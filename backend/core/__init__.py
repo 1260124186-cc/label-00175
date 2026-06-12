@@ -21,7 +21,12 @@ from core.imaging import (
     ResistType,
     ResistThresholdMode,
     ResistModel,
-    apply_resist_model
+    apply_resist_model,
+    downsample_mask,
+    upsample_mask,
+    build_pyramid_scales,
+    split_tiles,
+    merge_tiles_with_blend
 )
 from core.fft import fft2d, ifft2d, fft1d, ifft1d, frequency_filter, phase_modulation
 from core.metrics import mse, mae, ssim, normalized_correlation, batch_evaluate
@@ -45,6 +50,11 @@ __all__ = [
     'ResistThresholdMode',
     'ResistModel',
     'apply_resist_model',
+    'downsample_mask',
+    'upsample_mask',
+    'build_pyramid_scales',
+    'split_tiles',
+    'merge_tiles_with_blend',
     'fft2d',
     'ifft2d',
     'fft1d',

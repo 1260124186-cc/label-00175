@@ -2083,3 +2083,189 @@ def create_aberration_sweep(
             result.append((desc, opt))
 
     return result
+
+
+def downsample_mask(mask: np.ndarray, scale: int) -> np.ndarray:
+    """
+    对掩模进行整数倍下采样
+
+    使用区域平均池化将掩模缩小 scale 倍。
+
+    Args:
+        mask: 输入掩模 (2D numpy数组, 0-1值)
+        scale: 下采样倍数 (>= 2)
+
+    Returns:
+        下采样后的掩模
+    """
+    if scale < 2:
+        return mask.copy()
+    ny, nx = mask.shape
+    ny_new = ny // scale
+    nx_new = nx // scale
+    if ny_new < 1 or nx_new < 1:
+        return mask.copy()
+    cropped = mask[:ny_new * scale, :nx_new * scale]
+    reshaped = cropped.reshape(ny_new, scale, nx_new, scale)
+    return reshaped.mean(axis=(1, 3)).astype(np.float64)
+
+
+def upsample_mask(mask: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
+    """
+    将掩模上采样到目标尺寸
+
+    使用双线性插值进行上采样，保持值在 [0, 1] 范围内。
+
+    Args:
+        mask: 输入掩模 (2D numpy数组)
+        target_shape: 目标尺寸 (height, width)
+
+    Returns:
+        上采样后的掩模
+    """
+    from scipy.ndimage import zoom as scipy_zoom
+    ny_src, nx_src = mask.shape
+    ny_tgt, nx_tgt = target_shape
+    if ny_src == ny_tgt and nx_src == nx_tgt:
+        return mask.copy()
+    zoom_y = ny_tgt / ny_src
+    zoom_x = nx_tgt / nx_src
+    result = scipy_zoom(mask, (zoom_y, zoom_x), order=1)
+    return np.clip(result, 0.0, 1.0).astype(np.float64)
+
+
+def build_pyramid_scales(mask_shape: Tuple[int, int],
+                         min_size: int = 64,
+                         n_scales: int = 3) -> List[Tuple[int, int]]:
+    """
+    构建金字塔多尺度尺寸列表
+
+    从原始尺寸向下生成多级分辨率，每级缩小 2 倍，
+    直到最小维度达到 min_size 或达到 n_scales 层。
+
+    Args:
+        mask_shape: 原始掩模尺寸 (height, width)
+        min_size: 最低分辨率的最小尺寸
+        n_scales: 金字塔层数（不含原始分辨率）
+
+    Returns:
+        尺寸列表，从低分辨率到高分辨率（含原始分辨率）
+    """
+    scales = []
+    h, w = mask_shape
+    for _ in range(n_scales):
+        h_half = max(h // 2, min_size)
+        w_half = max(w // 2, min_size)
+        if h_half == h and w_half == w:
+            break
+        h, w = h_half, w_half
+        scales.append((h, w))
+    scales.reverse()
+    scales.append(mask_shape)
+    return scales
+
+
+def split_tiles(mask: np.ndarray,
+                tile_size: int = 256,
+                overlap: int = 32) -> List[Dict[str, Any]]:
+    """
+    将掩模分割为重叠的 tile 块
+
+    每个 tile 包含位置信息（row_start, col_start, row_end, col_end），
+    以及在原始掩模中对应的非重叠有效区域边界。
+
+    Args:
+        mask: 输入掩模 (2D numpy数组)
+        tile_size: 单个 tile 的尺寸（像素）
+        overlap: 相邻 tile 的重叠区域（像素）
+
+    Returns:
+        tile 信息列表，每个元素为字典:
+        {
+            'data': tile 数据 (2D 数组),
+            'row_start': 在原始掩模中的起始行,
+            'col_start': 在原始掩模中的起始列,
+            'row_end': 在原始掩模中的结束行（不含）,
+            'col_end': 在原始掩模中的结束列（不含）,
+            'inner_row_start': 有效区域起始行（相对于 tile）,
+            'inner_col_start': 有效区域起始列（相对于 tile）,
+            'inner_row_end': 有效区域结束行（相对于 tile, 不含）,
+            'inner_col_end': 有效区域结束列（相对于 tile, 不含）
+        }
+    """
+    ny, nx = mask.shape
+    step = max(tile_size - overlap, 1)
+    tiles = []
+    for row in range(0, ny, step):
+        for col in range(0, nx, step):
+            row_start = row
+            col_start = col
+            row_end = min(row + tile_size, ny)
+            col_end = min(col + tile_size, nx)
+            tile_data = mask[row_start:row_end, col_start:col_end].copy()
+            inner_row_start = overlap // 2 if row_start > 0 else 0
+            inner_col_start = overlap // 2 if col_start > 0 else 0
+            inner_row_end = tile_data.shape[0] - (overlap // 2 if row_end < ny else 0)
+            inner_col_end = tile_data.shape[1] - (overlap // 2 if col_end < nx else 0)
+            tiles.append({
+                'data': tile_data,
+                'row_start': row_start,
+                'col_start': col_start,
+                'row_end': row_end,
+                'col_end': col_end,
+                'inner_row_start': inner_row_start,
+                'inner_col_start': inner_col_start,
+                'inner_row_end': inner_row_end,
+                'inner_col_end': inner_col_end,
+            })
+    return tiles
+
+
+def merge_tiles_with_blend(tiles: List[Dict[str, Any]],
+                           target_shape: Tuple[int, int],
+                           overlap: int = 32,
+                           blend_sigma: float = 8.0) -> np.ndarray:
+    """
+    将优化后的 tile 块拼合并进行边界融合
+
+    使用高斯加权融合处理重叠区域，避免拼接缝隙。
+
+    Args:
+        tiles: tile 信息列表（与 split_tiles 输出格式一致，data 字段已被更新）
+        target_shape: 原始掩模尺寸 (height, width)
+        overlap: 重叠区域大小（像素）
+        blend_sigma: 融合权重的高斯 sigma
+
+    Returns:
+        拼合后的掩模 (2D numpy数组)
+    """
+    ny, nx = target_shape
+    result = np.zeros((ny, nx), dtype=np.float64)
+    weight = np.zeros((ny, nx), dtype=np.float64)
+    for t in tiles:
+        tile_data = t['data']
+        rs = t['row_start']
+        cs = t['col_start']
+        re = t['row_end']
+        ce = t['col_end']
+        th, tw = tile_data.shape
+        w_tile = np.ones((th, tw), dtype=np.float64)
+        if blend_sigma > 0 and overlap > 0:
+            half = overlap // 2
+            if rs > 0:
+                ramp = np.linspace(0, 1, min(half, th)).reshape(-1, 1)
+                w_tile[:ramp.shape[0], :] *= ramp
+            if re < ny:
+                ramp = np.linspace(1, 0, min(half, th)).reshape(-1, 1)
+                w_tile[-ramp.shape[0]:, :] *= ramp
+            if cs > 0:
+                ramp = np.linspace(0, 1, min(half, tw)).reshape(1, -1)
+                w_tile[:, :ramp.shape[1]] *= ramp
+            if ce < nx:
+                ramp = np.linspace(1, 0, min(half, tw)).reshape(1, -1)
+                w_tile[:, -ramp.shape[1]:] *= ramp
+        result[rs:re, cs:ce] += w_tile * tile_data
+        weight[rs:re, cs:ce] += w_tile
+    valid = weight > 1e-12
+    result[valid] /= weight[valid]
+    return np.clip(result, 0.0, 1.0).astype(np.float64)

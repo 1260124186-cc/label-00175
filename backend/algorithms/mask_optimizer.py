@@ -16,7 +16,9 @@ import time
 from core.imaging import (
     OpticalSystem, PartialCoherentImaging, simulate_wafer_image,
     ProcessCondition, ProcessWindow, MultiProcessSimulationResult,
-    simulate_multi_process, create_focus_dose_window, create_full_process_window
+    simulate_multi_process, create_focus_dose_window, create_full_process_window,
+    downsample_mask, upsample_mask, build_pyramid_scales,
+    split_tiles, merge_tiles_with_blend
 )
 from core.metrics import (
     mse, mae, ssim, evaluate_all, MetricsResult,
@@ -254,6 +256,53 @@ class OptimizationConfig:
     min_feature_method: str = 'combined'  # 'morphology', 'frequency', 'combined'
     min_feature_alpha: float = 0.5  # 联合方法中形态学权重
     pixel_size: float = 1.0  # 像素尺寸
+
+    # 多尺度/分块大尺寸掩模优化配置
+    use_multiscale: bool = False  # 是否启用金字塔多尺度优化
+    multiscale_mode: str = 'pyramid'  # 'pyramid' 或 'tile'
+    # 金字塔多尺度参数
+    pyramid_min_size: int = 64  # 金字塔最低分辨率的最小尺寸
+    pyramid_scales: int = 3  # 金字塔层数（不含原始分辨率）
+    pyramid_iter_ratio: float = 0.3  # 低分辨率层迭代数占总迭代数的比例
+    # Tile分块参数
+    tile_size: int = 256  # 单个 tile 的尺寸（像素）
+    tile_overlap: int = 32  # 相邻 tile 的重叠区域（像素）
+    tile_blend_sigma: float = 8.0  # 边界融合的高斯 sigma
+
+    @classmethod
+    def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'OptimizationConfig':
+        if d is None:
+            return cls()
+        cfg = cls()
+        field_names = {f.name for f in cls.__dataclass_fields__.values()}
+        for key, value in d.items():
+            if key in field_names:
+                if key == 'loss_weights':
+                    cfg.loss_weights = LossWeights.from_dict(value)
+                elif key == 'regularization':
+                    cfg.regularization = RegularizationConfig.from_dict(value)
+                elif key == 'process_conditions' and value is not None:
+                    cfg.process_conditions = [
+                        ProcessCondition(**pc) if isinstance(pc, dict) else pc
+                        for pc in value
+                    ]
+                else:
+                    setattr(cfg, key, value)
+        return cfg
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {}
+        for f in self.__dataclass_fields__.values():
+            val = getattr(self, f.name)
+            if f.name == 'loss_weights':
+                result[f.name] = val.to_dict()
+            elif f.name == 'regularization':
+                result[f.name] = val.to_dict()
+            elif f.name == 'process_conditions' and val is not None:
+                result[f.name] = [pc.to_dict() if hasattr(pc, 'to_dict') else pc for pc in val]
+            else:
+                result[f.name] = val
+        return result
 
 
 class LearningRateScheduler:
@@ -1362,6 +1411,318 @@ class MaskOptimizer:
             per_condition_losses=per_condition_losses,
             process_conditions=process_conditions
         )
+
+    def _optimize_pyramid(self,
+                          initial_mask: np.ndarray,
+                          target_image: np.ndarray,
+                          callback: Optional[Callable[[int, np.ndarray, float], None]] = None
+                          ) -> MaskOptimizationResult:
+        """
+        金字塔多尺度优化
+
+        先在低分辨率粗优化，逐步上采样到高分辨率细化。
+
+        Args:
+            initial_mask: 初始掩模
+            target_image: 目标图像
+            callback: 回调函数
+
+        Returns:
+            MaskOptimizationResult
+        """
+        start_time = time.time()
+        cfg = self.config
+        scales = build_pyramid_scales(
+            initial_mask.shape,
+            min_size=cfg.pyramid_min_size,
+            n_scales=cfg.pyramid_scales
+        )
+        logger.info(
+            f"金字塔多尺度优化: {len(scales)} 级, "
+            f"尺寸序列 {scales}"
+        )
+        total_max_iter = cfg.max_iter
+        coarse_ratio = cfg.pyramid_iter_ratio
+        n_coarse_levels = len(scales) - 1
+        if n_coarse_levels > 0:
+            coarse_iters = max(int(total_max_iter * coarse_ratio) // n_coarse_levels, 5)
+            fine_iters = total_max_iter - coarse_iters * n_coarse_levels
+        else:
+            coarse_iters = 0
+            fine_iters = total_max_iter
+
+        current_mask = initial_mask.astype(np.float64)
+        self._target_image = target_image.astype(np.float64)
+        loss_history = []
+
+        for level_idx, scale_shape in enumerate(scales):
+            is_last = (level_idx == len(scales) - 1)
+            if not is_last:
+                current_mask = downsample_mask(current_mask, 2)
+                if current_mask.shape[0] < scale_shape[0] or current_mask.shape[1] < scale_shape[1]:
+                    current_mask = upsample_mask(current_mask, scale_shape)
+                elif current_mask.shape != scale_shape:
+                    current_mask = upsample_mask(current_mask, scale_shape)
+                target_at_scale = downsample_mask(self._target_image, 2)
+                if target_at_scale.shape[0] < scale_shape[0] or target_at_scale.shape[1] < scale_shape[1]:
+                    target_at_scale = upsample_mask(target_at_scale, scale_shape)
+                elif target_at_scale.shape != scale_shape:
+                    target_at_scale = upsample_mask(target_at_scale, scale_shape)
+                n_iter = coarse_iters
+            else:
+                target_at_scale = self._target_image.copy()
+                n_iter = fine_iters
+
+            level_config = OptimizationConfig(
+                optimizer_type=cfg.optimizer_type,
+                max_iter=n_iter,
+                learning_rate=cfg.learning_rate,
+                tol=cfg.tol,
+                early_stop_patience=cfg.early_stop_patience,
+                lr_scheduler=cfg.lr_scheduler,
+                lr_decay=cfg.lr_decay,
+                lr_step_size=cfg.lr_step_size,
+                metric=cfg.metric,
+                use_composite_loss=cfg.use_composite_loss,
+                loss_weights=cfg.loss_weights,
+                regularization=cfg.regularization,
+                bounds=cfg.bounds,
+                verbose=cfg.verbose,
+                random_seed=cfg.random_seed,
+                use_multi_process=cfg.use_multi_process,
+                process_conditions=cfg.process_conditions,
+                process_window_mode=cfg.process_window_mode,
+                focus_range=cfg.focus_range,
+                dose_range=cfg.dose_range,
+                na_range=cfg.na_range,
+                sigma_range=cfg.sigma_range,
+                process_center_weight=cfg.process_center_weight,
+                process_edge_weight=cfg.process_edge_weight,
+                robustness_loss_weight=cfg.robustness_loss_weight,
+                threshold=cfg.threshold,
+                use_wafer_image_loss=cfg.use_wafer_image_loss,
+                binary_penalty_type=cfg.binary_penalty_type,
+                epe_threshold=cfg.epe_threshold,
+                epe_sigma=cfg.epe_sigma,
+                epe_use_soft=cfg.epe_use_soft,
+                min_feature_size=cfg.min_feature_size,
+                min_feature_method=cfg.min_feature_method,
+                min_feature_alpha=cfg.min_feature_alpha,
+                pixel_size=cfg.pixel_size,
+            )
+
+            level_optimizer = MaskOptimizer(
+                optical_system=self.optical_system,
+                config=level_config
+            )
+            level_result = level_optimizer.optimize(
+                initial_mask=current_mask,
+                target_image=target_at_scale,
+                callback=callback
+            )
+            current_mask = level_result.optimized_mask
+            loss_history.extend(level_result.loss_history)
+
+            if not is_last:
+                current_mask = upsample_mask(current_mask, scales[level_idx + 1])
+
+        self._setup_imaging_model(current_mask.shape)
+        final_wafer = self._imaging_model.compute_aerial_image(current_mask)
+        final_metrics = evaluate_all(final_wafer, self._target_image)
+        initial_wafer = self._imaging_model.compute_aerial_image(initial_mask)
+        initial_metrics = evaluate_all(initial_wafer, self._target_image)
+
+        total_time = time.time() - start_time
+
+        logger.info(
+            f"金字塔多尺度优化完成，最终MSE: {final_metrics.mse:.6e}，"
+            f"耗时: {total_time:.2f}秒"
+        )
+
+        return MaskOptimizationResult(
+            optimized_mask=current_mask,
+            initial_mask=initial_mask,
+            target_image=target_image,
+            final_wafer_image=final_wafer,
+            initial_wafer_image=initial_wafer,
+            final_metrics=final_metrics,
+            initial_metrics=initial_metrics,
+            loss_history=loss_history,
+            total_iterations=len(loss_history),
+            total_time=total_time,
+            converged=True,
+            message="金字塔多尺度优化完成"
+        )
+
+    def _optimize_tile(self,
+                       initial_mask: np.ndarray,
+                       target_image: np.ndarray,
+                       callback: Optional[Callable[[int, np.ndarray, float], None]] = None
+                       ) -> MaskOptimizationResult:
+        """
+        分块 tile 优化
+
+        将大尺寸掩模分割为重叠的 tile 块，逐块优化后拼接融合。
+
+        Args:
+            initial_mask: 初始掩模
+            target_image: 目标图像
+            callback: 回调函数
+
+        Returns:
+            MaskOptimizationResult
+        """
+        start_time = time.time()
+        cfg = self.config
+        tile_size = cfg.tile_size
+        overlap = cfg.tile_overlap
+        blend_sigma = cfg.tile_blend_sigma
+
+        ny, nx = initial_mask.shape
+        needs_tiling = (ny > tile_size or nx > tile_size)
+
+        if not needs_tiling:
+            logger.info("掩模尺寸不超过 tile 大小，回退到普通优化")
+            return self.optimize(initial_mask, target_image, callback)
+
+        logger.info(
+            f"分块 tile 优化: tile_size={tile_size}, overlap={overlap}, "
+            f"blend_sigma={blend_sigma}, mask_shape=({ny}, {nx})"
+        )
+
+        self._target_image = target_image.astype(np.float64)
+        current_mask = initial_mask.astype(np.float64)
+        loss_history = []
+
+        n_epochs = max(1, cfg.max_iter)
+        for epoch in range(n_epochs):
+            tiles = split_tiles(current_mask, tile_size, overlap)
+
+            for t_idx, tile_info in enumerate(tiles):
+                rs = tile_info['row_start']
+                cs = tile_info['col_start']
+                re = tile_info['row_end']
+                ce = tile_info['col_end']
+                tile_data = tile_info['data']
+                tile_target = self._target_image[rs:re, cs:ce].copy()
+
+                tile_config = OptimizationConfig(
+                    optimizer_type=cfg.optimizer_type,
+                    max_iter=max(5, n_epochs // 2),
+                    learning_rate=cfg.learning_rate,
+                    tol=cfg.tol,
+                    early_stop_patience=5,
+                    lr_scheduler=cfg.lr_scheduler,
+                    lr_decay=cfg.lr_decay,
+                    lr_step_size=cfg.lr_step_size,
+                    metric=cfg.metric,
+                    use_composite_loss=cfg.use_composite_loss,
+                    loss_weights=cfg.loss_weights,
+                    regularization=cfg.regularization,
+                    bounds=cfg.bounds,
+                    verbose=False,
+                    random_seed=cfg.random_seed,
+                    threshold=cfg.threshold,
+                    use_wafer_image_loss=cfg.use_wafer_image_loss,
+                    binary_penalty_type=cfg.binary_penalty_type,
+                    epe_threshold=cfg.epe_threshold,
+                    epe_sigma=cfg.epe_sigma,
+                    epe_use_soft=cfg.epe_use_soft,
+                    min_feature_size=cfg.min_feature_size,
+                    min_feature_method=cfg.min_feature_method,
+                    min_feature_alpha=cfg.min_feature_alpha,
+                    pixel_size=cfg.pixel_size,
+                )
+
+                tile_optimizer = MaskOptimizer(
+                    optical_system=self.optical_system,
+                    config=tile_config
+                )
+                tile_result = tile_optimizer.optimize(
+                    initial_mask=tile_data,
+                    target_image=tile_target
+                )
+                tile_info['data'] = tile_result.optimized_mask
+                loss_history.extend(tile_result.loss_history)
+
+            current_mask = merge_tiles_with_blend(
+                tiles, (ny, nx), overlap, blend_sigma
+            )
+
+            if callback is not None:
+                self._setup_imaging_model(current_mask.shape)
+                aerial = self._imaging_model.compute_aerial_image(current_mask)
+                current_loss = mse(aerial, self._target_image)
+                callback(epoch, current_mask, current_loss)
+
+            if cfg.verbose and (epoch % 10 == 0 or epoch == n_epochs - 1):
+                self._setup_imaging_model(current_mask.shape)
+                aerial = self._imaging_model.compute_aerial_image(current_mask)
+                current_loss = mse(aerial, self._target_image)
+                logger.info(f"Tile epoch {epoch:4d}: loss={current_loss:.6e}")
+
+        self._setup_imaging_model(current_mask.shape)
+        final_wafer = self._imaging_model.compute_aerial_image(current_mask)
+        final_metrics = evaluate_all(final_wafer, self._target_image)
+        initial_wafer = self._imaging_model.compute_aerial_image(initial_mask)
+        initial_metrics = evaluate_all(initial_wafer, self._target_image)
+
+        total_time = time.time() - start_time
+
+        logger.info(
+            f"分块 tile 优化完成，最终MSE: {final_metrics.mse:.6e}，"
+            f"耗时: {total_time:.2f}秒"
+        )
+
+        return MaskOptimizationResult(
+            optimized_mask=current_mask,
+            initial_mask=initial_mask,
+            target_image=target_image,
+            final_wafer_image=final_wafer,
+            initial_wafer_image=initial_wafer,
+            final_metrics=final_metrics,
+            initial_metrics=initial_metrics,
+            loss_history=loss_history,
+            total_iterations=len(loss_history),
+            total_time=total_time,
+            converged=True,
+            message="分块 tile 优化完成"
+        )
+
+    def optimize_multiscale(self,
+                            initial_mask: np.ndarray,
+                            target_image: np.ndarray,
+                            callback: Optional[Callable[[int, np.ndarray, float], None]] = None
+                            ) -> MaskOptimizationResult:
+        """
+        多尺度/分块优化入口
+
+        根据 config.use_multiscale 和 config.multiscale_mode 选择优化策略：
+        - 'pyramid': 金字塔多尺度优化（先低分辨率粗优化，再逐级上采样细化）
+        - 'tile': 分块优化后拼接融合
+
+        当 use_multiscale=False 时回退到普通 optimize。
+
+        Args:
+            initial_mask: 初始掩模图案
+            target_image: 目标图像
+            callback: 回调函数 callback(iteration, current_mask, current_loss)
+
+        Returns:
+            MaskOptimizationResult
+        """
+        if not self.config.use_multiscale:
+            return self.optimize(initial_mask, target_image, callback)
+
+        mode = self.config.multiscale_mode.lower()
+        if mode == 'pyramid':
+            return self._optimize_pyramid(initial_mask, target_image, callback)
+        elif mode == 'tile':
+            return self._optimize_tile(initial_mask, target_image, callback)
+        else:
+            raise ValueError(
+                f"未知的多尺度模式: {mode}，支持 'pyramid' 或 'tile'"
+            )
 
     def optimize_with_custom_objective(self,
                                        initial_mask: np.ndarray,
