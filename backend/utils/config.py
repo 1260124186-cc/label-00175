@@ -219,6 +219,17 @@ def create_default_config() -> Dict[str, Any]:
             'early_stop_patience': 10,
             'lr_scheduler': None,
             'metric': 'mse',
+            'use_composite_loss': False,
+            'loss_weights': {
+                'mse': 1.0,
+                'ssim': 0.0,
+                'pvb': 0.0,
+                'mask_complexity': 0.0
+            },
+            'regularization': {
+                'type': None,
+                'strength': 0.0
+            },
             'bounds': [0.0, 1.0],
             'random_seed': 42,  # 随机种子用于结果复现
             'population_size': 50,
@@ -329,6 +340,35 @@ def validate_config(config: Dict[str, Any]) -> bool:
     if opt.get('learning_rate', 0) <= 0:
         logger.error("学习率必须为正数")
         return False
+
+    # 验证复合损失权重
+    loss_weights = opt.get('loss_weights', {})
+    if isinstance(loss_weights, dict):
+        valid_loss_keys = {'mse', 'ssim', 'pvb', 'mask_complexity'}
+        for key in loss_weights:
+            if key not in valid_loss_keys:
+                logger.error(f"未知的损失权重键: {key}，有效键: {valid_loss_keys}")
+                return False
+            try:
+                float(loss_weights[key])
+            except (ValueError, TypeError):
+                logger.error(f"损失权重值必须为数值: {key}={loss_weights[key]}")
+                return False
+
+    # 验证正则化配置
+    regularization = opt.get('regularization', {})
+    if isinstance(regularization, dict):
+        reg_type = regularization.get('type', None)
+        valid_reg_types = {None, 'l1', 'l2', 'tv', 'none', 'None'}
+        if reg_type is not None and reg_type not in valid_reg_types:
+            logger.error(f"未知的正则化类型: {reg_type}，有效类型: None, 'l1', 'l2', 'tv'")
+            return False
+        if 'strength' in regularization:
+            try:
+                float(regularization['strength'])
+            except (ValueError, TypeError):
+                logger.error(f"正则化强度必须为数值: {regularization['strength']}")
+                return False
 
     logger.info("配置验证通过")
     return True

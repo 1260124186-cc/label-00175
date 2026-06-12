@@ -17,7 +17,15 @@ from core.imaging import (
     ProcessCondition, ProcessWindow, MultiProcessSimulationResult,
     simulate_multi_process, create_focus_dose_window, create_full_process_window
 )
-from core.metrics import mse, mae, ssim, evaluate_all, MetricsResult
+from core.metrics import (
+    mse, mae, ssim, evaluate_all, MetricsResult,
+    total_variation, total_variation_gradient,
+    pvb, pvb_gradient,
+    l1_regularization, l1_regularization_gradient,
+    l2_regularization, l2_regularization_gradient,
+    tv_regularization, tv_regularization_gradient,
+    CompositeLossComponents
+)
 from algorithms.optimizer import (
     BaseOptimizer, GradientDescentOptimizer, BFGSOptimizer,
     NewtonOptimizer, OptimizationResult
@@ -47,6 +55,74 @@ def _apply_threshold_for_loss(image: np.ndarray, threshold: float) -> np.ndarray
 
 
 @dataclass
+class LossWeights:
+    """
+    复合损失函数各分量权重配置
+
+    loss = w_mse * MSE + w_ssim * (1-SSIM) + w_pvb * PVB + w_mask_complexity * mask_complexity
+
+    Attributes:
+        mse: MSE（均方误差）权重
+        ssim: (1-SSIM) 结构相似性损失权重
+        pvb: PVB（Process Variation Band，工艺变化带宽）权重
+        mask_complexity: 掩模复杂度（总变差TV）权重
+    """
+    mse: float = 1.0
+    ssim: float = 0.0
+    pvb: float = 0.0
+    mask_complexity: float = 0.0
+
+    @classmethod
+    def from_dict(cls, d: Optional[Dict[str, float]]) -> 'LossWeights':
+        """从字典创建，缺失键使用默认值"""
+        if d is None:
+            return cls()
+        defaults = {'mse': 1.0, 'ssim': 0.0, 'pvb': 0.0, 'mask_complexity': 0.0}
+        defaults.update(d)
+        return cls(**defaults)
+
+    def to_dict(self) -> Dict[str, float]:
+        return {
+            'mse': self.mse,
+            'ssim': self.ssim,
+            'pvb': self.pvb,
+            'mask_complexity': self.mask_complexity
+        }
+
+    def total_weight(self) -> float:
+        return self.mse + self.ssim + self.pvb + self.mask_complexity
+
+
+@dataclass
+class RegularizationConfig:
+    """
+    正则化配置
+
+    Attributes:
+        type: 正则化类型: 'l1', 'l2', 'tv' (Total Variation), None
+        strength: 正则化强度系数
+    """
+    type: Optional[str] = None  # 'l1', 'l2', 'tv'
+    strength: float = 0.0
+
+    @classmethod
+    def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'RegularizationConfig':
+        """从字典创建，缺失键使用默认值"""
+        if d is None:
+            return cls()
+        return cls(
+            type=d.get('type', None),
+            strength=float(d.get('strength', 0.0))
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'type': self.type,
+            'strength': self.strength
+        }
+
+
+@dataclass
 class OptimizationConfig:
     """
     优化配置类
@@ -58,7 +134,10 @@ class OptimizationConfig:
         tol: 收敛容差
         early_stop_patience: 早停耐心值
         lr_scheduler: 学习率调度器类型
-        metric: 优化目标指标
+        metric: 优化目标指标（兼容旧接口，当 use_composite_loss=False 时生效）
+        use_composite_loss: 是否使用复合损失函数（优先级高于 metric）
+        loss_weights: 复合损失各分量权重（use_composite_loss=True 时生效）
+        regularization: 正则化配置
         bounds: 掩模值边界
         verbose: 是否输出详细信息
         random_seed: 随机种子（用于结果复现）
@@ -90,7 +169,10 @@ class OptimizationConfig:
     lr_scheduler: Optional[str] = None  # 'step', 'exponential', 'cosine'
     lr_decay: float = 0.95
     lr_step_size: int = 20
-    metric: str = 'mse'  # 'mse', 'mae', 'ssim'
+    metric: str = 'mse'  # 'mse', 'mae', 'ssim'（兼容旧接口）
+    use_composite_loss: bool = False  # 是否启用复合损失
+    loss_weights: LossWeights = field(default_factory=LossWeights)
+    regularization: RegularizationConfig = field(default_factory=RegularizationConfig)
     bounds: tuple = (0.0, 1.0)
     verbose: bool = True
     random_seed: Optional[int] = None
@@ -404,11 +486,120 @@ class MaskOptimizer:
             f"权重归一化后范围 [{min(self._multi_weights):.3f}, {max(self._multi_weights):.3f}]"
         )
 
+    def _prepare_image(self, aerial: np.ndarray, dose: float = 1.0) -> np.ndarray:
+        """
+        对空间像做剂量缩放和（可选）光刻胶阈值平滑处理
+
+        Args:
+            aerial: 空间像
+            dose: 曝光相对剂量
+
+        Returns:
+            处理后的图像，用于损失计算
+        """
+        if dose != 1.0:
+            aerial = np.clip(aerial * dose, 0.0, 1.0)
+        if self.config.use_wafer_image_loss:
+            return _apply_threshold_for_loss(aerial, self.config.threshold)
+        return aerial
+
+    def _compute_regularization_loss(self, mask: np.ndarray) -> float:
+        """
+        计算正则化项损失
+
+        Args:
+            mask: 掩模图案
+
+        Returns:
+            正则化损失值
+        """
+        reg_cfg = self.config.regularization
+        if reg_cfg.type is None or reg_cfg.strength <= 0:
+            return 0.0
+
+        if reg_cfg.type == 'l1':
+            return reg_cfg.strength * l1_regularization(mask)
+        elif reg_cfg.type == 'l2':
+            return reg_cfg.strength * l2_regularization(mask)
+        elif reg_cfg.type == 'tv':
+            return reg_cfg.strength * tv_regularization(mask)
+        else:
+            logger.warning(f"未知的正则化类型: {reg_cfg.type}，跳过")
+            return 0.0
+
+    def _compute_regularization_gradient(self, mask: np.ndarray) -> np.ndarray:
+        """
+        计算正则化项的梯度
+
+        Args:
+            mask: 掩模图案
+
+        Returns:
+            梯度数组
+        """
+        reg_cfg = self.config.regularization
+        if reg_cfg.type is None or reg_cfg.strength <= 0:
+            return np.zeros_like(mask)
+
+        if reg_cfg.type == 'l1':
+            return reg_cfg.strength * l1_regularization_gradient(mask)
+        elif reg_cfg.type == 'l2':
+            return reg_cfg.strength * l2_regularization_gradient(mask)
+        elif reg_cfg.type == 'tv':
+            return reg_cfg.strength * tv_regularization_gradient(mask)
+        else:
+            return np.zeros_like(mask)
+
+    def _compute_image_loss_components(self, image: np.ndarray,
+                                       target: np.ndarray) -> CompositeLossComponents:
+        """
+        针对单幅图像计算 MSE、(1-SSIM) 等逐像素损失分量（不含 PVB/正则化）
+
+        Args:
+            image: 处理后的成像结果
+            target: 目标图像
+
+        Returns:
+            CompositeLossComponents（仅填充 mse、ssim 字段）
+        """
+        comp = CompositeLossComponents()
+        lw = self.config.loss_weights
+
+        if lw.mse > 0:
+            comp.mse = lw.mse * mse(image, target)
+        if lw.ssim > 0:
+            comp.ssim = lw.ssim * (1.0 - ssim(image, target))
+
+        return comp
+
+    def _compute_composite_single_condition(self, mask: np.ndarray,
+                                            imaging_model: PartialCoherentImaging,
+                                            dose: float = 1.0) -> Tuple[float, np.ndarray, CompositeLossComponents]:
+        """
+        计算单工艺条件下的复合损失、成像结果及各分量（不含 PVB 和正则化）
+
+        Args:
+            mask: 掩模
+            imaging_model: 成像模型
+            dose: 曝光剂量
+
+        Returns:
+            (loss_value, processed_image, components)
+        """
+        aerial = imaging_model.compute_aerial_image(mask)
+        image = self._prepare_image(aerial, dose)
+        components = self._compute_image_loss_components(image, self._target_image)
+        loss = components.mse + components.ssim
+        return loss, image, components
+
     def _compute_single_condition_loss(self, mask: np.ndarray,
                                        imaging_model: PartialCoherentImaging,
                                        dose: float = 1.0) -> float:
         """
         计算单组工艺条件下的损失
+
+        当 config.use_composite_loss=True 时，使用复合损失（MSE/SSIM 加权）；
+        否则回退到旧的单一 metric 逻辑。
 
         Args:
             mask: 掩模图案
@@ -418,6 +609,10 @@ class MaskOptimizer:
         Returns:
             损失值
         """
+        if self.config.use_composite_loss:
+            loss, _, _ = self._compute_composite_single_condition(mask, imaging_model, dose)
+            return loss
+
         aerial = imaging_model.compute_aerial_image(mask)
 
         if self.config.use_wafer_image_loss:
@@ -443,13 +638,14 @@ class MaskOptimizer:
         """
         计算多工艺条件加权损失
 
-        L = Σ_i w_i * L_i(mask, cond_i) + λ_robust * Var(L_i)
+        当 use_composite_loss=True 时，复合损失形式：
+        L = Σ_i w_i * [w_mse*MSE_i + w_ssim*(1-SSIM_i)]
+            + w_pvb * PVB({I_i})
+            + w_mask_complexity * TV(mask)
+            + R(mask)
+            + λ_robust * Var(L_i)
 
-        其中：
-        - w_i: 归一化权重（中心条件权重高、边界条件权重低）
-        - L_i: 第 i 组工艺条件下的单条件损失
-        - λ_robust: 鲁棒性正则化权重（robustness_loss_weight）
-        - Var(L_i): 各条件损失值的方差，用于约束工艺窗口一致性
+        否则使用旧的单一 metric 逻辑。
 
         Args:
             mask: 掩模图案
@@ -457,6 +653,44 @@ class MaskOptimizer:
         Returns:
             加权总损失
         """
+        cfg = self.config
+
+        if cfg.use_composite_loss:
+            lw = cfg.loss_weights
+            per_images = []
+            per_losses = []
+            total_img_loss = 0.0
+
+            for model, cond, w in zip(
+                self._multi_imaging_models,
+                self._multi_conditions,
+                self._multi_weights
+            ):
+                loss_i, img_i, _ = self._compute_composite_single_condition(mask, model, cond.dose)
+                per_images.append(img_i)
+                per_losses.append(loss_i)
+                total_img_loss += w * loss_i
+
+            self._last_per_condition_losses = per_losses
+
+            total_loss = total_img_loss
+
+            if lw.pvb > 0:
+                pvb_val = pvb(per_images)
+                total_loss += lw.pvb * pvb_val
+
+            if lw.mask_complexity > 0:
+                total_loss += lw.mask_complexity * total_variation(mask)
+
+            total_loss += self._compute_regularization_loss(mask)
+
+            if cfg.robustness_loss_weight > 0 and len(per_losses) > 1:
+                loss_arr = np.array(per_losses)
+                robustness = float(np.var(loss_arr))
+                total_loss += cfg.robustness_loss_weight * robustness
+
+            return total_loss
+
         per_losses = []
         for model, cond, w in zip(
             self._multi_imaging_models,
@@ -483,10 +717,14 @@ class MaskOptimizer:
         """
         计算多工艺条件加权损失的梯度
 
-        dL/dmask = Σ_i w_i * dL_i/dmask + λ_robust * dVar(L_i)/dmask
+        当 use_composite_loss=True 时：
+        dL/dmask = Σ_i w_i * d[w_mse*MSE_i + w_ssim*(1-SSIM_i)]/dmask
+                 + w_pvb * dPVB/dmask
+                 + w_mask_complexity * dTV(mask)/dmask
+                 + dR(mask)/dmask
+                 + λ_robust * dVar(L_i)/dmask
 
-        对于 MSE 指标，解析计算各条件梯度并加权组合；
-        对于 SSIM 或其他复杂指标，退化为数值梯度。
+        对于包含 SSIM 或 PVB 的情况，退化为数值梯度。
 
         Args:
             mask: 掩模图案
@@ -494,6 +732,76 @@ class MaskOptimizer:
         Returns:
             梯度数组
         """
+        cfg = self.config
+
+        if cfg.use_composite_loss:
+            lw = cfg.loss_weights
+            if lw.ssim > 0 or lw.pvb > 0:
+                return self._numerical_gradient(mask)
+
+            gradient = np.zeros_like(mask)
+            per_images = []
+            per_losses = []
+
+            for model, cond, w in zip(
+                self._multi_imaging_models,
+                self._multi_conditions,
+                self._multi_weights
+            ):
+                aerial = model.compute_aerial_image(mask)
+                image = self._prepare_image(aerial, cond.dose)
+                per_images.append(image)
+
+                error_grad = np.zeros_like(image)
+
+                if lw.mse > 0:
+                    error_grad += lw.mse * (2.0 * (image - self._target_image) / mask.size)
+
+                imaging_grad = model.compute_image_gradient(mask)
+
+                if cond.dose != 1.0:
+                    error_grad = error_grad * cond.dose
+
+                if cfg.use_wafer_image_loss:
+                    aerial_dosed = aerial if cond.dose == 1.0 else np.clip(aerial * cond.dose, 0.0, 1.0)
+                    threshold_grad = (aerial_dosed >= cfg.threshold).astype(np.float64)
+                    error_grad = error_grad * threshold_grad
+
+                gradient += w * (error_grad * imaging_grad)
+
+                loss_i, _, _ = self._compute_composite_single_condition(mask, model, cond.dose)
+                per_losses.append(loss_i)
+
+            if lw.mask_complexity > 0:
+                gradient += lw.mask_complexity * total_variation_gradient(mask)
+
+            gradient += self._compute_regularization_gradient(mask)
+
+            if cfg.robustness_loss_weight > 0 and len(per_losses) > 1:
+                loss_arr = np.array(per_losses)
+                mean_loss = np.mean(loss_arr)
+                n = len(per_losses)
+                for model, cond, w in zip(
+                    self._multi_imaging_models,
+                    self._multi_conditions,
+                    self._multi_weights
+                ):
+                    idx = self._multi_conditions.index(cond)
+                    factor = 2.0 * cfg.robustness_loss_weight * (per_losses[idx] - mean_loss) / (n * n)
+                    if abs(factor) < 1e-12:
+                        continue
+                    aerial = model.compute_aerial_image(mask)
+                    image = self._prepare_image(aerial, cond.dose)
+                    error_grad = np.zeros_like(image)
+                    if lw.mse > 0:
+                        error_grad += lw.mse * (2.0 * (image - self._target_image) / mask.size)
+                    imaging_grad = model.compute_image_gradient(mask)
+                    if cond.dose != 1.0:
+                        error_grad = error_grad * cond.dose
+                    gradient += factor * (error_grad * imaging_grad)
+
+            return gradient
+
         metric = self.config.metric.lower()
         if metric == 'ssim':
             return self._numerical_gradient(mask)
@@ -575,6 +883,9 @@ class MaskOptimizer:
         当启用多工艺条件联合优化时，自动调度到
         _compute_multi_process_loss；否则使用标称条件。
 
+        当 use_composite_loss=True 时，使用复合损失：
+        L = w_mse*MSE + w_ssim*(1-SSIM) + w_mask_complexity*TV(mask) + R(mask)
+
         Args:
             mask: 掩模图案
 
@@ -583,6 +894,16 @@ class MaskOptimizer:
         """
         if self.config.use_multi_process and self._multi_imaging_models is not None:
             return self._compute_multi_process_loss(mask)
+
+        if self.config.use_composite_loss:
+            lw = self.config.loss_weights
+            loss, _, _ = self._compute_composite_single_condition(
+                mask, self._imaging_model, dose=1.0
+            )
+            if lw.mask_complexity > 0:
+                loss += lw.mask_complexity * total_variation(mask)
+            loss += self._compute_regularization_loss(mask)
+            return loss
 
         wafer_image = self._imaging_model.compute_aerial_image(mask)
 
@@ -606,6 +927,8 @@ class MaskOptimizer:
         当启用多工艺条件联合优化时，自动调度到
         _compute_multi_process_gradient。
 
+        当 use_composite_loss=True 且包含 SSIM 时，退化为数值梯度。
+
         Args:
             mask: 掩模图案
 
@@ -614,6 +937,35 @@ class MaskOptimizer:
         """
         if self.config.use_multi_process and self._multi_imaging_models is not None:
             return self._compute_multi_process_gradient(mask)
+
+        cfg = self.config
+
+        if cfg.use_composite_loss:
+            lw = cfg.loss_weights
+            if lw.ssim > 0:
+                return self._numerical_gradient(mask)
+
+            aerial = self._imaging_model.compute_aerial_image(mask)
+            image = self._prepare_image(aerial, dose=1.0)
+            imaging_grad = self._imaging_model.compute_image_gradient(mask)
+
+            error_grad = np.zeros_like(image)
+
+            if lw.mse > 0:
+                error_grad += lw.mse * (2.0 * (image - self._target_image) / mask.size)
+
+            if cfg.use_wafer_image_loss:
+                threshold_grad = (aerial >= cfg.threshold).astype(np.float64)
+                error_grad = error_grad * threshold_grad
+
+            gradient = error_grad * imaging_grad
+
+            if lw.mask_complexity > 0:
+                gradient += lw.mask_complexity * total_variation_gradient(mask)
+
+            gradient += self._compute_regularization_gradient(mask)
+
+            return gradient
 
         wafer_image = self._imaging_model.compute_aerial_image(mask)
 

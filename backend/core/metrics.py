@@ -335,3 +335,217 @@ def compute_error_map(image1: np.ndarray,
         return diff
     else:
         raise ValueError(f"未知的误差类型: {error_type}")
+
+
+def total_variation(image: np.ndarray) -> float:
+    """
+    计算总变差 (Total Variation, TV)，用于衡量图像/掩模复杂度
+
+    TV = Σ |I[i+1,j] - I[i,j]| + |I[i,j+1] - I[i,j]|
+
+    TV 越小表示图像越平滑，越大表示边缘越多、图案越复杂。
+    可作为 mask_complexity 损失项。
+
+    Args:
+        image: 输入图像（2D 数组）
+
+    Returns:
+        总变差标量值
+    """
+    img = image.astype(np.float64)
+    # 行方向差分
+    diff_y = np.abs(np.diff(img, axis=0))
+    # 列方向差分
+    diff_x = np.abs(np.diff(img, axis=1))
+    return float(np.sum(diff_y) + np.sum(diff_x))
+
+
+def total_variation_gradient(image: np.ndarray) -> np.ndarray:
+    """
+    计算总变差对图像像素的梯度（用于反向传播）
+
+    Args:
+        image: 输入图像（2D 数组）
+
+    Returns:
+        梯度数组，与 image 形状相同
+    """
+    img = image.astype(np.float64)
+    ny, nx = img.shape
+    grad = np.zeros_like(img)
+
+    # 对每个像素，累加四个方向（上、下、左、右）差分的符号贡献
+    # dTV/dI[i,j] = sign(I[i,j]-I[i-1,j]) + sign(I[i,j]-I[i+1,j])
+    #             + sign(I[i,j]-I[i,j-1]) + sign(I[i,j]-I[i,j+1])
+    # 边界处缺失的方向贡献为 0
+
+    # 上邻居
+    grad[1:, :] += np.sign(img[1:, :] - img[:-1, :])
+    # 下邻居
+    grad[:-1, :] += np.sign(img[:-1, :] - img[1:, :])
+    # 左邻居
+    grad[:, 1:] += np.sign(img[:, 1:] - img[:, :-1])
+    # 右邻居
+    grad[:, :-1] += np.sign(img[:, :-1] - img[:, 1:])
+
+    return grad
+
+
+def pvb(images: List[np.ndarray]) -> float:
+    """
+    计算工艺变化带宽 (Process Variation Band, PVB)
+
+    PVB 衡量多组工艺条件下成像结果的不一致程度：
+    PVB = mean_{x,y} ( max_i I_i[x,y] - min_i I_i[x,y] )
+
+    PVB 越小表示工艺鲁棒性越好，不同工艺条件下成像差异越小。
+
+    Args:
+        images: 多组工艺条件下的成像结果列表，每个元素为 2D 数组，
+                要求所有图像形状相同
+
+    Returns:
+        PVB 标量值
+    """
+    if not images:
+        return 0.0
+
+    stack = np.stack([img.astype(np.float64) for img in images], axis=0)
+    band = np.max(stack, axis=0) - np.min(stack, axis=0)
+    return float(np.mean(band))
+
+
+def pvb_gradient(images: List[np.ndarray], weights: Optional[List[float]] = None) -> List[np.ndarray]:
+    """
+    计算 PVB 对各幅图像的梯度（平均带宽对像素的偏导）
+
+    对于 max - min 的子梯度：
+    - 等于 max 的图像：梯度为 +1/N（N为像素总数，因为mean）
+    - 等于 min 的图像：梯度为 -1/N
+    - 其他图像：梯度为 0
+
+    当存在多个像素并列取 max/min 时，梯度在它们之间平均分配。
+
+    Args:
+        images: 多组成像结果列表
+        weights: 可选，各条件的权重列表（与 images 等长）；
+                 None 表示等权重
+
+    Returns:
+        梯度列表，每个元素形状与对应 image 相同
+    """
+    n = len(images)
+    if n == 0:
+        return []
+
+    if weights is None:
+        weights = [1.0] * n
+
+    total_w = sum(weights)
+    if total_w <= 0:
+        return [np.zeros_like(img) for img in images]
+
+    stack = np.stack([img.astype(np.float64) for img in images], axis=0)  # (n, H, W)
+    ny, nx = images[0].shape
+    n_pixels = ny * nx
+
+    max_vals = np.max(stack, axis=0)  # (H, W)
+    min_vals = np.min(stack, axis=0)  # (H, W)
+
+    grads = [np.zeros((ny, nx), dtype=np.float64) for _ in range(n)]
+
+    for i in range(n):
+        w = weights[i] / total_w
+        is_max = (stack[i] == max_vals)
+        is_min = (stack[i] == min_vals)
+        count_max = np.sum(stack == max_vals, axis=0).astype(np.float64)
+        count_min = np.sum(stack == min_vals, axis=0).astype(np.float64)
+        grads[i][is_max] += w / (n_pixels * count_max[is_max])
+        grads[i][is_min] -= w / (n_pixels * count_min[is_min])
+
+    return grads
+
+
+def l1_regularization(x: np.ndarray) -> float:
+    """
+    L1 正则化（Lasso）: Σ |x|
+
+    Args:
+        x: 参数数组
+
+    Returns:
+        L1 范数值
+    """
+    return float(np.sum(np.abs(x)))
+
+
+def l1_regularization_gradient(x: np.ndarray) -> np.ndarray:
+    """
+    L1 正则化梯度: sign(x)
+    """
+    return np.sign(x.astype(np.float64))
+
+
+def l2_regularization(x: np.ndarray) -> float:
+    """
+    L2 正则化（Ridge）: 0.5 * Σ x²
+
+    系数 0.5 使梯度形式更简洁。
+
+    Args:
+        x: 参数数组
+
+    Returns:
+        L2 正则项值
+    """
+    return float(0.5 * np.sum(x.astype(np.float64) ** 2))
+
+
+def l2_regularization_gradient(x: np.ndarray) -> np.ndarray:
+    """
+    L2 正则化梯度: x
+    """
+    return x.astype(np.float64)
+
+
+def tv_regularization(x: np.ndarray) -> float:
+    """
+    TV 正则化（与 total_variation 相同，作为正则项时使用）
+
+    Args:
+        x: 输入图像/掩模（2D 数组）
+
+    Returns:
+        TV 值
+    """
+    return total_variation(x)
+
+
+def tv_regularization_gradient(x: np.ndarray) -> np.ndarray:
+    """
+    TV 正则化梯度
+    """
+    return total_variation_gradient(x)
+
+
+@dataclass
+class CompositeLossComponents:
+    """
+    复合损失函数各分量值，用于日志和调试
+    """
+    mse: float = 0.0
+    ssim: float = 0.0  # 存储 (1 - SSIM)
+    pvb: float = 0.0
+    mask_complexity: float = 0.0
+    regularization: float = 0.0
+    total: float = 0.0
+
+    def to_dict(self) -> Dict[str, float]:
+        return {
+            'mse': self.mse,
+            'ssim_loss': self.ssim,
+            'pvb': self.pvb,
+            'mask_complexity': self.mask_complexity,
+            'regularization': self.regularization,
+            'total': self.total
+        }

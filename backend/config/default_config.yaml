@@ -45,7 +45,22 @@ optimization:
   lr_scheduler: null                # 学习率调度器: step, exponential, cosine, null
   lr_decay: 0.95                    # 学习率衰减率
   lr_step_size: 20                  # 学习率调度步长
-  metric: mse                       # 优化目标指标: mse, mae, ssim
+  metric: mse                       # 优化目标指标: mse, mae, ssim（兼容旧接口）
+  use_composite_loss: false         # 是否启用复合损失函数（优先级高于 metric）
+
+  # 复合损失各分量权重
+  # loss = w_mse*MSE + w_ssim*(1-SSIM) + w_pvb*PVB + w_mask_complexity*TV(mask)
+  loss_weights:
+    mse: 1.0                        # MSE 权重
+    ssim: 0.0                       # (1-SSIM) 权重
+    pvb: 0.0                        # PVB (工艺变化带宽) 权重，仅多工艺优化时有效
+    mask_complexity: 0.0            # 掩模复杂度(总变差TV)权重
+
+  # 正则化配置
+  regularization:
+    type: null                      # 正则化类型: null, l1, l2, tv
+    strength: 0.0                   # 正则化强度系数
+
   bounds:                           # 掩模值边界
     - 0.0
     - 1.0
