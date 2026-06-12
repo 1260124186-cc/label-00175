@@ -42,10 +42,17 @@ from core.metrics import (
 )
 from algorithms.optimizer import (
     BaseOptimizer, GradientDescentOptimizer, BFGSOptimizer,
-    NewtonOptimizer, OptimizationResult
+    NewtonOptimizer, OptimizationResult, AdamOptimizer, RMSpropOptimizer
 )
 from algorithms.advanced_optimizer import (
     BaseHeuristicOptimizer, GeneticAlgorithmOptimizer, ParticleSwarmOptimizer
+)
+from algorithms.callbacks import (
+    Callback, CallbackList, TrainerState,
+    LearningRateSchedulerCallback, EarlyStoppingCallback,
+    ModelCheckpointCallback, MaskSnapshotCallback,
+    ConvergencePlotCallback, LoggerCallback, HistoryCallback,
+    LambdaCallback
 )
 
 logger = logging.getLogger(__name__)
@@ -269,6 +276,41 @@ class OptimizationConfig:
     tile_overlap: int = 32  # 相邻 tile 的重叠区域（像素）
     tile_blend_sigma: float = 8.0  # 边界融合的高斯 sigma
 
+    # Callback 系统配置
+    use_callbacks: bool = True  # 是否启用 callback 系统
+    callback_log_freq: int = 10  # 日志输出频率
+    # 早停配置（通过 callback 实现）
+    early_stopping_enable: bool = True  # 是否启用早停
+    early_stopping_min_delta: float = 1e-6  # 早停最小改善量
+    early_stopping_restore_best: bool = True  # 早停后是否恢复最优
+    # 学习率调度器增强配置
+    lr_scheduler_patience: int = 10  # ReduceLROnPlateau 耐心值
+    lr_scheduler_factor: float = 0.5  # ReduceLROnPlateau 衰减因子
+    lr_min: float = 1e-7  # 最小学习率
+
+    # Checkpoint 配置
+    checkpoint_enable: bool = False  # 是否启用 checkpoint 保存
+    checkpoint_dir: str = './checkpoints'  # checkpoint 保存目录
+    checkpoint_freq: int = 50  # checkpoint 保存频率
+    checkpoint_save_best_only: bool = False  # 是否只保存最优的
+    checkpoint_max_keep: int = 5  # 最多保留的 checkpoint 数量
+    resume_from_checkpoint: Optional[str] = None  # 从哪个 checkpoint 恢复训练
+
+    # 中间掩模快照配置
+    snapshot_enable: bool = False  # 是否启用中间掩模快照
+    snapshot_dir: str = './snapshots'  # 快照保存目录
+    snapshot_freq: int = 20  # 快照保存频率
+    snapshot_save_best: bool = True  # 是否保存最优掩模
+    snapshot_save_npy: bool = True  # 是否保存 numpy 格式
+
+    # 收敛曲线绘制配置
+    plot_enable: bool = False  # 是否启用收敛曲线绘制
+    plot_dir: str = './plots'  # 曲线图保存目录
+    plot_freq: int = 10  # 曲线更新频率
+    plot_log_scale: bool = True  # 是否使用对数坐标
+    plot_lr: bool = True  # 是否同时绘制学习率曲线
+    plot_live_update: bool = False  # 是否实时更新显示
+
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'OptimizationConfig':
         if d is None:
@@ -427,13 +469,15 @@ class MaskOptimizer:
 
     def __init__(self,
                  optical_system: Optional[OpticalSystem] = None,
-                 config: Optional[OptimizationConfig] = None):
+                 config: Optional[OptimizationConfig] = None,
+                 callbacks: Optional[List[Callback]] = None):
         """
         初始化掩模优化器
 
         Args:
             optical_system: 光学系统参数
             config: 优化配置
+            callbacks: 自定义回调列表
         """
         self.optical_system = optical_system or OpticalSystem()
         self.config = config or OptimizationConfig()
@@ -447,6 +491,10 @@ class MaskOptimizer:
         self._multi_imaging_models: Optional[List[PartialCoherentImaging]] = None
         self._multi_conditions: Optional[List[ProcessCondition]] = None
         self._multi_weights: Optional[List[float]] = None
+
+        self._callbacks: CallbackList = CallbackList(callbacks)
+        self._history_callback: Optional[HistoryCallback] = None
+        self._trainer_state: Optional[TrainerState] = None
 
     def _setup_imaging_model(self, image_size: tuple):
         """设置成像模型"""
@@ -514,6 +562,294 @@ class MaskOptimizer:
         self._early_stopping = EarlyStopping(
             patience=self.config.early_stop_patience
         )
+
+    def _setup_callbacks(self, initial_mask: np.ndarray):
+        """
+        设置回调系统
+
+        根据配置创建并注册所有回调。
+        """
+        cfg = self.config
+        callbacks = self._callbacks
+
+        self._trainer_state = TrainerState()
+        self._trainer_state.mask = initial_mask.copy()
+        self._trainer_state.learning_rate = cfg.learning_rate
+
+        callbacks.set_state(self._trainer_state)
+        callbacks.set_params({
+            'max_iter': cfg.max_iter,
+            'learning_rate': cfg.learning_rate,
+            'optimizer_type': cfg.optimizer_type,
+        })
+
+        self._history_callback = HistoryCallback()
+        callbacks.append(self._history_callback)
+
+        if cfg.use_callbacks:
+            if cfg.verbose:
+                callbacks.append(LoggerCallback(
+                    log_freq=cfg.callback_log_freq,
+                    show_lr=True,
+                    show_time=True
+                ))
+
+            if cfg.lr_scheduler:
+                callbacks.append(LearningRateSchedulerCallback(
+                    initial_lr=cfg.learning_rate,
+                    scheduler_type=cfg.lr_scheduler,
+                    decay=cfg.lr_decay,
+                    step_size=cfg.lr_step_size,
+                    min_lr=cfg.lr_min,
+                    patience=cfg.lr_scheduler_patience,
+                    factor=cfg.lr_scheduler_factor,
+                    min_delta=cfg.early_stopping_min_delta
+                ))
+
+            if cfg.early_stopping_enable and cfg.early_stop_patience > 0:
+                callbacks.append(EarlyStoppingCallback(
+                    patience=cfg.early_stop_patience,
+                    min_delta=cfg.early_stopping_min_delta,
+                    monitor='loss',
+                    mode='min',
+                    restore_best=cfg.early_stopping_restore_best
+                ))
+
+            if cfg.checkpoint_enable:
+                callbacks.append(ModelCheckpointCallback(
+                    checkpoint_dir=cfg.checkpoint_dir,
+                    save_freq=cfg.checkpoint_freq,
+                    save_best_only=cfg.checkpoint_save_best_only,
+                    monitor='loss',
+                    mode='min',
+                    max_checkpoints=cfg.checkpoint_max_keep,
+                    prefix='mask_opt'
+                ))
+
+            if cfg.snapshot_enable:
+                callbacks.append(MaskSnapshotCallback(
+                    save_dir=cfg.snapshot_dir,
+                    save_freq=cfg.snapshot_freq,
+                    save_best=cfg.snapshot_save_best,
+                    save_npy=cfg.snapshot_save_npy
+                ))
+
+            if cfg.plot_enable:
+                callbacks.append(ConvergencePlotCallback(
+                    save_dir=cfg.plot_dir,
+                    plot_freq=cfg.plot_freq,
+                    log_scale=cfg.plot_log_scale,
+                    plot_lr=cfg.plot_lr,
+                    live_update=cfg.plot_live_update
+                ))
+
+    def add_callback(self, callback: Callback):
+        """
+        添加自定义回调
+
+        Args:
+            callback: 回调实例
+        """
+        self._callbacks.append(callback)
+
+    def _supports_step_training(self) -> bool:
+        """
+        检查当前优化器是否支持逐步训练
+
+        只有梯度类优化器支持逐步训练和完整的 callback 功能。
+        """
+        opt_type = self.config.optimizer_type.lower()
+        return opt_type in ['gradient_descent', 'adam', 'rmsprop']
+
+    def _step_train(self,
+                    initial_mask: np.ndarray,
+                    old_callback: Optional[Callable] = None
+                    ) -> OptimizationResult:
+        """
+        逐步训练循环（支持完整 callback 系统）
+
+        适用于 gradient_descent、adam、rmsprop 等梯度优化器。
+
+        Args:
+            initial_mask: 初始掩模
+            old_callback: 旧版回调函数（兼容接口）
+
+        Returns:
+            OptimizationResult 对象
+        """
+        cfg = self.config
+        x = initial_mask.copy()
+        shape = x.shape
+
+        self._setup_callbacks(initial_mask)
+        state = self._trainer_state
+
+        nfev = 1
+        f_val = self._compute_loss(x)
+        state.loss = f_val
+        state.loss_history.append(f_val)
+        state.lr_history.append(state.learning_rate)
+
+        success = False
+        message = "达到最大迭代次数"
+        nit = 0
+
+        self._callbacks.on_train_begin({'loss': f_val})
+
+        if old_callback is not None:
+            old_callback(0, x, f_val)
+
+        opt_type = cfg.optimizer_type.lower()
+
+        if opt_type == 'gradient_descent':
+            velocity = np.zeros_like(x.flatten())
+        elif opt_type == 'adam':
+            m = np.zeros_like(x)
+            v = np.zeros_like(x)
+        elif opt_type == 'rmsprop':
+            eg2 = np.zeros_like(x)
+            velocity = np.zeros_like(x)
+
+        for epoch in range(1, cfg.max_iter + 1):
+            nit = epoch
+
+            self._callbacks.on_epoch_begin(epoch)
+
+            lr = state.learning_rate
+
+            grad = self._compute_gradient(x)
+            nfev += 1
+
+            if opt_type == 'gradient_descent':
+                x_flat = x.flatten()
+                grad_flat = grad.flatten()
+
+                if hasattr(self._optimizer, 'momentum') and self._optimizer.momentum > 0:
+                    velocity = self._optimizer.momentum * velocity - lr * grad_flat
+                    x_new_flat = x_flat + velocity
+                else:
+                    x_new_flat = x_flat - lr * grad_flat
+
+                x_new = x_new_flat.reshape(shape)
+
+            elif opt_type == 'adam':
+                beta1 = 0.9
+                beta2 = 0.999
+                epsilon = 1e-8
+
+                if hasattr(self._optimizer, 'beta1'):
+                    beta1 = self._optimizer.beta1
+                if hasattr(self._optimizer, 'beta2'):
+                    beta2 = self._optimizer.beta2
+                if hasattr(self._optimizer, 'epsilon'):
+                    epsilon = self._optimizer.epsilon
+
+                m = beta1 * m + (1 - beta1) * grad
+                v = beta2 * v + (1 - beta2) * (grad ** 2)
+
+                m_hat = m / (1 - beta1 ** epoch)
+                v_hat = v / (1 - beta2 ** epoch)
+
+                x_new = x - lr * m_hat / (np.sqrt(v_hat) + epsilon)
+
+            elif opt_type == 'rmsprop':
+                alpha = 0.9
+                epsilon = 1e-8
+                momentum = 0.0
+
+                if hasattr(self._optimizer, 'alpha'):
+                    alpha = self._optimizer.alpha
+                if hasattr(self._optimizer, 'epsilon'):
+                    epsilon = self._optimizer.epsilon
+                if hasattr(self._optimizer, 'momentum'):
+                    momentum = self._optimizer.momentum
+
+                eg2 = alpha * eg2 + (1 - alpha) * (grad ** 2)
+
+                if momentum > 0:
+                    velocity = momentum * velocity - lr * grad / (np.sqrt(eg2) + epsilon)
+                    x_new = x + velocity
+                else:
+                    x_new = x - lr * grad / (np.sqrt(eg2) + epsilon)
+
+            else:
+                x_new = x - lr * grad
+
+            x_new = self._clip_to_bounds(x_new)
+            f_new = self._compute_loss(x_new)
+            nfev += 1
+
+            state.epoch = epoch
+            state.loss = f_new
+            state.mask = x_new.copy()
+            state.loss_history.append(f_new)
+            state.lr_history.append(lr)
+
+            logs = {'loss': f_new, 'learning_rate': lr}
+
+            stop = self._callbacks.on_epoch_end(epoch, logs)
+
+            if old_callback is not None:
+                old_callback(epoch, x_new, f_new)
+
+            if self._check_convergence(f_val, f_new, x, x_new):
+                success = True
+                message = f"在第{epoch}次迭代收敛"
+                x = x_new
+                f_val = f_new
+                break
+
+            if stop:
+                success = True
+                message = f"早停触发，在第{epoch}次迭代停止"
+                if state.mask is not None:
+                    x = state.mask.copy()
+                    f_val = state.loss
+                break
+
+            x = x_new
+            f_val = f_new
+
+        f_final = state.best_loss if state.best_loss < f_val else f_val
+        x_final = state.best_mask if (state.best_mask is not None and state.best_loss < f_val) else x
+
+        self._callbacks.on_train_end({'loss': f_final})
+
+        return OptimizationResult(
+            x=x_final,
+            fun=f_final,
+            nit=nit,
+            nfev=nfev,
+            success=success,
+            message=message,
+            history=state.loss_history
+        )
+
+    def _clip_to_bounds(self, x: np.ndarray) -> np.ndarray:
+        """将值裁剪到边界内"""
+        return np.clip(x, self.config.bounds[0], self.config.bounds[1])
+
+    def _check_convergence(self,
+                           f_old: float,
+                           f_new: float,
+                           x_old: np.ndarray,
+                           x_new: np.ndarray) -> bool:
+        """检查是否收敛"""
+        f_change = abs(f_new - f_old) / (abs(f_old) + 1e-10)
+        x_change = np.linalg.norm(x_new - x_old) / (np.linalg.norm(x_old) + 1e-10)
+        return f_change < self.config.tol or x_change < self.config.tol
+
+    def _load_checkpoint(self, filepath: str) -> Dict[str, Any]:
+        """
+        从 checkpoint 文件加载状态
+
+        Args:
+            filepath: checkpoint 文件路径
+
+        Returns:
+            状态字典
+        """
+        return ModelCheckpointCallback.load_checkpoint(filepath)
 
     def _build_process_conditions(self) -> Tuple[List[ProcessCondition], List[float]]:
         """
@@ -1323,6 +1659,9 @@ class MaskOptimizer:
         当 config.use_multi_process=True 时，自动构建多工艺条件
         成像模型并进行联合优化，同时约束工艺窗口中心与边界。
 
+        支持 callback 系统：LearningRateScheduler、EarlyStopping、
+        Checkpoint、MaskSnapshot、ConvergencePlot 等。
+
         Args:
             initial_mask: 初始掩模图案
             target_image: 目标图像
@@ -1336,9 +1675,13 @@ class MaskOptimizer:
         self._target_image = target_image.astype(np.float64)
 
         self._setup_imaging_model(initial_mask.shape)
-        self._setup_optimizer()
-        self._setup_lr_scheduler()
-        self._setup_early_stopping()
+
+        use_step_training = self._supports_step_training() and self.config.use_callbacks
+
+        if not use_step_training:
+            self._setup_optimizer()
+            self._setup_lr_scheduler()
+            self._setup_early_stopping()
 
         if self.config.use_multi_process:
             self._setup_multi_process_models(initial_mask.shape)
@@ -1350,22 +1693,61 @@ class MaskOptimizer:
         initial_wafer = self._imaging_model.compute_aerial_image(initial_mask)
         initial_metrics = evaluate_all(initial_wafer, target_image)
 
+        starting_mask = initial_mask.copy()
+        start_epoch = 0
+
+        if self.config.resume_from_checkpoint:
+            try:
+                ckpt_data = self._load_checkpoint(self.config.resume_from_checkpoint)
+                if 'mask' in ckpt_data and ckpt_data['mask'] is not None:
+                    starting_mask = ckpt_data['mask']
+                    if starting_mask.shape != initial_mask.shape:
+                        logger.warning(
+                            f"Checkpoint 掩模形状 {starting_mask.shape} "
+                            f"与初始掩模形状 {initial_mask.shape} 不匹配，使用初始掩模"
+                        )
+                        starting_mask = initial_mask.copy()
+                    else:
+                        start_epoch = int(ckpt_data.get('epoch', 0))
+                        logger.info(
+                            f"从 checkpoint 恢复训练: epoch={start_epoch}, "
+                            f"loss={ckpt_data.get('loss', 'N/A')}"
+                        )
+
+                        if self._trainer_state is None:
+                            self._trainer_state = TrainerState()
+
+                        if 'loss_history' in ckpt_data:
+                            self._trainer_state.loss_history = list(ckpt_data['loss_history'])
+                        if 'lr_history' in ckpt_data:
+                            self._trainer_state.lr_history = list(ckpt_data['lr_history'])
+                        if 'best_loss' in ckpt_data:
+                            self._trainer_state.best_loss = float(ckpt_data['best_loss'])
+                        if 'best_mask' in ckpt_data:
+                            self._trainer_state.best_mask = ckpt_data['best_mask']
+            except Exception as e:
+                logger.warning(f"加载 checkpoint 失败，从初始状态开始: {e}")
+                starting_mask = initial_mask.copy()
+                start_epoch = 0
+
         if self.config.use_multi_process:
             logger.info(f"开始多工艺条件联合掩模优化，{len(self._multi_conditions)} 个工艺条件，"
                        f"初始MSE: {initial_metrics.mse:.6e}")
         else:
             logger.info(f"开始掩模优化，初始MSE: {initial_metrics.mse:.6e}")
 
-        if isinstance(self._optimizer, BaseHeuristicOptimizer):
+        if use_step_training:
+            result = self._step_train(starting_mask, old_callback=callback)
+        elif isinstance(self._optimizer, BaseHeuristicOptimizer):
             result = self._optimizer.optimize(
                 objective=self._compute_loss,
-                x0=initial_mask,
+                x0=starting_mask,
                 bounds=self.config.bounds
             )
         else:
             result = self._optimizer.optimize(
                 objective=self._compute_loss,
-                x0=initial_mask,
+                x0=starting_mask,
                 gradient=self._compute_gradient,
                 bounds=self.config.bounds
             )
