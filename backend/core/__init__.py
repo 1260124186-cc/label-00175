@@ -17,7 +17,11 @@ from core.imaging import (
     MultiProcessSimulationResult,
     simulate_multi_process,
     create_focus_dose_window,
-    create_full_process_window
+    create_full_process_window,
+    ResistType,
+    ResistThresholdMode,
+    ResistModel,
+    apply_resist_model
 )
 from core.fft import fft2d, ifft2d, fft1d, ifft1d, frequency_filter, phase_modulation
 from core.metrics import mse, mae, ssim, normalized_correlation, batch_evaluate
@@ -37,6 +41,10 @@ __all__ = [
     'simulate_multi_process',
     'create_focus_dose_window',
     'create_full_process_window',
+    'ResistType',
+    'ResistThresholdMode',
+    'ResistModel',
+    'apply_resist_model',
     'fft2d',
     'ifft2d',
     'fft1d',

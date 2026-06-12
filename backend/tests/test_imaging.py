@@ -10,6 +10,12 @@ from core.imaging import (
     PartialCoherentImaging,
     simulate_wafer_image,
     _apply_threshold,
+    _apply_sigmoid_threshold,
+    _apply_car_development,
+    apply_resist_model,
+    ResistType,
+    ResistThresholdMode,
+    ResistModel,
     IlluminationType,
     generate_source,
     compute_tcc_kernel_2d,
@@ -509,3 +515,205 @@ class TestVisualizationHelpers:
 
         tcc_img = imaging.get_tcc_image()
         assert tcc_img is None
+
+
+class TestSigmoidThreshold:
+    """可微 sigmoid 阈值测试"""
+
+    def test_output_range(self):
+        """测试输出值在 (0, 1) 范围内"""
+        image = np.array([[0.1, 0.5], [0.7, 0.9]])
+        result = _apply_sigmoid_threshold(image, 0.5, 10.0)
+        assert np.all(result > 0.0)
+        assert np.all(result < 1.0)
+
+    def test_monotonicity(self):
+        """测试单调性：输入越大输出越大"""
+        image = np.linspace(0.0, 1.0, 100).reshape(1, 100)
+        result = _apply_sigmoid_threshold(image, 0.5, 20.0)
+        diffs = np.diff(result.ravel())
+        assert np.all(diffs >= 0)
+
+    def test_symmetry_around_threshold(self):
+        """测试关于阈值的对称性"""
+        image = np.array([[0.4, 0.6]])
+        result = _apply_sigmoid_threshold(image, 0.5, 10.0)
+        assert abs(result[0, 0] - (1.0 - result[0, 1])) < 1e-10
+
+    def test_high_steepness_approaches_hard(self):
+        """测试高陡度时趋近硬阈值"""
+        image = np.array([[0.2, 0.4], [0.6, 0.8]])
+        result = _apply_sigmoid_threshold(image, 0.5, 1000.0)
+        hard = _apply_threshold(image, 0.5)
+        np.testing.assert_allclose(result, hard, atol=1e-3)
+
+    def test_gradient_nonzero(self):
+        """测试梯度非零（可微性验证）"""
+        image = np.array([[0.45, 0.55]])
+        k = 20.0
+        eps = 1e-6
+        r_plus = _apply_sigmoid_threshold(image + eps, 0.5, k)
+        r_minus = _apply_sigmoid_threshold(image - eps, 0.5, k)
+        grad = (r_plus - r_minus) / (2 * eps)
+        assert np.all(grad > 0)
+
+
+class TestCARDevelopment:
+    """化学放大光刻胶（CAR）显影模型测试"""
+
+    def test_output_range(self):
+        """测试输出值在 [0, 1] 范围内"""
+        image = np.array([[0.1, 0.5], [0.7, 0.9]])
+        result = _apply_car_development(image, 0.5, 5.0, 5.0)
+        assert np.all(result >= 0.0)
+        assert np.all(result <= 1.0)
+
+    def test_monotonicity(self):
+        """测试单调性：曝光量越大显影越多"""
+        image = np.linspace(0.01, 1.0, 100).reshape(1, 100)
+        result = _apply_car_development(image, 0.5, 5.0, 5.0)
+        diffs = np.diff(result.ravel())
+        assert np.all(diffs >= 0)
+
+    def test_high_amplification_approaches_hard(self):
+        """测试高放大倍率趋近硬阈值"""
+        image = np.array([[0.2, 0.4], [0.6, 0.8]])
+        result = _apply_car_development(image, 0.5, 100.0, 10.0)
+        hard = _apply_threshold(image, 0.5)
+        np.testing.assert_allclose(result, hard, atol=1e-2)
+
+    def test_zero_threshold_all_clear(self):
+        """测试零阈值时全部显影"""
+        image = np.array([[0.1, 0.5], [0.7, 0.9]])
+        result = _apply_car_development(image, 0.0, 5.0, 5.0)
+        np.testing.assert_array_equal(result, 1.0)
+
+    def test_zero_intensity_zero_output(self):
+        """测试零光强输出为零"""
+        image = np.array([[0.0, 0.5], [0.7, 0.0]])
+        result = _apply_car_development(image, 0.5, 5.0, 5.0)
+        assert result[0, 0] == 0.0
+        assert result[1, 1] == 0.0
+
+
+class TestResistModel:
+    """高级光刻胶模型测试"""
+
+    def test_default_is_positive_hard(self):
+        """测试默认模型为正性硬阈值"""
+        model = ResistModel()
+        assert model.resist_type == ResistType.POSITIVE
+        assert model.threshold_mode == ResistThresholdMode.HARD
+
+    def test_positive_resist(self):
+        """测试正性胶：光强高于阈值处显影（值为1）"""
+        image = np.array([[0.2, 0.4], [0.6, 0.8]])
+        model = ResistModel(base_threshold=0.5)
+        result = apply_resist_model(image, resist_model=model)
+        expected = _apply_threshold(image, 0.5)
+        np.testing.assert_array_equal(result, expected)
+
+    def test_negative_resist(self):
+        """测试负性胶：光强低于阈值处显影（值为1）"""
+        image = np.array([[0.2, 0.4], [0.6, 0.8]])
+        model = ResistModel(resist_type=ResistType.NEGATIVE, base_threshold=0.5)
+        result = apply_resist_model(image, resist_model=model)
+        hard = _apply_threshold(image, 0.5)
+        expected = 1.0 - hard
+        np.testing.assert_array_equal(result, expected)
+
+    def test_sigmoid_mode(self):
+        """测试 sigmoid 模式输出连续值"""
+        image = np.array([[0.2, 0.4], [0.6, 0.8]])
+        model = ResistModel(threshold_mode=ResistThresholdMode.SIGMOID,
+                            base_threshold=0.5, sigmoid_steepness=20.0)
+        result = apply_resist_model(image, resist_model=model)
+        assert np.all(result > 0.0)
+        assert np.all(result < 1.0)
+
+    def test_car_mode(self):
+        """测试 CAR 模式输出"""
+        image = np.array([[0.1, 0.5], [0.7, 0.9]])
+        model = ResistModel(car_enabled=True, base_threshold=0.5,
+                            car_amplification=10.0, car_contrast=5.0)
+        result = apply_resist_model(image, resist_model=model)
+        assert result.shape == (2, 2)
+        assert np.all(result >= 0.0)
+        assert np.all(result <= 1.0)
+
+    def test_negative_sigmoid(self):
+        """测试负性胶 + sigmoid"""
+        image = np.array([[0.2, 0.4], [0.6, 0.8]])
+        model = ResistModel(resist_type=ResistType.NEGATIVE,
+                            threshold_mode=ResistThresholdMode.SIGMOID,
+                            base_threshold=0.5, sigmoid_steepness=20.0)
+        result = apply_resist_model(image, resist_model=model)
+        assert result[0, 0] > 0.5
+        assert result[1, 1] < 0.5
+
+    def test_tmr_field(self):
+        """测试 TMR 阈值调制"""
+        image = np.array([[0.4, 0.4], [0.4, 0.4]])
+        tmr = np.array([[0.0, 0.1], [-0.1, 0.0]])
+        model = ResistModel(tmr_enabled=True, tmr_field=tmr, base_threshold=0.4)
+        result = apply_resist_model(image, resist_model=model)
+        assert result[0, 0] == 1.0
+        assert result[0, 1] == 0.0
+        assert result[1, 0] == 1.0
+        assert result[1, 1] == 1.0
+
+    def test_tmr_shape_mismatch(self):
+        """测试 TMR 场形状不匹配时报错"""
+        image = np.ones((4, 4))
+        tmr = np.ones((3, 3))
+        model = ResistModel(tmr_enabled=True, tmr_field=tmr, base_threshold=0.3)
+        with pytest.raises(ValueError):
+            apply_resist_model(image, resist_model=model)
+
+    def test_none_resist_model_fallback(self):
+        """测试 resist_model=None 时回退到硬阈值"""
+        image = np.array([[0.2, 0.4], [0.6, 0.8]])
+        result = apply_resist_model(image, resist_model=None, threshold=0.5)
+        expected = _apply_threshold(image, 0.5)
+        np.testing.assert_array_equal(result, expected)
+
+
+class TestSimulateWaferWithResistModel:
+    """带高级光刻胶模型的晶圆仿真测试"""
+
+    def test_sigmoid_resist_in_simulation(self):
+        """测试 sigmoid 胶模型在仿真中的端到端运行"""
+        mask = np.zeros((32, 32))
+        mask[10:22, 10:22] = 1.0
+        model = ResistModel(threshold_mode=ResistThresholdMode.SIGMOID,
+                            base_threshold=0.3, sigmoid_steepness=30.0)
+        wafer = simulate_wafer_image(mask, resist_model=model)
+        assert wafer.shape == (32, 32)
+        assert wafer.dtype == np.float64
+
+    def test_negative_resist_in_simulation(self):
+        """测试负性胶在仿真中"""
+        image = np.array([[0.2, 0.8]])
+        model = ResistModel(resist_type=ResistType.NEGATIVE, base_threshold=0.5)
+        result = apply_resist_model(image, resist_model=model)
+        assert result[0, 0] == 1.0
+        assert result[0, 1] == 0.0
+
+    def test_car_resist_in_simulation(self):
+        """测试 CAR 模型在仿真中"""
+        mask = np.zeros((32, 32))
+        mask[10:22, 10:22] = 1.0
+        model = ResistModel(car_enabled=True, base_threshold=0.3,
+                            car_amplification=8.0, car_contrast=5.0)
+        wafer = simulate_wafer_image(mask, resist_model=model)
+        assert wafer.shape == (32, 32)
+        assert wafer.dtype == np.float64
+
+    def test_backward_compatible_no_resist_model(self):
+        """测试无 resist_model 时向后兼容"""
+        mask = np.zeros((32, 32))
+        mask[10:22, 10:22] = 1.0
+        wafer_old = simulate_wafer_image(mask, threshold=0.3, apply_resist=True)
+        wafer_new = simulate_wafer_image(mask, threshold=0.3, apply_resist=True,
+                                         resist_model=None)
+        np.testing.assert_array_equal(wafer_old, wafer_new)

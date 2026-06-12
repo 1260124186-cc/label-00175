@@ -1005,7 +1005,61 @@ class PartialCoherentImaging:
         return None
 
 
-@jit(nopython=True, cache=True)
+class ResistType(Enum):
+    POSITIVE = "positive"
+    NEGATIVE = "negative"
+
+
+class ResistThresholdMode(Enum):
+    HARD = "hard"
+    SIGMOID = "sigmoid"
+
+
+@dataclass
+class ResistModel:
+    """
+    高级光刻胶模型
+
+    封装光刻胶显影物理与近似方法，支持：
+    1. 阈值调制（TMR）—— 空间变化的阈值场
+    2. 化学放大光刻胶（CAR）简化显影模型
+    3. 正性/负性胶切换
+    4. 可微近似（sigmoid / soft threshold），用于端到端梯度优化
+
+    Attributes:
+        resist_type: 正性/负性光刻胶类型
+        threshold_mode: 阈值模式 —— HARD（硬阈值）或 SIGMOID（可微近似）
+        base_threshold: 基础阈值（归一化光强 0~1）
+        tmr_enabled: 是否启用阈值调制
+        tmr_field: 阈值调制场，形状与输入图像一致；
+                   调制后阈值 = base_threshold + tmr_field
+        car_enabled: 是否启用 CAR 简化显影模型
+        car_amplification: 化学放大倍率（CAR gain），>=1；
+                           越大越接近理想阶跃
+        car_contrast: CAR 对比度参数 n（Mack 模型指数），>=1
+        sigmoid_steepness: sigmoid 陡度参数 k，仅 threshold_mode=SIGMOID 时生效；
+                           越大越接近硬阈值，典型值 20~100
+    """
+    resist_type: ResistType = ResistType.POSITIVE
+    threshold_mode: ResistThresholdMode = ResistThresholdMode.HARD
+    base_threshold: float = 0.3
+    tmr_enabled: bool = False
+    tmr_field: Optional[np.ndarray] = None
+    car_enabled: bool = False
+    car_amplification: float = 10.0
+    car_contrast: float = 5.0
+    sigmoid_steepness: float = 50.0
+
+    def get_local_threshold(self, image_shape: Tuple[int, int]) -> np.ndarray:
+        if not self.tmr_enabled or self.tmr_field is None:
+            return np.full(image_shape, self.base_threshold, dtype=np.float64)
+        if self.tmr_field.shape != image_shape:
+            raise ValueError(
+                f"TMR 场形状 {self.tmr_field.shape} 与图像形状 {image_shape} 不匹配"
+            )
+        return self.base_threshold + self.tmr_field
+
+
 def _apply_threshold(image: np.ndarray, threshold: float) -> np.ndarray:
     """
     应用阈值处理（模拟光刻胶响应）
@@ -1028,11 +1082,192 @@ def _apply_threshold(image: np.ndarray, threshold: float) -> np.ndarray:
     return result
 
 
+@jit(nopython=True, cache=True)
+def _apply_sigmoid_threshold(image: np.ndarray, threshold: float,
+                             steepness: float) -> np.ndarray:
+    """
+    可微近似阈值（sigmoid soft threshold）
+
+    f(I) = σ(k·(I - T))  =  1 / (1 + exp(-k·(I - T)))
+
+    当 k → ∞ 时退化为硬阈值；有限 k 下处处可微，
+    梯度 df/dI = k·f·(1-f)，可用于端到端优化。
+
+    Args:
+        image: 输入光强图像
+        threshold: 阈值
+        steepness: sigmoid 陡度 k
+
+    Returns:
+        近似二值化图像，值域 (0, 1)
+    """
+    ny, nx = image.shape
+    result = np.zeros((ny, nx), dtype=np.float64)
+    for i in range(ny):
+        for j in range(nx):
+            arg = steepness * (image[i, j] - threshold)
+            if arg > 500.0:
+                result[i, j] = 1.0
+            elif arg < -500.0:
+                result[i, j] = 0.0
+            else:
+                result[i, j] = 1.0 / (1.0 + np.exp(-arg))
+    return result
+
+
+@jit(nopython=True, cache=True)
+def _apply_car_development(image: np.ndarray, threshold: float,
+                           amplification: float,
+                           contrast: float) -> np.ndarray:
+    """
+    化学放大光刻胶（CAR）简化显影模型
+
+    基于 Mack 显影模型的简化形式：
+
+        M(x) = 1 / (1 + (E_c / E(x))^(2·n))
+
+    其中 E(x) = A·I(x) 为有效曝光量，A 为化学放大倍率，
+    E_c = A·T 为临界曝光量，n 为对比度指数。
+
+    代入化简后：
+
+        M(x) = 1 / (1 + (T / I(x))^(2·n·A))
+
+    当 A·n >> 1 时趋近于理想阶跃。
+
+    对于负性胶，输出取反。
+
+    Args:
+        image: 输入光强图像（归一化 0~1）
+        threshold: 基础阈值 T
+        amplification: 化学放大倍率 A（>=1）
+        contrast: 对比度指数 n（>=1）
+
+    Returns:
+        显影后图像，值域 [0, 1]
+    """
+    ny, nx = image.shape
+    result = np.zeros((ny, nx), dtype=np.float64)
+    exponent = 2.0 * contrast * amplification
+    for i in range(ny):
+        for j in range(nx):
+            if threshold <= 0.0:
+                result[i, j] = 1.0
+            elif image[i, j] <= 0.0:
+                result[i, j] = 0.0
+            else:
+                ratio = threshold / image[i, j]
+                if ratio > 1e15:
+                    result[i, j] = 0.0
+                else:
+                    result[i, j] = 1.0 / (1.0 + ratio ** exponent)
+    return result
+
+
+def apply_resist_model(image: np.ndarray,
+                       resist_model: Optional[ResistModel] = None,
+                       threshold: float = 0.3) -> np.ndarray:
+    """
+    统一光刻胶响应入口
+
+    处理流程：阈值调制（TMR）→ CAR / sigmoid / 硬阈值 → 正性/负性翻转
+
+    Args:
+        image: 输入光强图像（归一化 0~1）
+        resist_model: 光刻胶模型配置，None 则使用硬阈值
+        threshold: 兼容旧接口的基础阈值，当 resist_model 为 None 时生效
+
+    Returns:
+        显影后晶圆图像
+    """
+    if resist_model is None:
+        return _apply_threshold(image, threshold)
+
+    local_threshold = resist_model.get_local_threshold(image.shape)
+
+    if resist_model.car_enabled:
+        if np.all(local_threshold == local_threshold[0, 0]):
+            result = _apply_car_development(
+                image, local_threshold[0, 0],
+                resist_model.car_amplification,
+                resist_model.car_contrast
+            )
+        else:
+            result = np.zeros_like(image, dtype=np.float64)
+            n_bins = 64
+            unique_thresh = np.unique(local_threshold)
+            if len(unique_thresh) > n_bins:
+                t_min = float(np.min(unique_thresh))
+                t_max = float(np.max(unique_thresh))
+                unique_thresh = np.linspace(t_min, t_max, n_bins)
+            for t_val in unique_thresh:
+                mask_t = np.isclose(local_threshold, t_val)
+                if not np.any(mask_t):
+                    continue
+                sub_image = image[mask_t]
+                sub_result = _apply_car_development(
+                    sub_image.reshape(1, -1), float(t_val),
+                    resist_model.car_amplification,
+                    resist_model.car_contrast
+                )
+                result[mask_t] = sub_result.ravel()
+    elif resist_model.threshold_mode == ResistThresholdMode.SIGMOID:
+        if np.all(local_threshold == local_threshold[0, 0]):
+            result = _apply_sigmoid_threshold(
+                image, local_threshold[0, 0],
+                resist_model.sigmoid_steepness
+            )
+        else:
+            result = np.zeros_like(image, dtype=np.float64)
+            n_bins = 64
+            unique_thresh = np.unique(local_threshold)
+            if len(unique_thresh) > n_bins:
+                t_min = float(np.min(unique_thresh))
+                t_max = float(np.max(unique_thresh))
+                unique_thresh = np.linspace(t_min, t_max, n_bins)
+            for t_val in unique_thresh:
+                mask_t = np.isclose(local_threshold, t_val)
+                if not np.any(mask_t):
+                    continue
+                sub_image = image[mask_t]
+                sub_result = _apply_sigmoid_threshold(
+                    sub_image.reshape(1, -1), float(t_val),
+                    resist_model.sigmoid_steepness
+                )
+                result[mask_t] = sub_result.ravel()
+    else:
+        if np.all(local_threshold == local_threshold[0, 0]):
+            result = _apply_threshold(image, local_threshold[0, 0])
+        else:
+            result = np.zeros_like(image, dtype=np.float64)
+            n_bins = 64
+            unique_thresh = np.unique(local_threshold)
+            if len(unique_thresh) > n_bins:
+                t_min = float(np.min(unique_thresh))
+                t_max = float(np.max(unique_thresh))
+                unique_thresh = np.linspace(t_min, t_max, n_bins)
+            for t_val in unique_thresh:
+                mask_t = np.isclose(local_threshold, t_val)
+                if not np.any(mask_t):
+                    continue
+                sub_image = image[mask_t]
+                sub_result = _apply_threshold(
+                    sub_image.reshape(1, -1), float(t_val)
+                )
+                result[mask_t] = sub_result.ravel()
+
+    if resist_model.resist_type == ResistType.NEGATIVE:
+        result = 1.0 - result
+
+    return result
+
+
 def simulate_wafer_image(mask: np.ndarray,
                          optical_system: Optional[OpticalSystem] = None,
                          threshold: float = 0.3,
                          apply_resist: bool = True,
-                         dose: float = 1.0) -> np.ndarray:
+                         dose: float = 1.0,
+                         resist_model: Optional[ResistModel] = None) -> np.ndarray:
     """
     模拟晶圆成像
 
@@ -1041,9 +1276,10 @@ def simulate_wafer_image(mask: np.ndarray,
     Args:
         mask: 掩模图案 (2D numpy数组)
         optical_system: 光学系统参数，None则使用默认参数
-        threshold: 光刻胶阈值
-        apply_resist: 是否应用光刻胶阈值处理
+        threshold: 光刻胶阈值（当 resist_model 为 None 时生效）
+        apply_resist: 是否应用光刻胶响应
         dose: 曝光相对剂量，1.0为标称剂量，大于1为过曝，小于1为欠曝
+        resist_model: 高级光刻胶模型配置，优先于 threshold/apply_resist 参数
 
     Returns:
         晶圆成像结果
@@ -1058,7 +1294,9 @@ def simulate_wafer_image(mask: np.ndarray,
     if dose != 1.0:
         aerial_image = np.clip(aerial_image * dose, 0.0, 1.0)
 
-    if apply_resist:
+    if resist_model is not None:
+        wafer_image = apply_resist_model(aerial_image, resist_model=resist_model)
+    elif apply_resist:
         wafer_image = _apply_threshold(aerial_image, threshold)
     else:
         wafer_image = aerial_image
@@ -1071,7 +1309,8 @@ def simulate_multi_process(
     conditions: List[ProcessCondition],
     base_optics: Optional[OpticalSystem] = None,
     threshold: float = 0.3,
-    apply_resist: bool = True
+    apply_resist: bool = True,
+    resist_model: Optional[ResistModel] = None
 ) -> MultiProcessSimulationResult:
     """
     多工艺条件联合仿真
@@ -1083,8 +1322,9 @@ def simulate_multi_process(
         mask: 掩模图案 (2D numpy数组)
         conditions: 工艺条件列表
         base_optics: 基础光学系统（提供未在ProcessCondition中定义的参数）
-        threshold: 光刻胶阈值
-        apply_resist: 是否应用光刻胶阈值处理
+        threshold: 光刻胶阈值（当 resist_model 为 None 时生效）
+        apply_resist: 是否应用光刻胶响应
+        resist_model: 高级光刻胶模型配置，优先于 threshold/apply_resist 参数
 
     Returns:
         MultiProcessSimulationResult，包含所有工艺条件下的仿真结果
@@ -1105,7 +1345,9 @@ def simulate_multi_process(
         else:
             aerial_dosed = aerial.copy()
 
-        if apply_resist:
+        if resist_model is not None:
+            wafer = apply_resist_model(aerial_dosed, resist_model=resist_model)
+        elif apply_resist:
             wafer = _apply_threshold(aerial_dosed, threshold)
         else:
             wafer = aerial_dosed.copy()
