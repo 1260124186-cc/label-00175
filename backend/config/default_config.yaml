@@ -9,6 +9,19 @@ optical_system:
   pixel_size: 1.0        # 像素尺寸 (nm)
   defocus: 0.0           # 离焦量 (nm)
   magnification: 4.0     # 放大倍率
+  # 照明模式: conventional, annular, dipole, quasar, custom
+  illumination_type: conventional
+  # 光源形状参数
+  source_params:
+    # conventional/annular: sigma_inner, sigma_outer
+    sigma_inner: 0.0
+    sigma_outer: 0.75
+    # dipole/quasar: angle, opening_angle
+    # angle: 0.0           # 极角 (度)
+    # opening_angle: 60.0  # 开口角 (度)
+  # SOCS低秩分解配置
+  use_socs: true         # 是否使用SOCS加速
+  socs_num_terms: 5      # SOCS分解项数
 
 # 优化参数
 optimization:
