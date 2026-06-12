@@ -228,6 +228,7 @@ class OptimizationConfig:
     population_size: int = 50
     crossover_rate: float = 0.8
     mutation_rate: float = 0.1
+    n_jobs: int = 1
 
     # 多工艺条件联合优化
     use_multi_process: bool = False
@@ -434,14 +435,16 @@ class MaskOptimizer:
                 crossover_rate=self.config.crossover_rate,
                 mutation_rate=self.config.mutation_rate,
                 verbose=self.config.verbose,
-                seed=seed  # 传递随机种子
+                seed=seed,
+                n_jobs=self.config.n_jobs
             )
         elif opt_type == 'pso':
             self._optimizer = ParticleSwarmOptimizer(
                 population_size=self.config.population_size,
                 max_iter=self.config.max_iter,
                 verbose=self.config.verbose,
-                seed=seed  # 传递随机种子
+                seed=seed,
+                n_jobs=self.config.n_jobs
             )
         else:
             raise ValueError(f"未知的优化器类型: {opt_type}")

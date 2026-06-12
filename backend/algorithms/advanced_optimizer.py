@@ -13,10 +13,28 @@ from abc import ABC, abstractmethod
 from typing import Callable, Optional, Tuple, List
 from dataclasses import dataclass, field
 import logging
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from algorithms.optimizer import OptimizationResult
 
 logger = logging.getLogger(__name__)
+
+
+def _evaluate_single(args):
+    """
+    模块级辅助函数：评估单个个体的适应度
+
+    必须是模块级函数才能被 multiprocessing pickle。
+
+    Args:
+        args: (objective_func, individual, shape) 元组
+
+    Returns:
+        适应度值
+    """
+    objective_func, individual, shape = args
+    return objective_func(individual.reshape(shape))
 
 
 class BaseHeuristicOptimizer(ABC):
@@ -30,7 +48,8 @@ class BaseHeuristicOptimizer(ABC):
                  population_size: int = 50,
                  max_iter: int = 100,
                  seed: Optional[int] = None,
-                 verbose: bool = False):
+                 verbose: bool = False,
+                 n_jobs: int = 1):
         """
         初始化启发式优化器
         
@@ -39,14 +58,72 @@ class BaseHeuristicOptimizer(ABC):
             max_iter: 最大迭代次数
             seed: 随机种子（用于结果复现）
             verbose: 是否输出详细信息
+            n_jobs: 并行工作进程数，1表示串行，-1表示使用所有CPU核心
         """
         self.population_size = population_size
         self.max_iter = max_iter
         self.verbose = verbose
         self.history: List[float] = []
-        
+        self.n_jobs = self._resolve_n_jobs(n_jobs)
+        self._parallel_available = None
+
         if seed is not None:
             np.random.seed(seed)
+
+    def _resolve_n_jobs(self, n_jobs: int) -> int:
+        """解析 n_jobs 参数，-1 表示使用所有 CPU 核心"""
+        if n_jobs == -1:
+            return os.cpu_count() or 1
+        return max(1, n_jobs)
+
+    def _evaluate_population(self,
+                             population: np.ndarray,
+                             objective: Callable[[np.ndarray], float],
+                             shape: Tuple[int, ...]) -> np.ndarray:
+        """
+        评估种群中所有个体的适应度
+
+        当 n_jobs > 1 时使用多进程并行评估，否则串行评估。
+        如果并行执行失败（如pickle错误），自动回退到串行模式。
+
+        Args:
+            population: 种群数组，形状为 (population_size, dim)
+            objective: 目标函数
+            shape: 个体的原始形状（用于reshape）
+
+        Returns:
+            适应度数组，形状为 (population_size,)
+        """
+        n = len(population)
+
+        if self.n_jobs == 1 or n <= 1:
+            return np.array([objective(ind.reshape(shape)) for ind in population])
+
+        if self._parallel_available is False:
+            return np.array([objective(ind.reshape(shape)) for ind in population])
+
+        try:
+            tasks = [(objective, population[i], shape) for i in range(n)]
+            results = [None] * n
+
+            with ProcessPoolExecutor(max_workers=self.n_jobs) as executor:
+                future_to_idx = {
+                    executor.submit(_evaluate_single, tasks[i]): i
+                    for i in range(n)
+                }
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    results[idx] = future.result()
+
+            self._parallel_available = True
+            return np.array(results)
+
+        except Exception as e:
+            logger.warning(
+                f"并行适应度评估失败，回退到串行模式: {e}"
+            )
+            self._parallel_available = False
+            return np.array([objective(ind.reshape(shape)) for ind in population])
     
     @abstractmethod
     def optimize(self,
@@ -122,8 +199,8 @@ class GeneticAlgorithmOptimizer(BaseHeuristicOptimizer):
         nfev = 0
         
         for gen in range(self.max_iter):
-            # 评估适应度
-            fitness = np.array([objective(ind.reshape(shape)) for ind in population])
+            # 评估适应度（支持并行）
+            fitness = self._evaluate_population(population, objective, shape)
             nfev += len(population)
             
             # 记录最优
@@ -263,7 +340,7 @@ class ParticleSwarmOptimizer(BaseHeuristicOptimizer):
         
         # 个体最优和全局最优
         pbest = positions.copy()
-        pbest_fitness = np.array([objective(p.reshape(shape)) for p in positions])
+        pbest_fitness = self._evaluate_population(positions, objective, shape)
         
         gbest_idx = np.argmin(pbest_fitness)
         gbest = pbest[gbest_idx].copy()
@@ -288,8 +365,8 @@ class ParticleSwarmOptimizer(BaseHeuristicOptimizer):
             positions = positions + velocities
             positions = np.clip(positions, bounds[0], bounds[1])
             
-            # 评估适应度
-            fitness = np.array([objective(p.reshape(shape)) for p in positions])
+            # 评估适应度（支持并行）
+            fitness = self._evaluate_population(positions, objective, shape)
             nfev += self.population_size
             
             # 更新个体最优
@@ -716,8 +793,8 @@ class DifferentialEvolutionOptimizer(BaseHeuristicOptimizer):
             size=(self.population_size, dim)
         )
 
-        # 评估初始种群
-        fitness = np.array([objective(ind.reshape(shape)) for ind in population])
+        # 评估初始种群（支持并行）
+        fitness = self._evaluate_population(population, objective, shape)
         nfev = self.population_size
 
         best_idx = np.argmin(fitness)
@@ -727,6 +804,9 @@ class DifferentialEvolutionOptimizer(BaseHeuristicOptimizer):
         self.history = [best_f]
 
         for gen in range(self.max_iter):
+            # 批量生成所有 trial 向量
+            trials = np.empty_like(population)
+
             for i in range(self.population_size):
                 # 选择变异基向量
                 if self.strategy.startswith('best'):
@@ -754,20 +834,23 @@ class DifferentialEvolutionOptimizer(BaseHeuristicOptimizer):
                 trial = np.where(cross_mask, donor, population[i])
 
                 # 边界处理
-                trial = np.clip(trial, bounds[0], bounds[1])
+                trials[i] = np.clip(trial, bounds[0], bounds[1])
 
-                # 选择
-                trial_f = objective(trial.reshape(shape))
-                nfev += 1
+            # 并行评估所有 trial
+            trial_fitness = self._evaluate_population(trials, objective, shape)
+            nfev += self.population_size
 
-                if trial_f < fitness[i]:
-                    population[i] = trial
-                    fitness[i] = trial_f
+            # 选择更新（代模式）
+            improved = trial_fitness < fitness
+            population[improved] = trials[improved]
+            fitness[improved] = trial_fitness[improved]
 
-                    if trial_f < best_f:
-                        best_f = trial_f
-                        best_x = trial.copy()
-                        best_idx = i
+            # 更新全局最优
+            current_best_idx = np.argmin(fitness)
+            if fitness[current_best_idx] < best_f:
+                best_f = fitness[current_best_idx]
+                best_x = population[current_best_idx].copy()
+                best_idx = current_best_idx
 
             self.history.append(best_f)
 
@@ -859,8 +942,8 @@ class CMAESOptimizer(BaseHeuristicOptimizer):
             # 边界约束
             X = np.clip(X, bounds[0], bounds[1])
 
-            # 评估
-            fitness = np.array([objective(x.reshape(shape)) for x in X])
+            # 评估（支持并行）
+            fitness = self._evaluate_population(X, objective, shape)
             nfev += lam
 
             # 排序

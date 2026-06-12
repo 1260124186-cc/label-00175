@@ -71,6 +71,7 @@ optimization:
   population_size: 50               # 种群大小
   crossover_rate: 0.8               # 交叉概率
   mutation_rate: 0.1                # 变异概率
+  n_jobs: 1                         # 并行工作进程数，1表示串行，-1表示使用所有CPU核心
 
   # 强化学习参数
   rl_gamma: 0.99                    # 折扣因子

@@ -234,7 +234,8 @@ def create_default_config() -> Dict[str, Any]:
             'random_seed': 42,  # 随机种子用于结果复现
             'population_size': 50,
             'crossover_rate': 0.8,
-            'mutation_rate': 0.1
+            'mutation_rate': 0.1,
+            'n_jobs': 1
         },
         'output': {
             'save_dir': './results',
