@@ -9,13 +9,18 @@ from algorithms.optimizer import (
     GradientDescentOptimizer,
     BFGSOptimizer,
     NewtonOptimizer,
+    AdamOptimizer,
+    RMSpropOptimizer,
     OptimizationResult
 )
 from algorithms.advanced_optimizer import (
     GeneticAlgorithmOptimizer,
     ParticleSwarmOptimizer,
     ReinforcementLearningOptimizer,
-    SimpleQLearningModel
+    SimpleQLearningModel,
+    SimulatedAnnealingOptimizer,
+    DifferentialEvolutionOptimizer,
+    CMAESOptimizer
 )
 from algorithms.mask_optimizer import (
     MaskOptimizer,
@@ -423,3 +428,276 @@ class TestReinforcementLearningOptimizer:
         # 探索率应该衰减
         assert optimizer.epsilon < 1.0
         assert optimizer.epsilon >= 0.1
+
+
+class TestAdamOptimizer:
+    """Adam 优化器测试"""
+
+    def test_simple_quadratic(self):
+        """测试简单二次函数优化"""
+        def objective(x):
+            return np.sum(x ** 2)
+
+        def gradient(x):
+            return 2 * x
+
+        optimizer = AdamOptimizer(
+            learning_rate=0.1,
+            max_iter=200,
+            tol=1e-6
+        )
+
+        x0 = np.array([5.0, 5.0])
+        result = optimizer.optimize(objective, x0, gradient)
+
+        assert result.fun < 0.01
+        assert np.allclose(result.x, [0, 0], atol=0.1)
+
+    def test_without_gradient(self):
+        """测试不提供梯度时使用数值梯度"""
+        def objective(x):
+            return np.sum((x - 1.0) ** 2)
+
+        optimizer = AdamOptimizer(
+            learning_rate=0.05,
+            max_iter=300
+        )
+
+        x0 = np.array([2.0, 2.0])
+        result = optimizer.optimize(objective, x0)
+
+        assert result.fun < 0.1
+        assert np.allclose(result.x, [1.0, 1.0], atol=0.2)
+
+    def test_history_recorded(self):
+        """测试历史记录"""
+        def objective(x):
+            return np.sum(x ** 2)
+
+        optimizer = AdamOptimizer(max_iter=10)
+        x0 = np.array([1.0, 1.0])
+        result = optimizer.optimize(objective, x0)
+
+        assert len(result.history) > 0
+        assert result.history[-1] <= result.history[0]
+
+
+class TestRMSpropOptimizer:
+    """RMSprop 优化器测试"""
+
+    def test_simple_quadratic(self):
+        """测试简单二次函数优化"""
+        def objective(x):
+            return np.sum(x ** 2)
+
+        def gradient(x):
+            return 2 * x
+
+        optimizer = RMSpropOptimizer(
+            learning_rate=0.05,
+            max_iter=200,
+            tol=1e-6
+        )
+
+        x0 = np.array([5.0, 5.0])
+        result = optimizer.optimize(objective, x0, gradient)
+
+        assert result.fun < 0.01
+        assert np.allclose(result.x, [0, 0], atol=0.1)
+
+    def test_with_momentum(self):
+        """测试带动量的 RMSprop"""
+        def objective(x):
+            return np.sum((x - 2.0) ** 2)
+
+        def gradient(x):
+            return 2 * (x - 2.0)
+
+        optimizer = RMSpropOptimizer(
+            learning_rate=0.01,
+            momentum=0.9,
+            max_iter=300
+        )
+
+        x0 = np.array([0.0, 0.0])
+        result = optimizer.optimize(objective, x0, gradient)
+
+        assert result.fun < 0.1
+        assert np.allclose(result.x, [2.0, 2.0], atol=0.2)
+
+    def test_with_bounds(self):
+        """测试带边界约束"""
+        def objective(x):
+            return np.sum((x - 0.5) ** 2)
+
+        optimizer = RMSpropOptimizer(
+            learning_rate=0.05,
+            max_iter=100
+        )
+
+        x0 = np.array([0.0, 0.0])
+        result = optimizer.optimize(objective, x0, bounds=(0.0, 1.0))
+
+        assert np.all(result.x >= 0)
+        assert np.all(result.x <= 1)
+
+
+class TestSimulatedAnnealingOptimizer:
+    """模拟退火优化器测试"""
+
+    def test_simple_optimization(self):
+        """测试简单优化问题"""
+        def objective(x):
+            return np.sum(x ** 2)
+
+        optimizer = SimulatedAnnealingOptimizer(
+            initial_temperature=10.0,
+            cooling_rate=0.95,
+            step_size=0.2,
+            max_iter=200,
+            seed=42
+        )
+
+        x0 = np.array([5.0, 5.0])
+        result = optimizer.optimize(objective, x0, bounds=(-10, 10))
+
+        initial_value = np.sum(x0 ** 2)
+        assert result.fun < initial_value
+
+    def test_bounds_respected(self):
+        """测试边界约束被遵守"""
+        def objective(x):
+            return np.sum(x ** 2)
+
+        optimizer = SimulatedAnnealingOptimizer(
+            max_iter=50,
+            seed=42
+        )
+
+        x0 = np.array([0.5, 0.5])
+        result = optimizer.optimize(objective, x0, bounds=(0.0, 1.0))
+
+        assert np.all(result.x >= 0.0)
+        assert np.all(result.x <= 1.0)
+
+    def test_history_recorded(self):
+        """测试历史记录"""
+        def objective(x):
+            return np.sum(x ** 2)
+
+        optimizer = SimulatedAnnealingOptimizer(
+            max_iter=20,
+            seed=42
+        )
+        x0 = np.array([1.0, 1.0])
+        result = optimizer.optimize(objective, x0)
+
+        assert len(result.history) > 0
+
+
+class TestDifferentialEvolutionOptimizer:
+    """差分进化优化器测试"""
+
+    def test_simple_optimization(self):
+        """测试简单优化问题"""
+        def objective(x):
+            return np.sum(x ** 2)
+
+        optimizer = DifferentialEvolutionOptimizer(
+            population_size=30,
+            max_iter=100,
+            seed=42
+        )
+
+        x0 = np.array([5.0, 5.0])
+        result = optimizer.optimize(objective, x0, bounds=(-10, 10))
+
+        assert result.fun < 1.0
+
+    def test_reproducibility(self):
+        """测试结果可复现性"""
+        def objective(x):
+            return np.sum(x ** 2)
+
+        x0 = np.array([5.0, 5.0])
+
+        optimizer1 = DifferentialEvolutionOptimizer(
+            population_size=20, max_iter=30, seed=42
+        )
+        result1 = optimizer1.optimize(objective, x0)
+
+        optimizer2 = DifferentialEvolutionOptimizer(
+            population_size=20, max_iter=30, seed=42
+        )
+        result2 = optimizer2.optimize(objective, x0)
+
+        assert abs(result1.fun - result2.fun) < 1e-10
+
+    def test_different_strategies(self):
+        """测试不同变异策略"""
+        def objective(x):
+            return np.sum((x - 1.0) ** 2)
+
+        for strategy in ['best1bin', 'rand1bin']:
+            optimizer = DifferentialEvolutionOptimizer(
+                population_size=20,
+                max_iter=50,
+                strategy=strategy,
+                seed=42
+            )
+            x0 = np.array([0.0, 0.0])
+            result = optimizer.optimize(objective, x0, bounds=(-5, 5))
+            assert result.fun < 5.0
+
+
+class TestCMAESOptimizer:
+    """CMA-ES 优化器测试"""
+
+    def test_simple_optimization(self):
+        """测试简单优化问题"""
+        def objective(x):
+            return np.sum(x ** 2)
+
+        optimizer = CMAESOptimizer(
+            population_size=20,
+            max_iter=50,
+            sigma=0.5,
+            seed=42
+        )
+
+        x0 = np.array([2.0, 2.0])
+        result = optimizer.optimize(objective, x0, bounds=(-5, 5))
+
+        assert result.fun < 1.0
+
+    def test_history_recorded(self):
+        """测试历史记录"""
+        def objective(x):
+            return np.sum(x ** 2)
+
+        optimizer = CMAESOptimizer(
+            population_size=15,
+            max_iter=10,
+            seed=42
+        )
+        x0 = np.array([1.0, 1.0])
+        result = optimizer.optimize(objective, x0)
+
+        assert len(result.history) > 0
+
+    def test_bounds_respected(self):
+        """测试边界约束"""
+        def objective(x):
+            return np.sum(x ** 2)
+
+        optimizer = CMAESOptimizer(
+            population_size=15,
+            max_iter=20,
+            seed=42
+        )
+
+        x0 = np.array([0.5, 0.5])
+        result = optimizer.optimize(objective, x0, bounds=(0.0, 1.0))
+
+        assert np.all(result.x >= 0.0)
+        assert np.all(result.x <= 1.0)

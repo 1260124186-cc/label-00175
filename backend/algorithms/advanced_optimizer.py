@@ -578,5 +578,352 @@ class SimpleQLearningModel:
             error = target - np.mean(current_q)
             self.weights += self.lr * np.outer(state, np.ones(self.action_dim)) * error
             total_loss += error ** 2
-        
+
         return total_loss / len(batch)
+
+
+class SimulatedAnnealingOptimizer(BaseHeuristicOptimizer):
+    """
+    模拟退火优化器 (Simulated Annealing, SA)
+
+    基于金属退火原理的随机优化算法，允许以一定概率接受更差的解，
+    从而有能力跳出局部最优。
+    """
+
+    def __init__(self,
+                 initial_temperature: float = 100.0,
+                 cooling_rate: float = 0.95,
+                 min_temperature: float = 1e-8,
+                 step_size: float = 0.1,
+                 **kwargs):
+        """
+        初始化模拟退火优化器
+
+        Args:
+            initial_temperature: 初始温度
+            cooling_rate: 温度衰减系数 (0, 1)
+            min_temperature: 最低温度
+            step_size: 邻域搜索步长
+        """
+        super().__init__(**kwargs)
+        self.initial_temperature = initial_temperature
+        self.cooling_rate = cooling_rate
+        self.min_temperature = min_temperature
+        self.step_size = step_size
+
+    def optimize(self,
+                 objective: Callable[[np.ndarray], float],
+                 x0: np.ndarray,
+                 bounds: Tuple[float, float] = (0.0, 1.0),
+                 **kwargs) -> OptimizationResult:
+        """执行模拟退火优化"""
+        shape = x0.shape
+        dim = x0.size
+
+        current_x = x0.copy().flatten()
+        current_f = objective(current_x.reshape(shape))
+
+        best_x = current_x.copy()
+        best_f = current_f
+
+        temperature = self.initial_temperature
+        self.history = [best_f]
+        nfev = 1
+        it = 0
+
+        while temperature > self.min_temperature and it < self.max_iter:
+            # 在邻域内生成新解
+            noise = np.random.normal(0, self.step_size, dim)
+            candidate_x = current_x + noise
+            candidate_x = np.clip(candidate_x, bounds[0], bounds[1])
+
+            candidate_f = objective(candidate_x.reshape(shape))
+            nfev += 1
+
+            # 计算接受概率
+            delta = candidate_f - current_f
+            if delta < 0:
+                accept = True
+            else:
+                accept_prob = np.exp(-delta / temperature)
+                accept = np.random.random() < accept_prob
+
+            if accept:
+                current_x = candidate_x
+                current_f = candidate_f
+
+                if current_f < best_f:
+                    best_x = current_x.copy()
+                    best_f = current_f
+
+            self.history.append(best_f)
+
+            if self.verbose and it % 10 == 0:
+                logger.info(
+                    f"迭代 {it}: T = {temperature:.4e}, best_f = {best_f:.6e}")
+
+            temperature *= self.cooling_rate
+            it += 1
+
+        return OptimizationResult(
+            x=best_x.reshape(shape),
+            fun=best_f,
+            nit=it,
+            nfev=nfev,
+            success=True,
+            message="模拟退火优化完成",
+            history=self.history
+        )
+
+
+class DifferentialEvolutionOptimizer(BaseHeuristicOptimizer):
+    """
+    差分进化优化器 (Differential Evolution, DE)
+
+    基于种群的进化算法，通过差分变异、交叉和选择操作搜索最优解。
+    """
+
+    def __init__(self,
+                 f: float = 0.8,
+                 cr: float = 0.7,
+                 strategy: str = 'best1bin',
+                 **kwargs):
+        """
+        初始化差分进化优化器
+
+        Args:
+            f: 差分缩放因子 (0, 2]
+            cr: 交叉概率 [0, 1]
+            strategy: 变异策略 ('best1bin', 'rand1bin', 'rand2bin')
+        """
+        super().__init__(**kwargs)
+        self.f = f
+        self.cr = cr
+        self.strategy = strategy
+
+    def optimize(self,
+                 objective: Callable[[np.ndarray], float],
+                 x0: np.ndarray,
+                 bounds: Tuple[float, float] = (0.0, 1.0),
+                 **kwargs) -> OptimizationResult:
+        """执行差分进化优化"""
+        shape = x0.shape
+        dim = x0.size
+
+        # 初始化种群
+        population = np.random.uniform(
+            bounds[0], bounds[1],
+            size=(self.population_size, dim)
+        )
+
+        # 评估初始种群
+        fitness = np.array([objective(ind.reshape(shape)) for ind in population])
+        nfev = self.population_size
+
+        best_idx = np.argmin(fitness)
+        best_x = population[best_idx].copy()
+        best_f = fitness[best_idx]
+
+        self.history = [best_f]
+
+        for gen in range(self.max_iter):
+            for i in range(self.population_size):
+                # 选择变异基向量
+                if self.strategy.startswith('best'):
+                    base = population[best_idx]
+                else:
+                    base = population[np.random.randint(self.population_size)]
+
+                # 选择差分向量
+                candidates = [j for j in range(self.population_size) if j != i]
+                if self.strategy.endswith('2bin'):
+                    r1, r2, r3, r4 = np.random.choice(
+                        candidates, 4, replace=False)
+                    donor = base + self.f * (
+                        population[r1] - population[r2] +
+                        population[r3] - population[r4]
+                    )
+                else:
+                    r1, r2, r3 = np.random.choice(
+                        candidates, 3, replace=False)
+                    donor = base + self.f * (population[r1] - population[r2])
+
+                # 二项式交叉
+                cross_mask = np.random.random(dim) < self.cr
+                cross_mask[np.random.randint(dim)] = True
+                trial = np.where(cross_mask, donor, population[i])
+
+                # 边界处理
+                trial = np.clip(trial, bounds[0], bounds[1])
+
+                # 选择
+                trial_f = objective(trial.reshape(shape))
+                nfev += 1
+
+                if trial_f < fitness[i]:
+                    population[i] = trial
+                    fitness[i] = trial_f
+
+                    if trial_f < best_f:
+                        best_f = trial_f
+                        best_x = trial.copy()
+                        best_idx = i
+
+            self.history.append(best_f)
+
+            if self.verbose and gen % 10 == 0:
+                logger.info(f"代数 {gen}: 最优适应度 = {best_f:.6e}")
+
+        return OptimizationResult(
+            x=best_x.reshape(shape),
+            fun=best_f,
+            nit=self.max_iter,
+            nfev=nfev,
+            success=True,
+            message="差分进化优化完成",
+            history=self.history
+        )
+
+
+class CMAESOptimizer(BaseHeuristicOptimizer):
+    """
+    CMA-ES 协方差矩阵自适应进化策略
+
+    基于正态分布采样的进化算法，自适应调整协方差矩阵以适应目标函数地形。
+    """
+
+    def __init__(self,
+                 sigma: float = 0.3,
+                 **kwargs):
+        """
+        初始化 CMA-ES 优化器
+
+        Args:
+            sigma: 初始步长（分布标准差）
+        """
+        super().__init__(**kwargs)
+        self.sigma_init = sigma
+
+    def optimize(self,
+                 objective: Callable[[np.ndarray], float],
+                 x0: np.ndarray,
+                 bounds: Tuple[float, float] = (0.0, 1.0),
+                 **kwargs) -> OptimizationResult:
+        """执行 CMA-ES 优化"""
+        shape = x0.shape
+        dim = x0.size
+
+        mean = x0.copy().flatten()
+        sigma = self.sigma_init
+        C = np.eye(dim)
+        p_c = np.zeros(dim)
+        p_s = np.zeros(dim)
+        B, D = np.eye(dim), np.ones(dim)
+
+        # 种群大小
+        lam = self.population_size
+        mu = lam // 2
+
+        # 权重计算
+        weights = np.log(mu + 0.5) - np.log(np.arange(1, mu + 1))
+        weights /= weights.sum()
+        mueff = 1.0 / (weights ** 2).sum()
+
+        # 学习率
+        cc = (4 + mueff / dim) / (dim + 4 + 2 * mueff / dim)
+        cs = (mueff + 2) / (dim + mueff + 5)
+        c1 = 2 / ((dim + 1.3) ** 2 + mueff)
+        cmu = min(1 - c1, 2 * (mueff - 2 + 1 / mueff) /
+                  ((dim + 2) ** 2 + mueff))
+        damps = 1 + 2 * max(0, np.sqrt((mueff - 1) / (dim + 1)) - 1) + cs
+        chiN = np.sqrt(dim) * (1 - 1 / (4 * dim) + 1 / (21 * dim ** 2))
+
+        self.history = []
+        best_x = mean.copy()
+        best_f = float('inf')
+        nfev = 0
+
+        for gen in range(self.max_iter):
+            # 采样
+            try:
+                Z = np.random.randn(lam, dim)
+                Y = Z @ (B * D).T
+                X = mean + sigma * Y
+            except np.linalg.LinAlgError:
+                C = np.eye(dim)
+                B, D = np.eye(dim), np.ones(dim)
+                Z = np.random.randn(lam, dim)
+                Y = Z @ (B * D).T
+                X = mean + sigma * Y
+
+            # 边界约束
+            X = np.clip(X, bounds[0], bounds[1])
+
+            # 评估
+            fitness = np.array([objective(x.reshape(shape)) for x in X])
+            nfev += lam
+
+            # 排序
+            idx = np.argsort(fitness)
+            X_sorted = X[idx]
+            Y_sorted = Y[idx]
+            Z_sorted = Z[idx]
+
+            # 更新历史最优
+            if fitness[idx[0]] < best_f:
+                best_f = fitness[idx[0]]
+                best_x = X_sorted[0].copy()
+
+            self.history.append(best_f)
+
+            if self.verbose and gen % 10 == 0:
+                logger.info(f"迭代 {gen}: 最优适应度 = {best_f:.6e}")
+
+            # 加权均值
+            y_w = np.sum(weights[:, None] * Y_sorted[:mu], axis=0)
+            mean_new = mean + sigma * y_w
+            mean_new = np.clip(mean_new, bounds[0], bounds[1])
+
+            # 进化路径
+            z_w = np.sum(weights[:, None] * Z_sorted[:mu], axis=0)
+            p_s = (1 - cs) * p_s + np.sqrt(cs * (2 - cs) * mueff) * z_w
+            hsig = (np.linalg.norm(p_s) /
+                    np.sqrt(1 - (1 - cs) ** (2 * (gen + 1))) / chiN <
+                    1.4 + 2 / (dim + 1))
+            p_c = (1 - cc) * p_c + hsig * \
+                np.sqrt(cc * (2 - cc) * mueff) * y_w
+
+            # 更新协方差矩阵
+            C = (1 - c1 - cmu) * C + c1 * (np.outer(p_c, p_c) + (1 - hsig)
+                                            * cc * (2 - cc) * C)
+            for k in range(mu):
+                C += cmu * weights[k] * np.outer(Y_sorted[k], Y_sorted[k])
+
+            # 对称化并强制正定
+            C = np.triu(C) + np.triu(C, 1).T
+
+            # 特征分解
+            try:
+                D2, B = np.linalg.eigh(C)
+                D2 = np.maximum(D2, 1e-14)
+                D = np.sqrt(D2)
+            except np.linalg.LinAlgError:
+                C = np.eye(dim)
+                B, D = np.eye(dim), np.ones(dim)
+
+            # 更新步长
+            sigma *= np.exp((cs / damps) *
+                            (np.linalg.norm(p_s) / chiN - 1))
+            sigma = max(sigma, 1e-10)
+
+            mean = mean_new
+
+        return OptimizationResult(
+            x=best_x.reshape(shape),
+            fun=best_f,
+            nit=self.max_iter,
+            nfev=nfev,
+            success=True,
+            message="CMA-ES 优化完成",
+            history=self.history
+        )

@@ -445,3 +445,207 @@ class BFGSOptimizer(BaseOptimizer):
             message=result.message,
             history=self.history
         )
+
+
+class AdamOptimizer(BaseOptimizer):
+    """
+    Adam 自适应矩估计优化器
+
+    结合动量法和 RMSprop 的自适应学习率优化算法。
+    """
+
+    def __init__(self,
+                 learning_rate: float = 0.001,
+                 beta1: float = 0.9,
+                 beta2: float = 0.999,
+                 epsilon: float = 1e-8,
+                 **kwargs):
+        """
+        初始化 Adam 优化器
+
+        Args:
+            learning_rate: 学习率
+            beta1: 一阶矩估计的指数衰减率
+            beta2: 二阶矩估计的指数衰减率
+            epsilon: 数值稳定常数
+        """
+        super().__init__(**kwargs)
+        self.learning_rate = learning_rate
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.epsilon = epsilon
+
+    def optimize(self,
+                 objective: Callable[[np.ndarray], float],
+                 x0: np.ndarray,
+                 gradient: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+                 bounds: Optional[Tuple[float, float]] = None,
+                 **kwargs) -> OptimizationResult:
+        """执行 Adam 优化"""
+        x = x0.copy().flatten()
+        m = np.zeros_like(x)
+        v = np.zeros_like(x)
+
+        self.history = []
+        f_val = objective(x.reshape(x0.shape))
+        self.history.append(f_val)
+
+        nfev = 1
+        success = False
+        message = "达到最大迭代次数"
+
+        for t in range(1, self.max_iter + 1):
+            if gradient is not None:
+                grad = gradient(x.reshape(x0.shape)).flatten()
+            else:
+                grad = self._numerical_gradient(objective, x, x0.shape)
+                nfev += 2 * len(x)
+            nfev += 1
+
+            m = self.beta1 * m + (1 - self.beta1) * grad
+            v = self.beta2 * v + (1 - self.beta2) * (grad ** 2)
+
+            m_hat = m / (1 - self.beta1 ** t)
+            v_hat = v / (1 - self.beta2 ** t)
+
+            x_new = x - self.learning_rate * m_hat / (np.sqrt(v_hat) + self.epsilon)
+            x_new = self._clip_to_bounds(x_new, bounds)
+
+            f_new = objective(x_new.reshape(x0.shape))
+            nfev += 1
+            self.history.append(f_new)
+
+            if self.verbose and t % 10 == 0:
+                logger.info(f"迭代 {t}: f = {f_new:.6e}")
+
+            if self._check_convergence(f_val, f_new, x, x_new):
+                success = True
+                message = f"在第{t}次迭代收敛"
+                x = x_new
+                f_val = f_new
+                break
+
+            x = x_new
+            f_val = f_new
+
+        return OptimizationResult(
+            x=x.reshape(x0.shape),
+            fun=f_val,
+            nit=t,
+            nfev=nfev,
+            success=success,
+            message=message,
+            history=self.history
+        )
+
+    def _numerical_gradient(self, objective, x, shape):
+        eps = 1e-7
+        grad = np.zeros_like(x)
+        for i in range(len(x)):
+            x_p, x_m = x.copy(), x.copy()
+            x_p[i] += eps
+            x_m[i] -= eps
+            grad[i] = (objective(x_p.reshape(shape)) -
+                      objective(x_m.reshape(shape))) / (2 * eps)
+        return grad
+
+
+class RMSpropOptimizer(BaseOptimizer):
+    """
+    RMSprop 优化器
+
+    使用平方梯度的指数移动平均来自适应调整每个参数的学习率。
+    """
+
+    def __init__(self,
+                 learning_rate: float = 0.01,
+                 alpha: float = 0.9,
+                 epsilon: float = 1e-8,
+                 momentum: float = 0.0,
+                 **kwargs):
+        """
+        初始化 RMSprop 优化器
+
+        Args:
+            learning_rate: 学习率
+            alpha: 平方梯度的平滑系数
+            epsilon: 数值稳定常数
+            momentum: 动量系数
+        """
+        super().__init__(**kwargs)
+        self.learning_rate = learning_rate
+        self.alpha = alpha
+        self.epsilon = epsilon
+        self.momentum = momentum
+
+    def optimize(self,
+                 objective: Callable[[np.ndarray], float],
+                 x0: np.ndarray,
+                 gradient: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+                 bounds: Optional[Tuple[float, float]] = None,
+                 **kwargs) -> OptimizationResult:
+        """执行 RMSprop 优化"""
+        x = x0.copy().flatten()
+        eg2 = np.zeros_like(x)
+        velocity = np.zeros_like(x)
+
+        self.history = []
+        f_val = objective(x.reshape(x0.shape))
+        self.history.append(f_val)
+
+        nfev = 1
+        success = False
+        message = "达到最大迭代次数"
+
+        for i in range(self.max_iter):
+            if gradient is not None:
+                grad = gradient(x.reshape(x0.shape)).flatten()
+            else:
+                grad = self._numerical_gradient(objective, x, x0.shape)
+                nfev += 2 * len(x)
+            nfev += 1
+
+            eg2 = self.alpha * eg2 + (1 - self.alpha) * (grad ** 2)
+
+            velocity = self.momentum * velocity - \
+                self.learning_rate * grad / (np.sqrt(eg2) + self.epsilon)
+            x_new = x + velocity
+            x_new = self._clip_to_bounds(x_new, bounds)
+
+            f_new = objective(x_new.reshape(x0.shape))
+            nfev += 1
+            self.history.append(f_new)
+
+            if self.verbose and i % 10 == 0:
+                logger.info(f"迭代 {i}: f = {f_new:.6e}")
+
+            if self._check_convergence(f_val, f_new, x, x_new):
+                success = True
+                message = f"在第{i+1}次迭代收敛"
+                x = x_new
+                f_val = f_new
+                break
+
+            x = x_new
+            f_val = f_new
+
+        return OptimizationResult(
+            x=x.reshape(x0.shape),
+            fun=f_val,
+            nit=i + 1,
+            nfev=nfev,
+            success=success,
+            message=message,
+            history=self.history
+        )
+
+    def _numerical_gradient(self, objective, x, shape):
+        eps = 1e-7
+        grad = np.zeros_like(x)
+        for i in range(len(x)):
+            x_p, x_m = x.copy(), x.copy()
+            x_p[i] += eps
+            x_m[i] -= eps
+            grad[i] = (objective(x_p.reshape(shape)) -
+                      objective(x_m.reshape(shape))) / (2 * eps)
+        return grad
