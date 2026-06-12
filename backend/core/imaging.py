@@ -1436,6 +1436,100 @@ class PartialCoherentImaging:
             return np.fft.fftshift(self.tcc)
         return None
 
+    def update_source(self, new_source: np.ndarray) -> None:
+        """
+        更新光源分布并重新计算传递函数
+
+        Args:
+            new_source: 新的光源分布，形状需与频率网格一致
+        """
+        if new_source.shape != self.source.shape:
+            raise ValueError(
+                f"新光源形状 {new_source.shape} 与当前形状 {self.source.shape} 不匹配"
+            )
+
+        new_source = np.clip(new_source, 0.0, None)
+        total = np.sum(new_source)
+        if total > 0:
+            new_source = new_source / total
+
+        self.source = new_source.astype(np.float64)
+        self._compute_transfer_functions()
+
+    def compute_source_gradient(self, mask: np.ndarray) -> np.ndarray:
+        """
+        计算空间像对光源分布的梯度
+
+        根据 Hopkins 公式:
+        I = ∫ S(fs) * |FFT^{-1}[M(f) * P(f - fs)]|^2 dfs
+
+        因此 dI/dS(fs_i) = |FFT^{-1}[M(f) * P(f - fs_i)]|^2
+
+        注意：返回的是每个光源点对空间像的梯度贡献，需要进一步
+        与损失函数对空间像的梯度链式相乘。
+
+        Args:
+            mask: 掩模图案
+
+        Returns:
+            梯度数组，形状与光源相同
+        """
+        mask_c = mask.astype(np.complex128)
+        ny, nx = mask.shape
+        gradient = np.zeros((ny, nx), dtype=np.float64)
+        mask_spectrum = np.fft.fft2(mask_c)
+        cutoff = self.optics.cutoff_frequency
+
+        if self.optics.use_socs and self.socs_eigenvalues is not None:
+            for lam, phi in zip(self.socs_eigenvalues, self.socs_eigenfunctions):
+                if lam < 1e-10:
+                    continue
+                filtered = mask_spectrum * phi
+                field_i = np.fft.ifft2(filtered)
+                intensity_i = np.abs(field_i) ** 2
+
+                source_indices = np.where(self.source > 1e-10)
+                for idx in range(len(source_indices[0])):
+                    sy, sx = source_indices[0][idx], source_indices[1][idx]
+                    fs_x = self.fx[sy, sx]
+                    fs_y = self.fy[sy, sx]
+                    if np.sqrt(fs_x ** 2 + fs_y ** 2) > cutoff:
+                        continue
+
+                    pupil_shifted = _shift_pupil(
+                        self.pupil, fs_x, fs_y, self.dfx, self.dfy
+                    )
+                    filtered_s = mask_spectrum * pupil_shifted
+                    field_s = np.fft.ifft2(filtered_s)
+                    intensity_s = np.abs(field_s) ** 2
+
+                    gradient[sy, sx] += np.sum(intensity_i * intensity_s) / (ny * nx)
+        else:
+            source_indices = np.where(self.source > 1e-10)
+            source_values = self.source[source_indices]
+
+            for idx in range(len(source_indices[0])):
+                sy, sx = source_indices[0][idx], source_indices[1][idx]
+                src_val = source_values[idx]
+                if src_val <= 0:
+                    continue
+
+                fs_x = self.fx[sy, sx]
+                fs_y = self.fy[sy, sx]
+                if np.sqrt(fs_x ** 2 + fs_y ** 2) > cutoff:
+                    continue
+
+                pupil_shifted = _shift_pupil(
+                    self.pupil, fs_x, fs_y, self.dfx, self.dfy
+                )
+                filtered = mask_spectrum * pupil_shifted
+                field_i = np.fft.ifft2(filtered)
+                intensity_i = np.abs(field_i) ** 2
+
+                gradient[sy, sx] = np.sum(intensity_i) / (ny * nx)
+
+        return gradient.astype(np.float64)
+
 
 class ResistType(Enum):
     POSITIVE = "positive"

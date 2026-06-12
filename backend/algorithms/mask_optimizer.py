@@ -9,6 +9,7 @@
 import numpy as np
 from typing import Optional, Callable, Dict, Any, List, Union, Tuple
 from dataclasses import dataclass, field
+from enum import Enum
 import logging
 import time
 
@@ -1393,3 +1394,722 @@ class MaskOptimizer:
                 gradient=gradient_func,
                 bounds=self.config.bounds
             )
+
+
+class OptimizationStrategy(Enum):
+    """多层掩模优化策略"""
+    ALTERNATING = "alternating"
+    JOINT = "joint"
+
+
+@dataclass
+class MultiLayerOptimizationConfig:
+    """
+    多层掩模联合优化配置
+
+    Attributes:
+        strategy: 优化策略 - 'alternating'（交替优化）或 'joint'（联合优化）
+        wafer_mask_config: 晶圆掩模优化配置
+        source_mask_config: 光源掩模优化配置
+        source_learning_rate: 光源掩模学习率
+        alternating_inner_iter: 交替优化时每轮内层迭代次数
+        alternating_warmup_iters: 先单独优化晶圆掩模的预热迭代次数
+        source_bounds: 光源掩模值边界
+        source_regularization: 光源正则化配置
+        source_smoothness_weight: 光源平滑度权重
+        source_sparsity_weight: 光源稀疏性权重
+    """
+    strategy: OptimizationStrategy = OptimizationStrategy.ALTERNATING
+    wafer_mask_config: Optional[OptimizationConfig] = None
+    source_mask_config: Optional[OptimizationConfig] = None
+    source_learning_rate: float = 0.001
+    alternating_inner_iter: int = 5
+    alternating_warmup_iters: int = 0
+    source_bounds: Tuple[float, float] = (0.0, 1.0)
+    source_regularization: RegularizationConfig = field(default_factory=RegularizationConfig)
+    source_smoothness_weight: float = 0.0
+    source_sparsity_weight: float = 0.0
+
+    @classmethod
+    def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'MultiLayerOptimizationConfig':
+        """从字典创建"""
+        if d is None:
+            return cls()
+        cfg = cls()
+        if 'strategy' in d:
+            cfg.strategy = OptimizationStrategy(d['strategy'])
+        if 'wafer_mask_config' in d:
+            cfg.wafer_mask_config = OptimizationConfig.from_dict(d['wafer_mask_config'])
+        if 'source_mask_config' in d:
+            cfg.source_mask_config = OptimizationConfig.from_dict(d['source_mask_config'])
+        if 'source_learning_rate' in d:
+            cfg.source_learning_rate = float(d['source_learning_rate'])
+        if 'alternating_inner_iter' in d:
+            cfg.alternating_inner_iter = int(d['alternating_inner_iter'])
+        if 'alternating_warmup_iters' in d:
+            cfg.alternating_warmup_iters = int(d['alternating_warmup_iters'])
+        if 'source_bounds' in d:
+            cfg.source_bounds = tuple(d['source_bounds'])
+        if 'source_regularization' in d:
+            cfg.source_regularization = RegularizationConfig.from_dict(d['source_regularization'])
+        if 'source_smoothness_weight' in d:
+            cfg.source_smoothness_weight = float(d['source_smoothness_weight'])
+        if 'source_sparsity_weight' in d:
+            cfg.source_sparsity_weight = float(d['source_sparsity_weight'])
+        return cfg
+
+
+@dataclass
+class MultiLayerOptimizationResult:
+    """多层掩模联合优化结果"""
+    optimized_wafer_mask: np.ndarray
+    optimized_source_mask: np.ndarray
+    initial_wafer_mask: np.ndarray
+    initial_source_mask: np.ndarray
+    target_image: np.ndarray
+    final_wafer_image: np.ndarray
+    initial_wafer_image: np.ndarray
+    final_metrics: MetricsResult
+    initial_metrics: MetricsResult
+    loss_history: List[float]
+    source_loss_history: List[float]
+    wafer_loss_history: List[float]
+    total_iterations: int
+    total_time: float
+    converged: bool
+    message: str
+    strategy: OptimizationStrategy
+    multi_process_result: Optional[MultiProcessSimulationResult] = None
+    process_conditions: Optional[List[ProcessCondition]] = None
+
+
+class MultiLayerMaskOptimizer:
+    """
+    多层掩模联合优化器（SMO/DMD）
+
+    支持光源掩模（source mask）与晶圆掩模（wafer mask）的交替优化或联合优化。
+    损失函数对两层掩模分别计算梯度并交替更新。
+
+    优化策略:
+    - ALTERNATING（交替优化）: 固定光源优化晶圆掩模若干步，然后固定晶圆掩模优化光源若干步，交替进行
+    - JOINT（联合优化）: 同时计算损失对光源和晶圆掩模的梯度，同时更新两者
+    """
+
+    def __init__(self,
+                 optical_system: Optional[OpticalSystem] = None,
+                 config: Optional[OptimizationConfig] = None,
+                 ml_config: Optional[MultiLayerOptimizationConfig] = None):
+        """
+        初始化多层掩模优化器
+
+        Args:
+            optical_system: 光学系统参数
+            config: 基础优化配置（兼容单掩模优化）
+            ml_config: 多层优化专用配置
+        """
+        self.optical_system = optical_system or OpticalSystem()
+        self.config = config or OptimizationConfig()
+        self.ml_config = ml_config or MultiLayerOptimizationConfig()
+
+        if self.ml_config.wafer_mask_config is not None:
+            self.wafer_config = self.ml_config.wafer_mask_config
+        else:
+            self.wafer_config = self.config
+
+        if self.ml_config.source_mask_config is not None:
+            self.source_config = self.ml_config.source_mask_config
+        else:
+            self.source_config = OptimizationConfig(
+                learning_rate=self.ml_config.source_learning_rate,
+                max_iter=self.ml_config.alternating_inner_iter,
+                use_composite_loss=True,
+                loss_weights=LossWeights(mse=1.0)
+            )
+
+        self._wafer_optimizer = MaskOptimizer(
+            optical_system=self.optical_system,
+            config=self.wafer_config
+        )
+
+        self._imaging_model: Optional[PartialCoherentImaging] = None
+        self._target_image: Optional[np.ndarray] = None
+
+        self._current_source_mask: Optional[np.ndarray] = None
+        self._current_wafer_mask: Optional[np.ndarray] = None
+
+        self._multi_imaging_models: Optional[List[PartialCoherentImaging]] = None
+        self._multi_conditions: Optional[List[ProcessCondition]] = None
+        self._multi_weights: Optional[List[float]] = None
+
+        self._source_lr_scheduler: Optional[LearningRateScheduler] = None
+        self._source_early_stopping: Optional[EarlyStopping] = None
+
+    def _setup_imaging_model(self, image_size: Tuple[int, int]):
+        """设置成像模型"""
+        self._imaging_model = PartialCoherentImaging(
+            self.optical_system, image_size
+        )
+
+    def _setup_multi_process_models(self, image_size: Tuple[int, int]):
+        """设置多工艺条件成像模型"""
+        self._wafer_optimizer._build_process_conditions = self._wafer_optimizer._build_process_conditions
+        conditions, weights = self._wafer_optimizer._build_process_conditions()
+
+        self._multi_conditions = conditions
+        total_w = sum(weights)
+        self._multi_weights = [w / total_w for w in weights]
+
+        self._multi_imaging_models = []
+        for cond in conditions:
+            optics = cond.to_optical_system(base_optics=self.optical_system)
+            model = PartialCoherentImaging(optics, image_size)
+            self._multi_imaging_models.append(model)
+
+    def _setup_source_optimization(self):
+        """设置光源优化相关组件"""
+        self._source_lr_scheduler = LearningRateScheduler(
+            initial_lr=self.ml_config.source_learning_rate,
+            scheduler_type='cosine',
+            decay=0.95,
+            step_size=50,
+            min_lr=1e-7
+        )
+        self._source_early_stopping = EarlyStopping(
+            patience=15,
+            min_delta=1e-7
+        )
+
+    def _prepare_image(self, aerial: np.ndarray, dose: float = 1.0, config: Optional[OptimizationConfig] = None) -> np.ndarray:
+        """对空间像做预处理用于损失计算"""
+        cfg = config or self.config
+        if dose != 1.0:
+            aerial = np.clip(aerial * dose, 0.0, 1.0)
+        if cfg.use_wafer_image_loss:
+            return _apply_threshold_for_loss(aerial, cfg.threshold)
+        return aerial
+
+    def _compute_source_regularization_loss(self, source: np.ndarray) -> float:
+        """计算光源正则化损失"""
+        loss = 0.0
+        cfg = self.ml_config
+
+        if cfg.source_smoothness_weight > 0:
+            loss += cfg.source_smoothness_weight * total_variation_isotropic(source)
+
+        if cfg.source_sparsity_weight > 0:
+            loss += cfg.source_sparsity_weight * l1_regularization(source)
+
+        reg_cfg = cfg.source_regularization
+        if reg_cfg.type is not None and reg_cfg.strength > 0:
+            reg_type = reg_cfg.type.lower()
+            if reg_type == 'l1':
+                loss += reg_cfg.strength * l1_regularization(source)
+            elif reg_type == 'l2':
+                loss += reg_cfg.strength * l2_regularization(source)
+            elif reg_type == 'tv' or reg_type == 'tv_isotropic':
+                loss += reg_cfg.strength * total_variation_isotropic(source)
+
+        return loss
+
+    def _compute_source_regularization_gradient(self, source: np.ndarray) -> np.ndarray:
+        """计算光源正则化梯度"""
+        grad = np.zeros_like(source)
+        cfg = self.ml_config
+
+        if cfg.source_smoothness_weight > 0:
+            grad += cfg.source_smoothness_weight * total_variation_isotropic_gradient(source)
+
+        if cfg.source_sparsity_weight > 0:
+            grad += cfg.source_sparsity_weight * l1_regularization_gradient(source)
+
+        reg_cfg = cfg.source_regularization
+        if reg_cfg.type is not None and reg_cfg.strength > 0:
+            reg_type = reg_cfg.type.lower()
+            if reg_type == 'l1':
+                grad += reg_cfg.strength * l1_regularization_gradient(source)
+            elif reg_type == 'l2':
+                grad += reg_cfg.strength * l2_regularization_gradient(source)
+            elif reg_type == 'tv' or reg_type == 'tv_isotropic':
+                grad += reg_cfg.strength * total_variation_isotropic_gradient(source)
+
+        return grad
+
+    def _compute_loss_for_source(self, source_mask: np.ndarray,
+                                 wafer_mask: np.ndarray) -> Tuple[float, np.ndarray]:
+        """
+        计算给定光源和晶圆掩模下的损失，以及损失对光源的梯度
+
+        Args:
+            source_mask: 光源掩模
+            wafer_mask: 晶圆掩模（固定）
+
+        Returns:
+            (loss_value, gradient) 二元组
+        """
+        self._imaging_model.update_source(source_mask)
+
+        if self.config.use_multi_process and self._multi_imaging_models is not None:
+            return self._compute_multi_process_loss_for_source(source_mask, wafer_mask)
+
+        return self._compute_single_process_loss_for_source(source_mask, wafer_mask)
+
+    def _compute_single_process_loss_for_source(self, source_mask: np.ndarray,
+                                                wafer_mask: np.ndarray) -> Tuple[float, np.ndarray]:
+        """单工艺条件下的光源损失和梯度计算"""
+        cfg = self.config
+        lw = cfg.loss_weights
+
+        aerial = self._imaging_model.compute_aerial_image(wafer_mask)
+        image = self._prepare_image(aerial, dose=1.0, config=cfg)
+
+        loss = 0.0
+        error_grad = np.zeros_like(image)
+
+        if cfg.use_composite_loss:
+            if lw.mse > 0:
+                mse_val = mse(image, self._target_image)
+                loss += lw.mse * mse_val
+                error_grad += lw.mse * (2.0 * (image - self._target_image) / image.size)
+            if lw.ssim > 0:
+                ssim_val = 1.0 - ssim(image, self._target_image)
+                loss += lw.ssim * ssim_val
+                error_grad += lw.ssim * ssim_loss_gradient(image, self._target_image)
+        else:
+            metric = cfg.metric.lower()
+            if metric == 'mse':
+                loss = mse(image, self._target_image)
+                error_grad = 2.0 * (image - self._target_image) / image.size
+            elif metric == 'mae':
+                loss = mae(image, self._target_image)
+                error_grad = np.sign(image - self._target_image) / image.size
+            elif metric == 'ssim':
+                loss = 1.0 - ssim(image, self._target_image)
+                error_grad = ssim_loss_gradient(image, self._target_image)
+
+        if cfg.use_wafer_image_loss:
+            threshold_grad = (aerial >= cfg.threshold).astype(np.float64)
+            error_grad = error_grad * threshold_grad
+
+        source_grad = self._imaging_model.compute_source_gradient(wafer_mask)
+        gradient = error_grad.mean() * source_grad
+
+        gradient += self._compute_source_regularization_gradient(source_mask)
+        loss += self._compute_source_regularization_loss(source_mask)
+
+        return loss, gradient
+
+    def _compute_multi_process_loss_for_source(self, source_mask: np.ndarray,
+                                               wafer_mask: np.ndarray) -> Tuple[float, np.ndarray]:
+        """多工艺条件下的光源损失和梯度计算"""
+        for model in self._multi_imaging_models:
+            model.update_source(source_mask)
+
+        cfg = self.config
+        lw = cfg.loss_weights
+        gradient = np.zeros_like(source_mask)
+        total_loss = 0.0
+        per_losses = []
+
+        for model, cond, w in zip(
+            self._multi_imaging_models,
+            self._multi_conditions,
+            self._multi_weights
+        ):
+            aerial = model.compute_aerial_image(wafer_mask)
+            image = self._prepare_image(aerial, cond.dose, config=cfg)
+
+            error_grad = np.zeros_like(image)
+            loss_i = 0.0
+
+            if cfg.use_composite_loss:
+                if lw.mse > 0:
+                    loss_i += lw.mse * mse(image, self._target_image)
+                    error_grad += lw.mse * (2.0 * (image - self._target_image) / image.size)
+                if lw.ssim > 0:
+                    loss_i += lw.ssim * (1.0 - ssim(image, self._target_image))
+                    error_grad += lw.ssim * ssim_loss_gradient(image, self._target_image)
+            else:
+                metric = cfg.metric.lower()
+                if metric == 'mse':
+                    loss_i = mse(image, self._target_image)
+                    error_grad = 2.0 * (image - self._target_image) / image.size
+                elif metric == 'mae':
+                    loss_i = mae(image, self._target_image)
+                    error_grad = np.sign(image - self._target_image) / image.size
+                elif metric == 'ssim':
+                    loss_i = 1.0 - ssim(image, self._target_image)
+                    error_grad = ssim_loss_gradient(image, self._target_image)
+
+            if cfg.use_wafer_image_loss:
+                aerial_dosed = aerial if cond.dose == 1.0 else np.clip(aerial * cond.dose, 0.0, 1.0)
+                threshold_grad = (aerial_dosed >= cfg.threshold).astype(np.float64)
+                error_grad = error_grad * threshold_grad
+
+            source_grad_i = model.compute_source_gradient(wafer_mask)
+            gradient += w * error_grad.mean() * source_grad_i
+            total_loss += w * loss_i
+            per_losses.append(loss_i)
+
+        gradient += self._compute_source_regularization_gradient(source_mask)
+        total_loss += self._compute_source_regularization_loss(source_mask)
+
+        if cfg.robustness_loss_weight > 0 and len(per_losses) > 1:
+            loss_arr = np.array(per_losses)
+            robustness = float(np.var(loss_arr))
+            total_loss += cfg.robustness_loss_weight * robustness
+
+            mean_loss = np.mean(loss_arr)
+            n = len(per_losses)
+            for model, cond, w in zip(
+                self._multi_imaging_models,
+                self._multi_conditions,
+                self._multi_weights
+            ):
+                idx = self._multi_conditions.index(cond)
+                factor = 2.0 * cfg.robustness_loss_weight * (per_losses[idx] - mean_loss) / (n * n)
+                if abs(factor) < 1e-12:
+                    continue
+                source_grad_i = model.compute_source_gradient(wafer_mask)
+                gradient += factor * source_grad_i
+
+        return total_loss, gradient
+
+    def _optimize_wafer_step(self, source_mask: np.ndarray,
+                             wafer_mask: np.ndarray,
+                             n_iter: int) -> Tuple[np.ndarray, float, List[float]]:
+        """
+        固定光源，优化晶圆掩模
+
+        Args:
+            source_mask: 当前光源掩模（固定）
+            wafer_mask: 当前晶圆掩模（待优化）
+            n_iter: 迭代次数
+
+        Returns:
+            (optimized_mask, final_loss, loss_history) 三元组
+        """
+        self._imaging_model.update_source(source_mask)
+        if self._multi_imaging_models is not None:
+            for model in self._multi_imaging_models:
+                model.update_source(source_mask)
+
+        old_max_iter = self._wafer_optimizer.config.max_iter
+        self._wafer_optimizer.config.max_iter = n_iter
+
+        try:
+            result = self._wafer_optimizer.optimize(
+                initial_mask=wafer_mask,
+                target_image=self._target_image
+            )
+            final_loss = result.loss_history[-1] if result.loss_history else float('inf')
+            return result.optimized_mask, final_loss, result.loss_history
+        finally:
+            self._wafer_optimizer.config.max_iter = old_max_iter
+
+    def _optimize_source_step(self, source_mask: np.ndarray,
+                              wafer_mask: np.ndarray,
+                              n_iter: int,
+                              epoch: int = 0) -> Tuple[np.ndarray, float, List[float]]:
+        """
+        固定晶圆掩模，优化光源
+
+        Args:
+            source_mask: 当前光源掩模（待优化）
+            wafer_mask: 当前晶圆掩模（固定）
+            n_iter: 迭代次数
+            epoch: 当前外层迭代次数（用于学习率调度）
+
+        Returns:
+            (optimized_source, final_loss, loss_history) 三元组
+        """
+        current_source = source_mask.copy()
+        loss_history = []
+        lr = self._source_lr_scheduler.step(epoch) if self._source_lr_scheduler else self.ml_config.source_learning_rate
+
+        for i in range(n_iter):
+            loss, grad = self._compute_loss_for_source(current_source, wafer_mask)
+            loss_history.append(loss)
+
+            grad_norm = np.linalg.norm(grad)
+            if grad_norm > 1e3:
+                grad = grad / grad_norm * 1e3
+
+            current_source = current_source - lr * grad
+            current_source = np.clip(current_source, *self.ml_config.source_bounds)
+
+            total = np.sum(current_source)
+            if total > 0:
+                current_source = current_source / total
+
+            if np.linalg.norm(grad) < self.config.tol:
+                break
+
+        final_loss = loss_history[-1] if loss_history else float('inf')
+        return current_source, final_loss, loss_history
+
+    def _optimize_alternating(self,
+                              initial_wafer_mask: np.ndarray,
+                              initial_source_mask: np.ndarray,
+                              callback: Optional[Callable[[int, np.ndarray, np.ndarray, float], None]] = None
+                              ) -> Tuple[np.ndarray, np.ndarray, List[float], List[float], List[float]]:
+        """
+        交替优化策略
+
+        Args:
+            initial_wafer_mask: 初始晶圆掩模
+            initial_source_mask: 初始光源掩模
+            callback: 回调函数 callback(epoch, wafer_mask, source_mask, current_loss)
+
+        Returns:
+            (final_wafer_mask, final_source_mask, total_loss_history, wafer_loss_history, source_loss_history)
+        """
+        wafer_mask = initial_wafer_mask.copy()
+        source_mask = initial_source_mask.copy()
+
+        total_loss_history = []
+        wafer_loss_history = []
+        source_loss_history = []
+
+        max_iter = self.config.max_iter
+        inner_iter = self.ml_config.alternating_inner_iter
+        warmup_iters = self.ml_config.alternating_warmup_iters
+
+        if warmup_iters > 0:
+            logger.info(f"开始晶圆掩模预热优化，{warmup_iters} 次迭代")
+            wafer_mask, wafer_loss, hist = self._optimize_wafer_step(
+                source_mask, wafer_mask, warmup_iters
+            )
+            wafer_loss_history.extend(hist)
+
+        for epoch in range(max_iter):
+            wafer_mask, wafer_loss, wafer_hist = self._optimize_wafer_step(
+                source_mask, wafer_mask, inner_iter
+            )
+            wafer_loss_history.extend(wafer_hist)
+
+            source_mask, source_loss, source_hist = self._optimize_source_step(
+                source_mask, wafer_mask, inner_iter, epoch
+            )
+            source_loss_history.extend(source_hist)
+
+            total_loss = (wafer_loss + source_loss) / 2
+            total_loss_history.append(total_loss)
+
+            if self.config.verbose and (epoch % 10 == 0 or epoch == max_iter - 1):
+                logger.info(
+                    f"Epoch {epoch:4d}: total_loss={total_loss:.6e}, "
+                    f"wafer_loss={wafer_loss:.6e}, source_loss={source_loss:.6e}"
+                )
+
+            if callback is not None:
+                callback(epoch, wafer_mask, source_mask, total_loss)
+
+            if self._source_early_stopping and self._source_early_stopping(total_loss):
+                logger.info(f"早停触发，在 epoch {epoch} 停止优化")
+                break
+
+        return wafer_mask, source_mask, total_loss_history, wafer_loss_history, source_loss_history
+
+    def _optimize_joint(self,
+                        initial_wafer_mask: np.ndarray,
+                        initial_source_mask: np.ndarray,
+                        callback: Optional[Callable[[int, np.ndarray, np.ndarray, float], None]] = None
+                        ) -> Tuple[np.ndarray, np.ndarray, List[float], List[float], List[float]]:
+        """
+        联合优化策略：同时更新晶圆掩模和光源
+
+        Args:
+            initial_wafer_mask: 初始晶圆掩模
+            initial_source_mask: 初始光源掩模
+            callback: 回调函数 callback(epoch, wafer_mask, source_mask, current_loss)
+
+        Returns:
+            (final_wafer_mask, final_source_mask, total_loss_history, wafer_loss_history, source_loss_history)
+        """
+        wafer_mask = initial_wafer_mask.copy()
+        source_mask = initial_source_mask.copy()
+
+        total_loss_history = []
+        wafer_loss_history = []
+        source_loss_history = []
+
+        max_iter = self.config.max_iter
+        wafer_lr = self.wafer_config.learning_rate
+        source_lr = self.ml_config.source_learning_rate
+
+        wafer_grad_optimizer = GradientDescentOptimizer(
+            learning_rate=wafer_lr,
+            max_iter=1,
+            tol=self.config.tol,
+            verbose=False
+        )
+
+        for epoch in range(max_iter):
+            self._imaging_model.update_source(source_mask)
+            if self._multi_imaging_models is not None:
+                for model in self._multi_imaging_models:
+                    model.update_source(source_mask)
+
+            wafer_loss = self._wafer_optimizer._compute_loss(wafer_mask)
+            wafer_grad = self._wafer_optimizer._compute_gradient(wafer_mask)
+
+            wafer_result = wafer_grad_optimizer.optimize(
+                objective=lambda x: self._wafer_optimizer._compute_loss(x),
+                x0=wafer_mask,
+                gradient=lambda x: self._wafer_optimizer._compute_gradient(x),
+                bounds=self.config.bounds
+            )
+            wafer_mask = wafer_result.x
+
+            source_loss, source_grad = self._compute_loss_for_source(source_mask, wafer_mask)
+
+            grad_norm = np.linalg.norm(source_grad)
+            if grad_norm > 1e3:
+                source_grad = source_grad / grad_norm * 1e3
+
+            source_mask = source_mask - source_lr * source_grad
+            source_mask = np.clip(source_mask, *self.ml_config.source_bounds)
+
+            total = np.sum(source_mask)
+            if total > 0:
+                source_mask = source_mask / total
+
+            total_loss = (wafer_loss + source_loss) / 2
+            total_loss_history.append(total_loss)
+            wafer_loss_history.append(wafer_loss)
+            source_loss_history.append(source_loss)
+
+            if self.config.verbose and (epoch % 10 == 0 or epoch == max_iter - 1):
+                logger.info(
+                    f"Epoch {epoch:4d}: total_loss={total_loss:.6e}, "
+                    f"wafer_loss={wafer_loss:.6e}, source_loss={source_loss:.6e}"
+                )
+
+            if callback is not None:
+                callback(epoch, wafer_mask, source_mask, total_loss)
+
+            if self._source_early_stopping and self._source_early_stopping(total_loss):
+                logger.info(f"早停触发，在 epoch {epoch} 停止优化")
+                break
+
+        return wafer_mask, source_mask, total_loss_history, wafer_loss_history, source_loss_history
+
+    def optimize(self,
+                 initial_wafer_mask: np.ndarray,
+                 initial_source_mask: np.ndarray,
+                 target_image: np.ndarray,
+                 callback: Optional[Callable[[int, np.ndarray, np.ndarray, float], None]] = None
+                 ) -> MultiLayerOptimizationResult:
+        """
+        执行多层掩模联合优化
+
+        Args:
+            initial_wafer_mask: 初始晶圆掩模图案
+            initial_source_mask: 初始光源掩模图案
+            target_image: 目标图像
+            callback: 回调函数 callback(iteration, wafer_mask, source_mask, current_loss)
+
+        Returns:
+            MultiLayerOptimizationResult 对象
+        """
+        start_time = time.time()
+
+        self._target_image = target_image.astype(np.float64)
+        image_size = initial_wafer_mask.shape
+
+        self._setup_imaging_model(image_size)
+        self._setup_source_optimization()
+
+        if self.config.use_multi_process:
+            self._setup_multi_process_models(image_size)
+        else:
+            self._multi_imaging_models = None
+            self._multi_conditions = None
+            self._multi_weights = None
+
+        self._wafer_optimizer._target_image = self._target_image
+        self._wafer_optimizer._setup_imaging_model(image_size)
+        self._wafer_optimizer._setup_optimizer()
+        self._wafer_optimizer._setup_lr_scheduler()
+        self._wafer_optimizer._setup_early_stopping()
+
+        if self.config.use_multi_process:
+            self._wafer_optimizer._setup_multi_process_models(image_size)
+
+        initial_source = initial_source_mask.copy()
+        self._imaging_model.update_source(initial_source)
+        self._wafer_optimizer._imaging_model.update_source(initial_source)
+        if self._multi_imaging_models is not None:
+            for model, wafer_model in zip(self._multi_imaging_models, self._wafer_optimizer._multi_imaging_models):
+                model.update_source(initial_source)
+                wafer_model.update_source(initial_source)
+
+        initial_wafer = self._imaging_model.compute_aerial_image(initial_wafer_mask)
+        initial_metrics = evaluate_all(initial_wafer, target_image)
+
+        logger.info(
+            f"开始多层掩模{self.ml_config.strategy.value}优化，"
+            f"策略: {self.ml_config.strategy.value}, "
+            f"初始MSE: {initial_metrics.mse:.6e}"
+        )
+
+        if self.ml_config.strategy == OptimizationStrategy.ALTERNATING:
+            opt_wafer, opt_source, total_hist, wafer_hist, source_hist = self._optimize_alternating(
+                initial_wafer_mask, initial_source_mask, callback
+            )
+        else:
+            opt_wafer, opt_source, total_hist, wafer_hist, source_hist = self._optimize_joint(
+                initial_wafer_mask, initial_source_mask, callback
+            )
+
+        self._imaging_model.update_source(opt_source)
+        final_wafer = self._imaging_model.compute_aerial_image(opt_wafer)
+        final_metrics = evaluate_all(final_wafer, target_image)
+
+        total_time = time.time() - start_time
+
+        multi_process_result = None
+        process_conditions = None
+
+        if self.config.use_multi_process and self._multi_conditions is not None:
+            for model in self._multi_imaging_models:
+                model.update_source(opt_source)
+            multi_process_result = simulate_multi_process(
+                opt_wafer,
+                self._multi_conditions,
+                base_optics=self.optical_system,
+                threshold=self.config.threshold,
+                apply_resist=self.config.use_wafer_image_loss
+            )
+            process_conditions = self._multi_conditions
+
+        converged = len(total_hist) > 0 and (
+            self._source_early_stopping.should_stop if self._source_early_stopping else False
+        )
+
+        logger.info(
+            f"优化完成，最终MSE: {final_metrics.mse:.6e}，"
+            f"耗时: {total_time:.2f}秒"
+        )
+
+        return MultiLayerOptimizationResult(
+            optimized_wafer_mask=opt_wafer,
+            optimized_source_mask=opt_source,
+            initial_wafer_mask=initial_wafer_mask,
+            initial_source_mask=initial_source_mask,
+            target_image=target_image,
+            final_wafer_image=final_wafer,
+            initial_wafer_image=initial_wafer,
+            final_metrics=final_metrics,
+            initial_metrics=initial_metrics,
+            loss_history=total_hist,
+            source_loss_history=source_hist,
+            wafer_loss_history=wafer_hist,
+            total_iterations=len(total_hist),
+            total_time=total_time,
+            converged=converged,
+            message="优化完成" if converged else "达到最大迭代次数",
+            strategy=self.ml_config.strategy,
+            multi_process_result=multi_process_result,
+            process_conditions=process_conditions
+        )
