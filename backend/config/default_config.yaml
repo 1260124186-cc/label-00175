@@ -1,0 +1,51 @@
+# 计算光刻仿真框架默认配置文件
+# Default Configuration for Lithography Simulation Framework
+
+# 光学系统参数
+optical_system:
+  wavelength: 193.0      # 光源波长 (nm), ArF光源
+  na: 1.35               # 数值孔径 (Numerical Aperture)
+  sigma: 0.75            # 部分相干因子 (0~1)
+  pixel_size: 1.0        # 像素尺寸 (nm)
+  defocus: 0.0           # 离焦量 (nm)
+  magnification: 4.0     # 放大倍率
+
+# 优化参数
+optimization:
+  optimizer_type: gradient_descent  # 优化器类型: gradient_descent, bfgs, newton, genetic, pso, rl
+  max_iter: 100                     # 最大迭代次数
+  learning_rate: 0.01               # 学习率 (梯度下降)
+  tol: 1.0e-6                       # 收敛容差
+  early_stop_patience: 10           # 早停耐心值
+  lr_scheduler: null                # 学习率调度器: step, exponential, cosine, null
+  lr_decay: 0.95                    # 学习率衰减率
+  lr_step_size: 20                  # 学习率调度步长
+  metric: mse                       # 优化目标指标: mse, mae, ssim
+  bounds:                           # 掩模值边界
+    - 0.0
+    - 1.0
+  verbose: true                     # 是否输出详细信息
+  random_seed: 42                   # 随机种子（用于结果复现，null表示不固定）
+
+  # 启发式算法参数 (遗传算法/粒子群)
+  population_size: 50               # 种群大小
+  crossover_rate: 0.8               # 交叉概率
+  mutation_rate: 0.1                # 变异概率
+
+  # 强化学习参数
+  rl_gamma: 0.99                    # 折扣因子
+  rl_epsilon: 0.1                   # 初始探索率
+  rl_epsilon_decay: 0.995           # 探索率衰减
+
+# 输出配置
+output:
+  save_dir: ./results               # 结果保存目录
+  save_images: true                 # 是否保存图像
+  save_history: true                # 是否保存历史数据
+  image_format: png                 # 图像格式: png, tiff
+  log_level: INFO                   # 日志级别: DEBUG, INFO, WARNING, ERROR
+
+# 成像模拟参数
+imaging:
+  resist_threshold: 0.3             # 光刻胶阈值
+  apply_resist: true                # 是否应用光刻胶响应
