@@ -11,9 +11,10 @@
 
 import numpy as np
 from numba import jit, prange
-from typing import Tuple, Optional, Dict, Any, List
+from typing import Tuple, Optional, Dict, Any, List, Union
 from dataclasses import dataclass, field
 from enum import Enum
+from itertools import product
 
 
 class IlluminationType(Enum):
@@ -23,6 +24,248 @@ class IlluminationType(Enum):
     ANNULAR = "annular"                # 环形照明
     QUASAR = "quasar"                  # 四极照明
     CUSTOM = "custom"                 # 自定义照明
+
+
+@dataclass
+class ProcessCondition:
+    """
+    单组工艺条件
+
+    封装一次光刻仿真所需的完整工艺参数集合。
+
+    Attributes:
+        defocus: 离焦量 (nm)，正值表示过聚焦，负值表示欠聚焦
+        dose: 曝光剂量 (mJ/cm²)，归一化相对剂量，1.0为标称剂量
+        na: 数值孔径 (Numerical Aperture)
+        sigma: 部分相干因子 (0~1)
+        wavelength: 光源波长 (nm)
+        name: 工艺条件名称，用于日志和结果标识
+        weight: 该工艺条件在优化中的权重
+    """
+    defocus: float = 0.0
+    dose: float = 1.0
+    na: float = 1.35
+    sigma: float = 0.75
+    wavelength: float = 193.0
+    name: str = ""
+    weight: float = 1.0
+
+    def __post_init__(self):
+        if not self.name:
+            self.name = f"df={self.defocus:.0f}nm_dose={self.dose:.2f}_NA={self.na:.2f}_σ={self.sigma:.2f}"
+
+    @classmethod
+    def from_optical_system(cls, optics: 'OpticalSystem',
+                            dose: float = 1.0,
+                            weight: float = 1.0,
+                            name: str = "") -> 'ProcessCondition':
+        """从OpticalSystem创建工艺条件"""
+        return cls(
+            defocus=optics.defocus,
+            dose=dose,
+            na=optics.na,
+            sigma=optics.sigma,
+            wavelength=optics.wavelength,
+            name=name,
+            weight=weight
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典"""
+        return {
+            'defocus': self.defocus,
+            'dose': self.dose,
+            'na': self.na,
+            'sigma': self.sigma,
+            'wavelength': self.wavelength,
+            'name': self.name,
+            'weight': self.weight
+        }
+
+    def to_optical_system(self, base_optics: Optional['OpticalSystem'] = None) -> 'OpticalSystem':
+        """
+        转换为OpticalSystem实例
+
+        Args:
+            base_optics: 基础光学系统，提供未在此工艺条件中指定的参数
+
+        Returns:
+            OpticalSystem实例
+        """
+        if base_optics is not None:
+            return OpticalSystem(
+                wavelength=self.wavelength,
+                na=self.na,
+                sigma=self.sigma,
+                pixel_size=base_optics.pixel_size,
+                defocus=self.defocus,
+                magnification=base_optics.magnification,
+                illumination_type=base_optics.illumination_type,
+                source_params=dict(base_optics.source_params),
+                use_socs=base_optics.use_socs,
+                socs_num_terms=base_optics.socs_num_terms,
+                custom_source=base_optics.custom_source
+            )
+        else:
+            return OpticalSystem(
+                wavelength=self.wavelength,
+                na=self.na,
+                sigma=self.sigma,
+                defocus=self.defocus
+            )
+
+
+@dataclass
+class ProcessWindow:
+    """
+    工艺窗口参数扫描范围定义
+
+    用于生成多组工艺条件的笛卡尔积。每个参数可以是：
+    - 单个标量值：该参数固定不变
+    - 列表/数组：取其中每个值参与笛卡尔积
+    - (start, stop, num)元组：使用np.linspace生成等间隔采样
+
+    Attributes:
+        defocus_values: 离焦量扫描值 (nm)
+        dose_values: 曝光剂量扫描值 (相对剂量)
+        na_values: 数值孔径扫描值
+        sigma_values: 部分相干因子扫描值
+        wavelength_values: 波长扫描值 (nm)
+        default_weight: 默认权重
+    """
+    defocus_values: Any = 0.0
+    dose_values: Any = 1.0
+    na_values: Any = 1.35
+    sigma_values: Any = 0.75
+    wavelength_values: Any = 193.0
+    default_weight: float = 1.0
+
+    @staticmethod
+    def _normalize_scan_values(values: Any) -> List[float]:
+        """规范化扫描值输入为列表"""
+        if isinstance(values, (list, np.ndarray)):
+            return [float(v) for v in values]
+        elif isinstance(values, tuple) and len(values) == 3:
+            start, stop, num = values
+            return list(np.linspace(start, stop, int(num)))
+        elif isinstance(values, tuple) and len(values) != 3:
+            return [float(v) for v in values]
+        elif np.isscalar(values):
+            return [float(values)]
+        else:
+            return [float(values)]
+
+    def generate_conditions(self,
+                            weights: Optional[Union[float, List[float], np.ndarray]] = None,
+                            center_weight_boost: Optional[float] = None) -> List[ProcessCondition]:
+        """
+        生成工艺条件组合（笛卡尔积）
+
+        Args:
+            weights: 每个条件的权重。可以是单个值（所有条件相同权重）、
+                     或与条件数相同的列表。None则使用default_weight。
+            center_weight_boost: 可选，对最接近参数空间中心的工艺条件额外乘以该权重系数。
+                                用于在工艺窗口中心设置更强的约束。
+
+        Returns:
+            ProcessCondition列表
+        """
+        defocus_list = self._normalize_scan_values(self.defocus_values)
+        dose_list = self._normalize_scan_values(self.dose_values)
+        na_list = self._normalize_scan_values(self.na_values)
+        sigma_list = self._normalize_scan_values(self.sigma_values)
+        wavelength_list = self._normalize_scan_values(self.wavelength_values)
+
+        all_combos = list(product(defocus_list, dose_list, na_list, sigma_list, wavelength_list))
+
+        n_conditions = len(all_combos)
+
+        if weights is None:
+            weight_list = [self.default_weight] * n_conditions
+        elif np.isscalar(weights):
+            weight_list = [float(weights)] * n_conditions
+        else:
+            weight_list = list(weights)
+            if len(weight_list) != n_conditions:
+                raise ValueError(
+                    f"权重数量 ({len(weight_list)}) 与工艺条件数量 ({n_conditions}) 不匹配"
+                )
+
+        if center_weight_boost is not None:
+            df_center = (min(defocus_list) + max(defocus_list)) / 2
+            dose_center = (min(dose_list) + max(dose_list)) / 2
+            na_center = (min(na_list) + max(na_list)) / 2
+            sigma_center = (min(sigma_list) + max(sigma_list)) / 2
+            wl_center = (min(wavelength_list) + max(wavelength_list)) / 2
+
+            distances = []
+            for df, d, na, sg, wl in all_combos:
+                dist = np.sqrt(
+                    ((df - df_center) / (max(defocus_list) - min(defocus_list) + 1e-12))**2 +
+                    ((d - dose_center) / (max(dose_list) - min(dose_list) + 1e-12))**2 +
+                    ((na - na_center) / (max(na_list) - min(na_list) + 1e-12))**2 +
+                    ((sg - sigma_center) / (max(sigma_list) - min(sigma_list) + 1e-12))**2 +
+                    ((wl - wl_center) / (max(wavelength_list) - min(wavelength_list) + 1e-12))**2
+                )
+                distances.append(dist)
+
+            if distances:
+                min_dist_idx = np.argmin(distances)
+                weight_list[min_dist_idx] *= float(center_weight_boost)
+
+        conditions = []
+        for idx, (df, d, na, sg, wl) in enumerate(all_combos):
+            w = weight_list[idx]
+            cond = ProcessCondition(
+                defocus=df,
+                dose=d,
+                na=na,
+                sigma=sg,
+                wavelength=wl,
+                weight=w,
+                name=f"cond_{idx:03d}_df={df:.0f}_dose={d:.2f}_NA={na:.2f}_σ={sg:.2f}"
+            )
+            conditions.append(cond)
+
+        return conditions
+
+
+@dataclass
+class MultiProcessSimulationResult:
+    """多工艺条件联合仿真结果"""
+    aerial_images: List[np.ndarray]
+    wafer_images: List[np.ndarray]
+    conditions: List[ProcessCondition]
+    dose: Optional[float] = None
+    threshold: float = 0.3
+
+    @property
+    def n_conditions(self) -> int:
+        """工艺条件数量"""
+        return len(self.conditions)
+
+    def get_condition_result(self, idx: int) -> Tuple[ProcessCondition, np.ndarray, np.ndarray]:
+        """获取指定索引的条件和结果"""
+        return self.conditions[idx], self.aerial_images[idx], self.wafer_images[idx]
+
+    def get_by_name(self, name: str) -> Optional[Tuple[ProcessCondition, np.ndarray, np.ndarray]]:
+        """按名称查找结果"""
+        for i, c in enumerate(self.conditions):
+            if c.name == name:
+                return c, self.aerial_images[i], self.wafer_images[i]
+        return None
+
+    def weighted_combined_image(self, use_wafer: bool = True) -> np.ndarray:
+        """按权重加权合成所有条件的图像"""
+        total_weight = sum(c.weight for c in self.conditions)
+        if total_weight <= 0:
+            raise ValueError("工艺条件权重总和必须大于0")
+
+        images = self.wafer_images if use_wafer else self.aerial_images
+        combined = np.zeros_like(images[0], dtype=np.float64)
+        for c, img in zip(self.conditions, images):
+            combined += (c.weight / total_weight) * img
+        return combined
 
 
 @dataclass
@@ -149,6 +392,71 @@ class OpticalSystem:
             'use_socs': self.use_socs,
             'socs_num_terms': self.socs_num_terms
         }
+
+    def parameter_sweep(
+        self,
+        defocus_values: Any = None,
+        dose_values: Any = None,
+        na_values: Any = None,
+        sigma_values: Any = None,
+        center_weight_boost: Optional[float] = None,
+        default_weight: float = 1.0
+    ) -> Tuple[List['OpticalSystem'], List[float], List[ProcessCondition]]:
+        """
+        参数扫描：生成多组光学系统变体
+
+        基于当前光学系统的基准参数，对指定维度进行扫描，
+        生成笛卡尔积组合的光学系统实例列表。
+
+        Args:
+            defocus_values: 离焦量扫描值。可以是：
+                - None: 使用当前 defocus 固定不变
+                - 标量: 固定为该值
+                - 列表/数组: 取其中每个值
+                - (start, stop, num) 元组: np.linspace 等间隔采样
+            dose_values: 曝光剂量扫描值（归一化），格式同上，None 则固定为 1.0
+            na_values: 数值孔径扫描值，格式同上，None 则使用当前 NA
+            sigma_values: 部分相干因子扫描值，格式同上，None 则使用当前 sigma
+            center_weight_boost: 中心条件额外权重倍率，None 则不区分
+            default_weight: 所有条件的默认基础权重
+
+        Returns:
+            (optical_systems, weights, conditions) 三元组：
+            - optical_systems: 扫描产生的 OpticalSystem 列表
+            - weights: 每个系统对应的权重列表
+            - conditions: 对应的 ProcessCondition 列表
+        """
+        df_vals = ProcessWindow._normalize_scan_values(
+            defocus_values if defocus_values is not None else self.defocus
+        )
+        dose_vals = ProcessWindow._normalize_scan_values(
+            dose_values if dose_values is not None else 1.0
+        )
+        na_vals = ProcessWindow._normalize_scan_values(
+            na_values if na_values is not None else self.na
+        )
+        sigma_vals = ProcessWindow._normalize_scan_values(
+            sigma_values if sigma_values is not None else self.sigma
+        )
+
+        pw = ProcessWindow(
+            defocus_values=df_vals,
+            dose_values=dose_vals,
+            na_values=na_vals,
+            sigma_values=sigma_vals,
+            wavelength_values=self.wavelength,
+            default_weight=default_weight
+        )
+        conditions = pw.generate_conditions(center_weight_boost=center_weight_boost)
+
+        optical_systems = []
+        weights = []
+        for cond in conditions:
+            opt_sys = cond.to_optical_system(base_optics=self)
+            optical_systems.append(opt_sys)
+            weights.append(cond.weight)
+
+        return optical_systems, weights, conditions
 
 
 def generate_source(fx: np.ndarray, fy: np.ndarray,
@@ -723,17 +1031,19 @@ def _apply_threshold(image: np.ndarray, threshold: float) -> np.ndarray:
 def simulate_wafer_image(mask: np.ndarray,
                          optical_system: Optional[OpticalSystem] = None,
                          threshold: float = 0.3,
-                         apply_resist: bool = True) -> np.ndarray:
+                         apply_resist: bool = True,
+                         dose: float = 1.0) -> np.ndarray:
     """
     模拟晶圆成像
 
-    完整的成像流程：掩模 -> 光学成像 -> 光刻胶响应
+    完整的成像流程：掩模 -> 光学成像 -> 剂量缩放 -> 光刻胶响应
 
     Args:
         mask: 掩模图案 (2D numpy数组)
         optical_system: 光学系统参数，None则使用默认参数
         threshold: 光刻胶阈值
         apply_resist: 是否应用光刻胶阈值处理
+        dose: 曝光相对剂量，1.0为标称剂量，大于1为过曝，小于1为欠曝
 
     Returns:
         晶圆成像结果
@@ -741,16 +1051,147 @@ def simulate_wafer_image(mask: np.ndarray,
     if optical_system is None:
         optical_system = OpticalSystem()
 
-    # 创建成像模型
     imaging_model = PartialCoherentImaging(optical_system, mask.shape)
 
-    # 计算空间像
     aerial_image = imaging_model.compute_aerial_image(mask)
 
-    # 应用光刻胶响应
+    if dose != 1.0:
+        aerial_image = np.clip(aerial_image * dose, 0.0, 1.0)
+
     if apply_resist:
         wafer_image = _apply_threshold(aerial_image, threshold)
     else:
         wafer_image = aerial_image
 
     return wafer_image
+
+
+def simulate_multi_process(
+    mask: np.ndarray,
+    conditions: List[ProcessCondition],
+    base_optics: Optional[OpticalSystem] = None,
+    threshold: float = 0.3,
+    apply_resist: bool = True
+) -> MultiProcessSimulationResult:
+    """
+    多工艺条件联合仿真
+
+    对给定的多组工艺条件，依次进行光学成像仿真。
+    支持 focus（defocus）、dose、NA、sigma 等参数扫描。
+
+    Args:
+        mask: 掩模图案 (2D numpy数组)
+        conditions: 工艺条件列表
+        base_optics: 基础光学系统（提供未在ProcessCondition中定义的参数）
+        threshold: 光刻胶阈值
+        apply_resist: 是否应用光刻胶阈值处理
+
+    Returns:
+        MultiProcessSimulationResult，包含所有工艺条件下的仿真结果
+    """
+    if base_optics is None:
+        base_optics = OpticalSystem()
+
+    aerial_images = []
+    wafer_images = []
+
+    for cond in conditions:
+        optics = cond.to_optical_system(base_optics=base_optics)
+        imaging_model = PartialCoherentImaging(optics, mask.shape)
+        aerial = imaging_model.compute_aerial_image(mask)
+
+        if cond.dose != 1.0:
+            aerial_dosed = np.clip(aerial * cond.dose, 0.0, 1.0)
+        else:
+            aerial_dosed = aerial.copy()
+
+        if apply_resist:
+            wafer = _apply_threshold(aerial_dosed, threshold)
+        else:
+            wafer = aerial_dosed.copy()
+
+        aerial_images.append(aerial_dosed)
+        wafer_images.append(wafer)
+
+    return MultiProcessSimulationResult(
+        aerial_images=aerial_images,
+        wafer_images=wafer_images,
+        conditions=conditions,
+        threshold=threshold
+    )
+
+
+def create_focus_dose_window(
+    focus_range: Tuple[float, float, int] = (-100, 100, 5),
+    dose_range: Tuple[float, float, int] = (0.8, 1.2, 5),
+    na: float = 1.35,
+    sigma: float = 0.75,
+    wavelength: float = 193.0,
+    center_weight: Optional[float] = 2.0,
+    edge_weight: float = 1.0
+) -> List[ProcessCondition]:
+    """
+    便捷函数：创建经典的 focus-dose 工艺窗口
+
+    生成 focus × dose 的二维工艺窗口扫描条件，用于工艺鲁棒性优化。
+    中心条件（最佳焦点、标称剂量）权重更高，四角条件权重较低。
+
+    Args:
+        focus_range: (start_nm, stop_nm, n_points) 离焦量扫描范围
+        dose_range: (start, stop, n_points) 曝光剂量扫描范围
+        na: 固定的数值孔径
+        sigma: 固定的部分相干因子
+        wavelength: 固定的波长 (nm)
+        center_weight: 中心条件额外权重倍率；None则不做区分
+        edge_weight: 边界条件的基础权重
+
+    Returns:
+        ProcessCondition列表，中心条件权重被center_weight放大
+    """
+    pw = ProcessWindow(
+        defocus_values=focus_range,
+        dose_values=dose_range,
+        na_values=na,
+        sigma_values=sigma,
+        wavelength_values=wavelength,
+        default_weight=edge_weight
+    )
+
+    return pw.generate_conditions(center_weight_boost=center_weight)
+
+
+def create_full_process_window(
+    focus_values: Any = (-100, 0, 100, 3),
+    dose_values: Any = (0.85, 1.0, 1.15, 3),
+    na_values: Any = (1.30, 1.35, 3),
+    sigma_values: Any = (0.65, 0.75, 0.85, 3),
+    wavelength: float = 193.0,
+    center_weight_boost: Optional[float] = 3.0
+) -> List[ProcessCondition]:
+    """
+    便捷函数：创建完整四维工艺窗口
+
+    包含 focus、dose、NA、sigma 四维参数扫描。
+    用于对工艺窗口进行全面的鲁棒性验证和优化。
+
+    Args:
+        focus_values: 离焦量扫描范围（标量/列表/三元组）
+        dose_values: 剂量扫描范围
+        na_values: 数值孔径扫描范围
+        sigma_values: 部分相干因子扫描范围
+        wavelength: 固定波长
+        center_weight_boost: 中心条件权重倍率
+
+    Returns:
+        ProcessCondition列表
+    """
+    pw = ProcessWindow(
+        defocus_values=focus_values,
+        dose_values=dose_values,
+        na_values=na_values,
+        sigma_values=sigma_values,
+        wavelength_values=wavelength,
+        default_weight=1.0
+    )
+
+    return pw.generate_conditions(center_weight_boost=center_weight_boost)

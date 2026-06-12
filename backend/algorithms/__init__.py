@@ -8,7 +8,7 @@ from algorithms.advanced_optimizer import (
     BaseHeuristicOptimizer, GeneticAlgorithmOptimizer, ParticleSwarmOptimizer,
     ReinforcementLearningOptimizer, SimpleQLearningModel
 )
-from algorithms.mask_optimizer import MaskOptimizer, OptimizationConfig
+from algorithms.mask_optimizer import MaskOptimizer, OptimizationConfig, MaskOptimizationResult
 
 __all__ = [
     'GradientDescentOptimizer',
@@ -20,5 +20,6 @@ __all__ = [
     'ReinforcementLearningOptimizer',
     'SimpleQLearningModel',
     'MaskOptimizer',
-    'OptimizationConfig'
+    'OptimizationConfig',
+    'MaskOptimizationResult'
 ]

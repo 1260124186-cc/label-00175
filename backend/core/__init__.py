@@ -11,7 +11,13 @@ from core.imaging import (
     generate_source,
     compute_tcc_kernel_2d,
     compute_tcc_full,
-    socs_decomposition
+    socs_decomposition,
+    ProcessCondition,
+    ProcessWindow,
+    MultiProcessSimulationResult,
+    simulate_multi_process,
+    create_focus_dose_window,
+    create_full_process_window
 )
 from core.fft import fft2d, ifft2d, fft1d, ifft1d, frequency_filter, phase_modulation
 from core.metrics import mse, mae, ssim, normalized_correlation, batch_evaluate
@@ -25,6 +31,12 @@ __all__ = [
     'compute_tcc_kernel_2d',
     'compute_tcc_full',
     'socs_decomposition',
+    'ProcessCondition',
+    'ProcessWindow',
+    'MultiProcessSimulationResult',
+    'simulate_multi_process',
+    'create_focus_dose_window',
+    'create_full_process_window',
     'fft2d',
     'ifft2d',
     'fft1d',
