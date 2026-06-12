@@ -19,11 +19,11 @@ from dataclasses import dataclass
 def mse(image1: np.ndarray, image2: np.ndarray) -> float:
     """
     计算均方误差 (Mean Squared Error)
-    
+
     Args:
         image1: 第一幅图像
         image2: 第二幅图像（目标图像）
-        
+
     Returns:
         MSE值，越小表示越相似
     """
@@ -35,11 +35,11 @@ def mse(image1: np.ndarray, image2: np.ndarray) -> float:
 def mae(image1: np.ndarray, image2: np.ndarray) -> float:
     """
     计算平均绝对误差 (Mean Absolute Error)
-    
+
     Args:
         image1: 第一幅图像
         image2: 第二幅图像（目标图像）
-        
+
     Returns:
         MAE值，越小表示越相似
     """
@@ -48,24 +48,24 @@ def mae(image1: np.ndarray, image2: np.ndarray) -> float:
 
 
 @jit(nopython=True, cache=True)
-def _compute_local_stats(image: np.ndarray, 
+def _compute_local_stats(image: np.ndarray,
                          window_size: int) -> Tuple[np.ndarray, np.ndarray]:
     """
     计算局部均值和方差
-    
+
     Args:
         image: 输入图像
         window_size: 窗口大小
-        
+
     Returns:
         (局部均值, 局部方差)
     """
     ny, nx = image.shape
     half_win = window_size // 2
-    
+
     mean_img = np.zeros((ny, nx), dtype=np.float64)
     var_img = np.zeros((ny, nx), dtype=np.float64)
-    
+
     for i in range(ny):
         for j in range(nx):
             # 确定窗口边界
@@ -73,73 +73,73 @@ def _compute_local_stats(image: np.ndarray,
             y_end = min(ny, i + half_win + 1)
             x_start = max(0, j - half_win)
             x_end = min(nx, j + half_win + 1)
-            
+
             # 提取窗口
             window_sum = 0.0
             window_sq_sum = 0.0
             count = 0
-            
+
             for yi in range(y_start, y_end):
                 for xi in range(x_start, x_end):
                     val = image[yi, xi]
                     window_sum += val
                     window_sq_sum += val * val
                     count += 1
-            
+
             mean_val = window_sum / count
             var_val = window_sq_sum / count - mean_val * mean_val
-            
+
             mean_img[i, j] = mean_val
             var_img[i, j] = max(0.0, var_val)  # 确保非负
-    
+
     return mean_img, var_img
 
 
 @jit(nopython=True, cache=True)
-def _compute_local_covariance(image1: np.ndarray, 
+def _compute_local_covariance(image1: np.ndarray,
                               image2: np.ndarray,
                               mean1: np.ndarray,
                               mean2: np.ndarray,
                               window_size: int) -> np.ndarray:
     """
     计算局部协方差
-    
+
     Args:
         image1: 第一幅图像
         image2: 第二幅图像
         mean1: 图像1的局部均值
         mean2: 图像2的局部均值
         window_size: 窗口大小
-        
+
     Returns:
         局部协方差图
     """
     ny, nx = image1.shape
     half_win = window_size // 2
-    
+
     cov_img = np.zeros((ny, nx), dtype=np.float64)
-    
+
     for i in range(ny):
         for j in range(nx):
             y_start = max(0, i - half_win)
             y_end = min(ny, i + half_win + 1)
             x_start = max(0, j - half_win)
             x_end = min(nx, j + half_win + 1)
-            
+
             cov_sum = 0.0
             count = 0
-            
+
             for yi in range(y_start, y_end):
                 for xi in range(x_start, x_end):
                     cov_sum += (image1[yi, xi] - mean1[i, j]) * (image2[yi, xi] - mean2[i, j])
                     count += 1
-            
+
             cov_img[i, j] = cov_sum / count
-    
+
     return cov_img
 
 
-def ssim(image1: np.ndarray, 
+def ssim(image1: np.ndarray,
          image2: np.ndarray,
          window_size: int = 11,
          k1: float = 0.01,
@@ -147,7 +147,7 @@ def ssim(image1: np.ndarray,
          data_range: float = 1.0) -> float:
     """
     计算结构相似性指数 (Structural Similarity Index)
-    
+
     Args:
         image1: 第一幅图像
         image2: 第二幅图像（目标图像）
@@ -155,28 +155,28 @@ def ssim(image1: np.ndarray,
         k1: 稳定常数1
         k2: 稳定常数2
         data_range: 数据范围（最大值-最小值）
-        
+
     Returns:
         SSIM值，范围[-1, 1]，越接近1表示越相似
     """
     img1 = image1.astype(np.float64)
     img2 = image2.astype(np.float64)
-    
+
     # 稳定常数
     c1 = (k1 * data_range) ** 2
     c2 = (k2 * data_range) ** 2
-    
+
     # 计算局部统计量
     mean1, var1 = _compute_local_stats(img1, window_size)
     mean2, var2 = _compute_local_stats(img2, window_size)
     cov12 = _compute_local_covariance(img1, img2, mean1, mean2, window_size)
-    
+
     # 计算SSIM
     numerator = (2 * mean1 * mean2 + c1) * (2 * cov12 + c2)
     denominator = (mean1**2 + mean2**2 + c1) * (var1 + var2 + c2)
-    
+
     ssim_map = numerator / (denominator + 1e-10)
-    
+
     return float(np.mean(ssim_map))
 
 
@@ -327,50 +327,50 @@ def ssim_loss_gradient(image1: np.ndarray,
 def normalized_correlation(image1: np.ndarray, image2: np.ndarray) -> float:
     """
     计算归一化相关系数 (Normalized Cross-Correlation)
-    
+
     Args:
         image1: 第一幅图像
         image2: 第二幅图像（目标图像）
-        
+
     Returns:
         NCC值，范围[-1, 1]，越接近1表示越相似
     """
     img1 = image1.astype(np.float64).flatten()
     img2 = image2.astype(np.float64).flatten()
-    
+
     # 去均值
     img1_centered = img1 - np.mean(img1)
     img2_centered = img2 - np.mean(img2)
-    
+
     # 计算相关系数
     numerator = np.sum(img1_centered * img2_centered)
     denominator = np.sqrt(np.sum(img1_centered**2) * np.sum(img2_centered**2))
-    
+
     if denominator < 1e-10:
         return 0.0
-    
+
     return numerator / denominator
 
 
 @jit(nopython=True, cache=True)
-def psnr(image1: np.ndarray, image2: np.ndarray, 
+def psnr(image1: np.ndarray, image2: np.ndarray,
          data_range: float = 1.0) -> float:
     """
     计算峰值信噪比 (Peak Signal-to-Noise Ratio)
-    
+
     Args:
         image1: 第一幅图像
         image2: 第二幅图像（目标图像）
         data_range: 数据范围
-        
+
     Returns:
         PSNR值（dB），越大表示越相似
     """
     mse_val = mse(image1, image2)
-    
+
     if mse_val < 1e-10:
         return 100.0  # 完全相同
-    
+
     return 10.0 * np.log10(data_range**2 / mse_val)
 
 
@@ -382,7 +382,7 @@ class MetricsResult:
     ssim: float
     ncc: float
     psnr: float
-    
+
     def to_dict(self) -> Dict[str, float]:
         """转换为字典"""
         return {
@@ -394,17 +394,17 @@ class MetricsResult:
         }
 
 
-def evaluate_all(image1: np.ndarray, 
+def evaluate_all(image1: np.ndarray,
                  image2: np.ndarray,
                  data_range: float = 1.0) -> MetricsResult:
     """
     计算所有误差指标
-    
+
     Args:
         image1: 第一幅图像（预测/优化结果）
         image2: 第二幅图像（目标图像）
         data_range: 数据范围
-        
+
     Returns:
         MetricsResult对象，包含所有指标
     """
@@ -422,19 +422,19 @@ def batch_evaluate(images: List[np.ndarray],
                    metrics: Optional[List[str]] = None) -> List[Dict[str, float]]:
     """
     批量评估多幅图像
-    
+
     Args:
         images: 待评估图像列表
         target: 目标图像
         metrics: 要计算的指标列表，None则计算全部
                  可选: ['mse', 'mae', 'ssim', 'ncc', 'psnr']
-        
+
     Returns:
         评估结果列表，每个元素为指标字典
     """
     if metrics is None:
         metrics = ['mse', 'mae', 'ssim', 'ncc', 'psnr']
-    
+
     metric_funcs = {
         'mse': mse,
         'mae': mae,
@@ -442,7 +442,7 @@ def batch_evaluate(images: List[np.ndarray],
         'ncc': normalized_correlation,
         'psnr': psnr
     }
-    
+
     results = []
     for img in images:
         result = {}
@@ -450,26 +450,26 @@ def batch_evaluate(images: List[np.ndarray],
             if metric_name in metric_funcs:
                 result[metric_name] = metric_funcs[metric_name](img, target)
         results.append(result)
-    
+
     return results
 
 
-def compute_error_map(image1: np.ndarray, 
+def compute_error_map(image1: np.ndarray,
                       image2: np.ndarray,
                       error_type: str = 'absolute') -> np.ndarray:
     """
     计算误差分布图
-    
+
     Args:
         image1: 第一幅图像
         image2: 第二幅图像（目标）
         error_type: 误差类型 ('absolute', 'squared', 'signed')
-        
+
     Returns:
         误差分布图
     """
     diff = image1.astype(np.float64) - image2.astype(np.float64)
-    
+
     if error_type == 'absolute':
         return np.abs(diff)
     elif error_type == 'squared':
@@ -671,6 +671,687 @@ def tv_regularization_gradient(x: np.ndarray) -> np.ndarray:
     return total_variation_gradient(x)
 
 
+def manhattan_distance_penalty(mask: np.ndarray) -> float:
+    """
+    曼哈顿距离惩罚（促进二值化）
+
+    惩罚掩模像素值偏离 0 或 1 的程度：
+    L1_binary = Σ min(|m_i|, |1 - m_i|) * 2
+              = Σ 2 * |m_i - 0.5| - 0.5 （等价形式）
+              = Σ 1 - |2 * m_i - 1|
+
+    当 m_i = 0 或 m_i = 1 时，惩罚为 0；
+    当 m_i = 0.5 时，惩罚达到最大值 1。
+
+    Args:
+        mask: 掩模图案（2D 数组，值范围 [0, 1]）
+
+    Returns:
+        平均曼哈顿距离惩罚值（归一化到像素数）
+    """
+    m = mask.astype(np.float64)
+    penalty = 1.0 - np.abs(2.0 * m - 1.0)
+    return float(np.mean(penalty))
+
+
+def manhattan_distance_penalty_gradient(mask: np.ndarray) -> np.ndarray:
+    """
+    曼哈顿距离惩罚的梯度
+
+    dL/dm_i = -2 * sign(2*m_i - 1)  当 m_i != 0.5
+    在 m_i = 0.5 处子梯度可取 [-2, 2] 之间任意值，取 0。
+
+    Args:
+        mask: 掩模图案（2D 数组）
+
+    Returns:
+        梯度数组，与 mask 形状相同
+    """
+    m = mask.astype(np.float64)
+    diff = 2.0 * m - 1.0
+    grad = -2.0 * np.sign(diff)
+    grad[np.abs(diff) < 1e-10] = 0.0
+    return grad / mask.size
+
+
+def binary_entropy_penalty(mask: np.ndarray, eps: float = 1e-10) -> float:
+    """
+    二值熵惩罚（另一种二值化促进方式）
+
+    H(m) = -Σ [m_i * log(m_i) + (1 - m_i) * log(1 - m_i)]
+
+    当 m_i = 0 或 m_i = 1 时，熵为 0；
+    当 m_i = 0.5 时，熵达到最大值 log(2)。
+
+    Args:
+        mask: 掩模图案（2D 数组，值范围 (0, 1)）
+        eps: 数值稳定性小量
+
+    Returns:
+        平均二值熵惩罚值
+    """
+    m = np.clip(mask.astype(np.float64), eps, 1.0 - eps)
+    entropy = - (m * np.log(m) + (1.0 - m) * np.log(1.0 - m))
+    return float(np.mean(entropy))
+
+
+def binary_entropy_penalty_gradient(mask: np.ndarray, eps: float = 1e-10) -> np.ndarray:
+    """
+    二值熵惩罚的梯度
+
+    dH/dm_i = -log(m_i) + log(1 - m_i) = log((1 - m_i) / m_i)
+
+    Args:
+        mask: 掩模图案（2D 数组）
+        eps: 数值稳定性小量
+
+    Returns:
+        梯度数组
+    """
+    m = np.clip(mask.astype(np.float64), eps, 1.0 - eps)
+    grad = np.log((1.0 - m) / m)
+    return grad / mask.size
+
+
+def total_variation_anisotropic(image: np.ndarray) -> float:
+    """
+    各向异性总变分 (Anisotropic TV) - L1 范数
+
+    TV_L1 = Σ |I[i+1,j] - I[i,j]| + |I[i,j+1] - I[i,j]|
+
+    对水平和垂直差分分别取 L1 范数，更倾向于保留水平/垂直边缘。
+
+    Args:
+        image: 输入图像（2D 数组）
+
+    Returns:
+        各向异性 TV 值
+    """
+    img = image.astype(np.float64)
+    diff_y = np.abs(np.diff(img, axis=0))
+    diff_x = np.abs(np.diff(img, axis=1))
+    return float(np.sum(diff_y) + np.sum(diff_x))
+
+
+def total_variation_isotropic(image: np.ndarray, eps: float = 1e-8) -> float:
+    """
+    各向同性总变分 (Isotropic TV) - L2 范数
+
+    TV_L2 = Σ sqrt( (I[i+1,j]-I[i,j])² + (I[i,j+1]-I[i,j])² )
+
+    对梯度取 L2 范数，对边缘方向不敏感，更均匀地平滑。
+
+    Args:
+        image: 输入图像（2D 数组）
+        eps: 数值稳定性小量
+
+    Returns:
+        各向同性 TV 值
+    """
+    img = image.astype(np.float64)
+    ny, nx = img.shape
+    diff_y = np.zeros_like(img)
+    diff_x = np.zeros_like(img)
+    diff_y[:-1, :] = np.diff(img, axis=0)
+    diff_x[:, :-1] = np.diff(img, axis=1)
+    grad_mag = np.sqrt(diff_y**2 + diff_x**2 + eps**2)
+    return float(np.sum(grad_mag))
+
+
+def total_variation_isotropic_gradient(image: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """
+    各向同性总变分的梯度
+
+    dTV/dI[i,j] = (I[i,j] - I[i-1,j]) / |∇I[i-1,j]|
+                + (I[i,j] - I[i+1,j]) / |∇I[i,j]|
+                + (I[i,j] - I[i,j-1]) / |∇I[i,j-1]|
+                + (I[i,j] - I[i,j+1]) / |∇I[i,j]|
+
+    （边界处缺失项为 0）
+
+    Args:
+        image: 输入图像（2D 数组）
+        eps: 数值稳定性小量
+
+    Returns:
+        梯度数组
+    """
+    img = image.astype(np.float64)
+    ny, nx = img.shape
+    grad = np.zeros_like(img)
+
+    diff_y = np.zeros_like(img)
+    diff_x = np.zeros_like(img)
+    diff_y[:-1, :] = np.diff(img, axis=0)
+    diff_x[:, :-1] = np.diff(img, axis=1)
+    grad_mag = np.sqrt(diff_y**2 + diff_x**2 + eps**2)
+
+    grad[1:, :] += (img[1:, :] - img[:-1, :]) / grad_mag[:-1, :]
+    grad[:-1, :] += (img[:-1, :] - img[1:, :]) / grad_mag[:-1, :]
+    grad[:, 1:] += (img[:, 1:] - img[:, :-1]) / grad_mag[:, :-1]
+    grad[:, :-1] += (img[:, :-1] - img[:, 1:]) / grad_mag[:, :-1]
+
+    return grad
+
+
+def compute_edge_map(image: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+    """
+    计算图像的二值边缘图（使用 Sobel 算子 + 阈值）
+
+    Args:
+        image: 输入图像（2D 数组，值范围 [0, 1]）
+        threshold: 边缘阈值
+
+    Returns:
+        二值边缘图（1 表示边缘，0 表示非边缘）
+    """
+    img = image.astype(np.float64)
+
+    sobel_y = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float64)
+    sobel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float64)
+
+    from scipy.signal import convolve2d
+    grad_y = convolve2d(img, sobel_y, mode='same', boundary='symm')
+    grad_x = convolve2d(img, sobel_x, mode='same', boundary='symm')
+    grad_mag = np.sqrt(grad_y**2 + grad_x**2)
+
+    grad_max = grad_mag.max()
+    if grad_max > 0:
+        grad_mag = grad_mag / grad_max
+
+    edge_map = (grad_mag >= threshold).astype(np.float64)
+    return edge_map
+
+
+def edge_placement_error(image: np.ndarray,
+                         target: np.ndarray,
+                         threshold: float = 0.5,
+                         pixel_size: float = 1.0) -> float:
+    """
+    边缘放置误差 (Edge Placement Error, EPE) 近似
+
+    计算预测图像与目标图像的边缘位置之间的平均距离：
+    EPE = mean( distance_transform(pred_edge) * target_edge
+               + distance_transform(target_edge) * pred_edge )
+
+    这是一个可微近似，使用距离变换衡量边缘对齐程度。
+
+    Args:
+        image: 预测图像（2D 数组）
+        target: 目标图像（2D 数组）
+        threshold: 边缘检测阈值
+        pixel_size: 像素尺寸（用于转换为物理距离）
+
+    Returns:
+        平均 EPE 值（单位与 pixel_size 一致）
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    pred_edge = compute_edge_map(image, threshold)
+    target_edge = compute_edge_map(target, threshold)
+
+    if np.sum(target_edge) == 0 and np.sum(pred_edge) == 0:
+        return 0.0
+
+    dist_pred = distance_transform_edt(1.0 - pred_edge)
+    dist_target = distance_transform_edt(1.0 - target_edge)
+
+    epe_val = (np.sum(dist_pred * target_edge) + np.sum(dist_target * pred_edge))
+    n_edges = np.sum(target_edge) + np.sum(pred_edge)
+
+    if n_edges > 0:
+        epe_val = epe_val / n_edges
+
+    return float(epe_val * pixel_size)
+
+
+def edge_placement_error_gradient(image: np.ndarray,
+                                  target: np.ndarray,
+                                  threshold: float = 0.5,
+                                  eps: float = 1e-5) -> np.ndarray:
+    """
+    边缘放置误差（EPE）的数值梯度（近似）
+
+    由于 EPE 涉及离散边缘检测，直接解析梯度困难，
+    使用数值差分近似。对于小尺寸掩模可接受。
+
+    Args:
+        image: 预测图像（2D 数组，变量）
+        target: 目标图像（2D 数组，常数）
+        threshold: 边缘检测阈值
+        eps: 数值差分步长
+
+    Returns:
+        梯度数组
+    """
+    ny, nx = image.shape
+    grad = np.zeros((ny, nx), dtype=np.float64)
+    base_epe = edge_placement_error(image, target, threshold)
+
+    for i in range(ny):
+        for j in range(nx):
+            img_plus = image.copy()
+            img_plus[i, j] = min(1.0, img_plus[i, j] + eps)
+            epe_plus = edge_placement_error(img_plus, target, threshold)
+
+            img_minus = image.copy()
+            img_minus[i, j] = max(0.0, img_minus[i, j] - eps)
+            epe_minus = edge_placement_error(img_minus, target, threshold)
+
+            grad[i, j] = (epe_plus - epe_minus) / (2 * eps)
+
+    return grad
+
+
+def soft_edge_placement_error(image: np.ndarray,
+                              target: np.ndarray,
+                              sigma: float = 1.0,
+                              pixel_size: float = 1.0) -> float:
+    """
+    软边缘放置误差（可微版本）
+
+    使用高斯滤波的梯度幅值代替二值边缘，避免离散操作，
+    使得损失函数处处可微。
+
+    EPE_soft = || gσ * |∇I_pred| - gσ * |∇I_target| ||_1
+
+    其中 gσ 是标准差为 σ 的高斯核。
+
+    Args:
+        image: 预测图像（2D 数组）
+        target: 目标图像（2D 数组）
+        sigma: 高斯平滑标准差（像素）
+        pixel_size: 像素尺寸
+
+    Returns:
+        软 EPE 值
+    """
+    from scipy.ndimage import gaussian_filter
+
+    img = image.astype(np.float64)
+    tgt = target.astype(np.float64)
+
+    grad_y_pred = np.zeros_like(img)
+    grad_x_pred = np.zeros_like(img)
+    grad_y_pred[:-1, :] = np.diff(img, axis=0)
+    grad_x_pred[:, :-1] = np.diff(img, axis=1)
+    grad_mag_pred = np.sqrt(grad_y_pred**2 + grad_x_pred**2)
+
+    grad_y_tgt = np.zeros_like(tgt)
+    grad_x_tgt = np.zeros_like(tgt)
+    grad_y_tgt[:-1, :] = np.diff(tgt, axis=0)
+    grad_x_tgt[:, :-1] = np.diff(tgt, axis=1)
+    grad_mag_tgt = np.sqrt(grad_y_tgt**2 + grad_x_tgt**2)
+
+    if sigma > 0:
+        grad_mag_pred = gaussian_filter(grad_mag_pred, sigma=sigma)
+        grad_mag_tgt = gaussian_filter(grad_mag_tgt, sigma=sigma)
+
+    pred_max = grad_mag_pred.max()
+    tgt_max = grad_mag_tgt.max()
+    if pred_max > 0:
+        grad_mag_pred = grad_mag_pred / pred_max
+    if tgt_max > 0:
+        grad_mag_tgt = grad_mag_tgt / tgt_max
+
+    epe_soft = np.mean(np.abs(grad_mag_pred - grad_mag_tgt))
+    return float(epe_soft * pixel_size)
+
+
+def soft_edge_placement_error_gradient(image: np.ndarray,
+                                       target: np.ndarray,
+                                       sigma: float = 1.0) -> np.ndarray:
+    """
+    软边缘放置误差的解析梯度
+
+    Args:
+        image: 预测图像（2D 数组）
+        target: 目标图像（2D 数组）
+        sigma: 高斯平滑标准差
+
+    Returns:
+        梯度数组
+    """
+    from scipy.ndimage import gaussian_filter
+
+    img = image.astype(np.float64)
+    tgt = target.astype(np.float64)
+    ny, nx = img.shape
+
+    grad_y_pred = np.zeros_like(img)
+    grad_x_pred = np.zeros_like(img)
+    grad_y_pred[:-1, :] = np.diff(img, axis=0)
+    grad_x_pred[:, :-1] = np.diff(img, axis=1)
+    grad_mag_pred = np.sqrt(grad_y_pred**2 + grad_x_pred**2 + 1e-12)
+
+    grad_y_tgt = np.zeros_like(tgt)
+    grad_x_tgt = np.zeros_like(tgt)
+    grad_y_tgt[:-1, :] = np.diff(tgt, axis=0)
+    grad_x_tgt[:, :-1] = np.diff(tgt, axis=1)
+    grad_mag_tgt = np.sqrt(grad_y_tgt**2 + grad_x_tgt**2)
+
+    pred_max = grad_mag_pred.max()
+    tgt_max = grad_mag_tgt.max()
+    if pred_max <= 0:
+        pred_max = 1.0
+    if tgt_max <= 0:
+        tgt_max = 1.0
+
+    grad_mag_pred_norm = grad_mag_pred / pred_max
+    grad_mag_tgt_norm = grad_mag_tgt / tgt_max
+
+    if sigma > 0:
+        grad_mag_pred_smooth = gaussian_filter(grad_mag_pred_norm, sigma=sigma)
+        grad_mag_tgt_smooth = gaussian_filter(grad_mag_tgt_norm, sigma=sigma)
+    else:
+        grad_mag_pred_smooth = grad_mag_pred_norm
+        grad_mag_tgt_smooth = grad_mag_tgt_norm
+
+    sign_diff = np.sign(grad_mag_pred_smooth - grad_mag_tgt_smooth)
+
+    if sigma > 0:
+        from scipy.ndimage import correlate
+        k_size = int(4 * sigma) + 1
+        x = np.arange(-k_size, k_size + 1)
+        g_kernel = np.exp(-x**2 / (2 * sigma**2))
+        g_kernel = g_kernel / g_kernel.sum()
+        g_2d = np.outer(g_kernel, g_kernel)
+        backprop_sign = correlate(sign_diff, g_2d, mode='constant')
+    else:
+        backprop_sign = sign_diff
+
+    backprop_sign = backprop_sign / pred_max
+
+    dmag_dy = grad_y_pred / grad_mag_pred
+    dmag_dx = grad_x_pred / grad_mag_pred
+
+    grad = np.zeros_like(img)
+
+    grad_y_contrib = backprop_sign * dmag_dy
+    grad[1:, :] += grad_y_contrib[:-1, :]
+    grad[:-1, :] -= grad_y_contrib[:-1, :]
+
+    grad_x_contrib = backprop_sign * dmag_dx
+    grad[:, 1:] += grad_x_contrib[:, :-1]
+    grad[:, :-1] -= grad_x_contrib[:, :-1]
+
+    return grad / (ny * nx)
+
+
+def _create_structuring_element(kernel_size: int) -> np.ndarray:
+    """
+    创建形态学操作的结构元素（圆盘形）
+
+    Args:
+        kernel_size: 结构元素尺寸（奇数）
+
+    Returns:
+        二值结构元素数组
+    """
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    r = kernel_size // 2
+    y, x = np.ogrid[-r:r+1, -r:r+1]
+    selem = (x**2 + y**2) <= r**2
+    return selem.astype(np.float64)
+
+
+def min_feature_size_morphology(mask: np.ndarray,
+                                min_size: int = 3,
+                                threshold: float = 0.5) -> float:
+    """
+    最小特征尺寸约束（形态学方法）
+
+    使用开运算（腐蚀+膨胀）检测小于 min_size 的特征：
+    - 对掩模的亮区（>= threshold）做开运算，移除小的亮特征
+    - 对掩模的暗区（< threshold）做开运算，移除小的暗特征（孔洞）
+    惩罚 = || mask - open(mask) ||_1 + || (1-mask) - open(1-mask) ||_1
+
+    这是一个可微的软近似，使用 sigmoid 代替硬阈值。
+
+    Args:
+        mask: 掩模图案（2D 数组，值范围 [0, 1]）
+        min_size: 最小允许的特征尺寸（像素），对应结构元素半径
+        threshold: 二值化阈值
+
+    Returns:
+        平均小特征惩罚值
+    """
+    from scipy.ndimage import binary_opening
+
+    m = mask.astype(np.float64)
+    ny, nx = m.shape
+
+    selem = _create_structuring_element(min_size)
+
+    bright_mask = (m >= threshold).astype(np.float64)
+    bright_opened = binary_opening(bright_mask > 0.5, structure=selem > 0.5).astype(np.float64)
+    bright_penalty = np.sum(np.abs(bright_mask - bright_opened))
+
+    dark_mask = (m < threshold).astype(np.float64)
+    dark_opened = binary_opening(dark_mask > 0.5, structure=selem > 0.5).astype(np.float64)
+    dark_penalty = np.sum(np.abs(dark_mask - dark_opened))
+
+    total_penalty = (bright_penalty + dark_penalty) / (ny * nx)
+    return float(total_penalty)
+
+
+def soft_min_feature_size_morphology(mask: np.ndarray,
+                                     min_size: int = 3,
+                                     steepness: float = 10.0) -> float:
+    """
+    软最小特征尺寸约束（可微形态学近似）
+
+    使用可微的近似腐蚀和膨胀操作：
+    - 软腐蚀：局部加权最小值（可用平均池化近似）
+    - 软膨胀：局部加权最大值（可用平均池化近似）
+
+    实际使用高斯加权的局部平均来近似形态学操作。
+
+    Args:
+        mask: 掩模图案（2D 数组）
+        min_size: 最小特征尺寸（像素）
+        steepness: sigmoid 陡度参数
+
+    Returns:
+        平均小特征惩罚值
+    """
+    from scipy.ndimage import gaussian_filter
+
+    m = mask.astype(np.float64)
+    ny, nx = m.shape
+
+    sigma = min_size / 3.0
+
+    m_sigmoid = 1.0 / (1.0 + np.exp(-steepness * (m - 0.5)))
+
+    smoothed = gaussian_filter(m_sigmoid, sigma=sigma)
+
+    diff = np.abs(m_sigmoid - smoothed)
+
+    high_freq_mask = (diff > 0.1).astype(np.float64)
+
+    penalty = np.sum(diff * high_freq_mask) / (ny * nx)
+
+    return float(penalty)
+
+
+def soft_min_feature_size_morphology_gradient(mask: np.ndarray,
+                                              min_size: int = 3,
+                                              steepness: float = 10.0) -> np.ndarray:
+    """
+    软最小特征尺寸约束的梯度（形态学方法）
+
+    Args:
+        mask: 掩模图案（2D 数组）
+        min_size: 最小特征尺寸（像素）
+        steepness: sigmoid 陡度参数
+
+    Returns:
+        梯度数组
+    """
+    from scipy.ndimage import gaussian_filter, correlate
+
+    m = mask.astype(np.float64)
+    ny, nx = m.shape
+
+    sigma = min_size / 3.0
+
+    sig_arg = steepness * (m - 0.5)
+    m_sigmoid = 1.0 / (1.0 + np.exp(-sig_arg))
+    dsigmoid_dm = steepness * m_sigmoid * (1.0 - m_sigmoid)
+
+    smoothed = gaussian_filter(m_sigmoid, sigma=sigma)
+
+    diff = np.abs(m_sigmoid - smoothed)
+    sign_diff = np.sign(m_sigmoid - smoothed)
+
+    high_freq_mask = (diff > 0.1).astype(np.float64)
+    dmask_dm = sign_diff * high_freq_mask + diff * 0.0
+
+    k_size = int(4 * sigma) + 1
+    x = np.arange(-k_size, k_size + 1)
+    g_kernel = np.exp(-x**2 / (2 * sigma**2))
+    g_kernel = g_kernel / g_kernel.sum()
+    g_2d = np.outer(g_kernel, g_kernel)
+
+    backprop = correlate(dmask_dm, g_2d, mode='constant')
+
+    grad = dsigmoid_dm * (dmask_dm - backprop)
+
+    return grad / (ny * nx)
+
+
+def min_feature_size_frequency(mask: np.ndarray,
+                               min_size: int = 3,
+                               pixel_size: float = 1.0) -> float:
+    """
+    最小特征尺寸约束（频域带限方法）
+
+    惩罚高于截止频率的频谱分量：
+    f_cutoff = 1 / (min_size * pixel_size)
+    惩罚 = Σ |M(f)| * (|f| > f_cutoff)
+
+    这通过移除过小特征的高频分量来约束最小特征尺寸。
+
+    Args:
+        mask: 掩模图案（2D 数组）
+        min_size: 最小允许的特征尺寸（物理单位，与 pixel_size 一致）
+        pixel_size: 像素尺寸
+
+    Returns:
+        高频分量惩罚值（归一化）
+    """
+    m = mask.astype(np.float64)
+    ny, nx = m.shape
+
+    cutoff_freq = 1.0 / (min_size * pixel_size)
+
+    fx = np.fft.fftfreq(nx, pixel_size)
+    fy = np.fft.fftfreq(ny, pixel_size)
+    fy_grid, fx_grid = np.meshgrid(fy, fx, indexing='ij')
+
+    freq_mag = np.sqrt(fx_grid**2 + fy_grid**2)
+    high_pass_mask = (freq_mag > cutoff_freq).astype(np.float64)
+
+    spectrum = np.fft.fft2(m)
+    spectrum_mag = np.abs(spectrum)
+
+    total_high_freq = np.sum(spectrum_mag * high_pass_mask)
+    total_energy = np.sum(spectrum_mag) + 1e-12
+
+    penalty = total_high_freq / total_energy
+    return float(penalty)
+
+
+def min_feature_size_frequency_gradient(mask: np.ndarray,
+                                        min_size: int = 3,
+                                        pixel_size: float = 1.0) -> np.ndarray:
+    """
+    最小特征尺寸约束的梯度（频域方法）
+
+    Args:
+        mask: 掩模图案（2D 数组）
+        min_size: 最小特征尺寸
+        pixel_size: 像素尺寸
+
+    Returns:
+        梯度数组
+    """
+    m = mask.astype(np.float64)
+    ny, nx = m.shape
+
+    cutoff_freq = 1.0 / (min_size * pixel_size)
+
+    fx = np.fft.fftfreq(nx, pixel_size)
+    fy = np.fft.fftfreq(ny, pixel_size)
+    fy_grid, fx_grid = np.meshgrid(fy, fx, indexing='ij')
+
+    freq_mag = np.sqrt(fx_grid**2 + fy_grid**2)
+    high_pass_mask = (freq_mag > cutoff_freq).astype(np.float64)
+
+    spectrum = np.fft.fft2(m)
+    spectrum_mag = np.abs(spectrum) + 1e-12
+
+    total_high_freq = np.sum(spectrum_mag * high_pass_mask)
+    total_energy = np.sum(spectrum_mag) + 1e-12
+
+    dtotal_df = high_pass_mask / spectrum_mag * spectrum
+    dtotal_de = spectrum / spectrum_mag
+
+    grad_spectrum = (dtotal_df * total_energy - total_high_freq * dtotal_de) / (total_energy**2)
+
+    grad_space = np.real(np.fft.ifft2(grad_spectrum))
+
+    return grad_space
+
+
+def min_feature_size_combined(mask: np.ndarray,
+                              min_size: int = 3,
+                              pixel_size: float = 1.0,
+                              alpha: float = 0.5) -> float:
+    """
+    最小特征尺寸约束（形态学+频域联合）
+
+    结合形态学和频域两种方法的优势：
+    - 形态学：准确检测空间域中的小特征
+    - 频域：平滑的梯度，易于优化
+
+    Args:
+        mask: 掩模图案（2D 数组）
+        min_size: 最小特征尺寸
+        pixel_size: 像素尺寸
+        alpha: 形态学权重，(1-alpha) 为频域权重
+
+    Returns:
+        联合惩罚值
+    """
+    penalty_morph = soft_min_feature_size_morphology(mask, min_size)
+    penalty_freq = min_feature_size_frequency(mask, min_size, pixel_size)
+    return float(alpha * penalty_morph + (1 - alpha) * penalty_freq)
+
+
+def min_feature_size_combined_gradient(mask: np.ndarray,
+                                       min_size: int = 3,
+                                       pixel_size: float = 1.0,
+                                       alpha: float = 0.5) -> np.ndarray:
+    """
+    最小特征尺寸约束的梯度（联合方法）
+
+    Args:
+        mask: 掩模图案（2D 数组）
+        min_size: 最小特征尺寸
+        pixel_size: 像素尺寸
+        alpha: 形态学权重
+
+    Returns:
+        梯度数组
+    """
+    grad_morph = soft_min_feature_size_morphology_gradient(mask, min_size)
+    grad_freq = min_feature_size_frequency_gradient(mask, min_size, pixel_size)
+    return alpha * grad_morph + (1 - alpha) * grad_freq
+
+
 @dataclass
 class CompositeLossComponents:
     """
@@ -681,6 +1362,10 @@ class CompositeLossComponents:
     pvb: float = 0.0
     mask_complexity: float = 0.0
     regularization: float = 0.0
+    binary_penalty: float = 0.0
+    tv_smooth: float = 0.0
+    epe: float = 0.0
+    min_feature: float = 0.0
     total: float = 0.0
 
     def to_dict(self) -> Dict[str, float]:
@@ -690,5 +1375,9 @@ class CompositeLossComponents:
             'pvb': self.pvb,
             'mask_complexity': self.mask_complexity,
             'regularization': self.regularization,
+            'binary_penalty': self.binary_penalty,
+            'tv_smooth': self.tv_smooth,
+            'epe': self.epe,
+            'min_feature': self.min_feature,
             'total': self.total
         }

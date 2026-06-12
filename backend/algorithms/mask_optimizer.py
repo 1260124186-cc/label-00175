@@ -21,10 +21,20 @@ from core.metrics import (
     mse, mae, ssim, evaluate_all, MetricsResult,
     ssim_loss_gradient,
     total_variation, total_variation_gradient,
+    total_variation_anisotropic, total_variation_isotropic,
+    total_variation_isotropic_gradient,
     pvb, pvb_gradient,
     l1_regularization, l1_regularization_gradient,
     l2_regularization, l2_regularization_gradient,
     tv_regularization, tv_regularization_gradient,
+    manhattan_distance_penalty, manhattan_distance_penalty_gradient,
+    binary_entropy_penalty, binary_entropy_penalty_gradient,
+    edge_placement_error, edge_placement_error_gradient,
+    soft_edge_placement_error, soft_edge_placement_error_gradient,
+    min_feature_size_morphology, min_feature_size_frequency,
+    soft_min_feature_size_morphology, soft_min_feature_size_morphology_gradient,
+    min_feature_size_frequency_gradient,
+    min_feature_size_combined, min_feature_size_combined_gradient,
     CompositeLossComponents
 )
 from algorithms.optimizer import (
@@ -61,24 +71,37 @@ class LossWeights:
     复合损失函数各分量权重配置
 
     loss = w_mse * MSE + w_ssim * (1-SSIM) + w_pvb * PVB + w_mask_complexity * mask_complexity
+           + w_binary * binary_penalty + w_tv_smooth * TV_smooth
+           + w_epe * EPE + w_min_feature * min_feature_size
 
     Attributes:
         mse: MSE（均方误差）权重
         ssim: (1-SSIM) 结构相似性损失权重
         pvb: PVB（Process Variation Band，工艺变化带宽）权重
         mask_complexity: 掩模复杂度（总变差TV）权重
+        binary_penalty: 二值化惩罚权重（曼哈顿距离/熵）
+        tv_smooth: 各向同性TV平滑权重
+        epe: 边缘放置误差（EPE）权重
+        min_feature: 最小特征尺寸约束权重
     """
     mse: float = 1.0
     ssim: float = 0.0
     pvb: float = 0.0
     mask_complexity: float = 0.0
+    binary_penalty: float = 0.0
+    tv_smooth: float = 0.0
+    epe: float = 0.0
+    min_feature: float = 0.0
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, float]]) -> 'LossWeights':
         """从字典创建，缺失键使用默认值"""
         if d is None:
             return cls()
-        defaults = {'mse': 1.0, 'ssim': 0.0, 'pvb': 0.0, 'mask_complexity': 0.0}
+        defaults = {
+            'mse': 1.0, 'ssim': 0.0, 'pvb': 0.0, 'mask_complexity': 0.0,
+            'binary_penalty': 0.0, 'tv_smooth': 0.0, 'epe': 0.0, 'min_feature': 0.0
+        }
         defaults.update(d)
         return cls(**defaults)
 
@@ -87,11 +110,16 @@ class LossWeights:
             'mse': self.mse,
             'ssim': self.ssim,
             'pvb': self.pvb,
-            'mask_complexity': self.mask_complexity
+            'mask_complexity': self.mask_complexity,
+            'binary_penalty': self.binary_penalty,
+            'tv_smooth': self.tv_smooth,
+            'epe': self.epe,
+            'min_feature': self.min_feature
         }
 
     def total_weight(self) -> float:
-        return self.mse + self.ssim + self.pvb + self.mask_complexity
+        return (self.mse + self.ssim + self.pvb + self.mask_complexity +
+                self.binary_penalty + self.tv_smooth + self.epe + self.min_feature)
 
 
 @dataclass
@@ -100,11 +128,17 @@ class RegularizationConfig:
     正则化配置
 
     Attributes:
-        type: 正则化类型: 'l1', 'l2', 'tv' (Total Variation), None
+        type: 正则化类型: 'l1', 'l2', 'tv', 'tv_isotropic',
+              'manhattan', 'binary_entropy', 'epe', 'epe_soft',
+              'min_feature_morph', 'min_feature_freq', 'min_feature_combined', None
         strength: 正则化强度系数
+        params: 额外参数字典（如 min_size, sigma 等）
     """
-    type: Optional[str] = None  # 'l1', 'l2', 'tv'
+    type: Optional[str] = None  # 'l1', 'l2', 'tv', 'tv_isotropic', 'manhattan',
+                                 # 'binary_entropy', 'epe', 'epe_soft',
+                                 # 'min_feature_morph', 'min_feature_freq', 'min_feature_combined'
     strength: float = 0.0
+    params: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'RegularizationConfig':
@@ -113,13 +147,15 @@ class RegularizationConfig:
             return cls()
         return cls(
             type=d.get('type', None),
-            strength=float(d.get('strength', 0.0))
+            strength=float(d.get('strength', 0.0)),
+            params=dict(d.get('params', {}))
         )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             'type': self.type,
-            'strength': self.strength
+            'strength': self.strength,
+            'params': self.params
         }
 
 
@@ -161,6 +197,16 @@ class OptimizationConfig:
                                 用于同时最小化均值误差和条件间差异
         threshold: 光刻胶阈值（用于wafer图像损失）
         use_wafer_image_loss: 是否使用wafer图像（阈值后）计算损失
+
+        # 掩模约束与正则化参数
+        binary_penalty_type: str = 'manhattan'  # 'manhattan' 或 'entropy'
+        epe_threshold: float = 0.5  # EPE 边缘检测阈值
+        epe_sigma: float = 1.0  # 软 EPE 的高斯平滑 sigma
+        epe_use_soft: bool = True  # 是否使用可微的软 EPE
+        min_feature_size: int = 3  # 最小特征尺寸（像素）
+        min_feature_method: str = 'combined'  # 'morphology', 'frequency', 'combined'
+        min_feature_alpha: float = 0.5  # 联合方法中形态学权重
+        pixel_size: float = 1.0  # 像素尺寸（用于EPE和最小特征尺寸的物理单位转换）
     """
     optimizer_type: str = 'gradient_descent'
     max_iter: int = 100
@@ -196,6 +242,16 @@ class OptimizationConfig:
     robustness_loss_weight: float = 0.0  # 0表示不使用鲁棒性正则化
     threshold: float = 0.3
     use_wafer_image_loss: bool = False  # False使用aerial图像计算损失，True使用wafer图像
+
+    # 掩模约束与正则化参数
+    binary_penalty_type: str = 'manhattan'  # 'manhattan' 或 'entropy'
+    epe_threshold: float = 0.5  # EPE 边缘检测阈值
+    epe_sigma: float = 1.0  # 软 EPE 的高斯平滑 sigma
+    epe_use_soft: bool = True  # 是否使用可微的软 EPE
+    min_feature_size: int = 3  # 最小特征尺寸（像素）
+    min_feature_method: str = 'combined'  # 'morphology', 'frequency', 'combined'
+    min_feature_alpha: float = 0.5  # 联合方法中形态学权重
+    pixel_size: float = 1.0  # 像素尺寸
 
 
 class LearningRateScheduler:
@@ -518,12 +574,47 @@ class MaskOptimizer:
         if reg_cfg.type is None or reg_cfg.strength <= 0:
             return 0.0
 
-        if reg_cfg.type == 'l1':
+        params = reg_cfg.params
+        reg_type = reg_cfg.type.lower()
+
+        if reg_type == 'l1':
             return reg_cfg.strength * l1_regularization(mask)
-        elif reg_cfg.type == 'l2':
+        elif reg_type == 'l2':
             return reg_cfg.strength * l2_regularization(mask)
-        elif reg_cfg.type == 'tv':
+        elif reg_type == 'tv':
             return reg_cfg.strength * tv_regularization(mask)
+        elif reg_type == 'tv_isotropic':
+            return reg_cfg.strength * total_variation_isotropic(mask)
+        elif reg_type == 'manhattan':
+            return reg_cfg.strength * manhattan_distance_penalty(mask)
+        elif reg_type == 'binary_entropy':
+            return reg_cfg.strength * binary_entropy_penalty(mask)
+        elif reg_type == 'epe':
+            epe_threshold = params.get('threshold', self.config.epe_threshold)
+            pixel_size = params.get('pixel_size', self.config.pixel_size)
+            return reg_cfg.strength * edge_placement_error(
+                mask, self._target_image, epe_threshold, pixel_size
+            )
+        elif reg_type == 'epe_soft':
+            sigma = params.get('sigma', self.config.epe_sigma)
+            pixel_size = params.get('pixel_size', self.config.pixel_size)
+            return reg_cfg.strength * soft_edge_placement_error(
+                mask, self._target_image, sigma, pixel_size
+            )
+        elif reg_type == 'min_feature_morph':
+            min_size = params.get('min_size', self.config.min_feature_size)
+            return reg_cfg.strength * soft_min_feature_size_morphology(mask, min_size)
+        elif reg_type == 'min_feature_freq':
+            min_size = params.get('min_size', self.config.min_feature_size)
+            pixel_size = params.get('pixel_size', self.config.pixel_size)
+            return reg_cfg.strength * min_feature_size_frequency(mask, min_size, pixel_size)
+        elif reg_type == 'min_feature_combined':
+            min_size = params.get('min_size', self.config.min_feature_size)
+            pixel_size = params.get('pixel_size', self.config.pixel_size)
+            alpha = params.get('alpha', self.config.min_feature_alpha)
+            return reg_cfg.strength * min_feature_size_combined(
+                mask, min_size, pixel_size, alpha
+            )
         else:
             logger.warning(f"未知的正则化类型: {reg_cfg.type}，跳过")
             return 0.0
@@ -542,12 +633,48 @@ class MaskOptimizer:
         if reg_cfg.type is None or reg_cfg.strength <= 0:
             return np.zeros_like(mask)
 
-        if reg_cfg.type == 'l1':
+        params = reg_cfg.params
+        reg_type = reg_cfg.type.lower()
+
+        if reg_type == 'l1':
             return reg_cfg.strength * l1_regularization_gradient(mask)
-        elif reg_cfg.type == 'l2':
+        elif reg_type == 'l2':
             return reg_cfg.strength * l2_regularization_gradient(mask)
-        elif reg_cfg.type == 'tv':
+        elif reg_type == 'tv':
             return reg_cfg.strength * tv_regularization_gradient(mask)
+        elif reg_type == 'tv_isotropic':
+            return reg_cfg.strength * total_variation_isotropic_gradient(mask)
+        elif reg_type == 'manhattan':
+            return reg_cfg.strength * manhattan_distance_penalty_gradient(mask)
+        elif reg_type == 'binary_entropy':
+            return reg_cfg.strength * binary_entropy_penalty_gradient(mask)
+        elif reg_type == 'epe':
+            epe_threshold = params.get('threshold', self.config.epe_threshold)
+            eps = params.get('eps', 1e-5)
+            return reg_cfg.strength * edge_placement_error_gradient(
+                mask, self._target_image, epe_threshold, eps
+            )
+        elif reg_type == 'epe_soft':
+            sigma = params.get('sigma', self.config.epe_sigma)
+            return reg_cfg.strength * soft_edge_placement_error_gradient(
+                mask, self._target_image, sigma
+            )
+        elif reg_type == 'min_feature_morph':
+            min_size = params.get('min_size', self.config.min_feature_size)
+            return reg_cfg.strength * soft_min_feature_size_morphology_gradient(mask, min_size)
+        elif reg_type == 'min_feature_freq':
+            min_size = params.get('min_size', self.config.min_feature_size)
+            pixel_size = params.get('pixel_size', self.config.pixel_size)
+            return reg_cfg.strength * min_feature_size_frequency_gradient(
+                mask, min_size, pixel_size
+            )
+        elif reg_type == 'min_feature_combined':
+            min_size = params.get('min_size', self.config.min_feature_size)
+            pixel_size = params.get('pixel_size', self.config.pixel_size)
+            alpha = params.get('alpha', self.config.min_feature_alpha)
+            return reg_cfg.strength * min_feature_size_combined_gradient(
+                mask, min_size, pixel_size, alpha
+            )
         else:
             return np.zeros_like(mask)
 
@@ -572,6 +699,106 @@ class MaskOptimizer:
             comp.ssim = lw.ssim * (1.0 - ssim(image, target))
 
         return comp
+
+    def _compute_mask_constraints(self, mask: np.ndarray) -> CompositeLossComponents:
+        """
+        计算掩模约束项（二值化惩罚、TV平滑、EPE、最小特征尺寸）
+
+        Args:
+            mask: 掩模图案
+
+        Returns:
+            CompositeLossComponents，填充 binary_penalty、tv_smooth、epe、min_feature 字段
+        """
+        comp = CompositeLossComponents()
+        lw = self.config.loss_weights
+        cfg = self.config
+
+        if lw.binary_penalty > 0:
+            if cfg.binary_penalty_type == 'entropy':
+                comp.binary_penalty = lw.binary_penalty * binary_entropy_penalty(mask)
+            else:
+                comp.binary_penalty = lw.binary_penalty * manhattan_distance_penalty(mask)
+
+        if lw.tv_smooth > 0:
+            comp.tv_smooth = lw.tv_smooth * total_variation_isotropic(mask)
+
+        if lw.epe > 0:
+            if cfg.epe_use_soft:
+                comp.epe = lw.epe * soft_edge_placement_error(
+                    mask, self._target_image, cfg.epe_sigma, cfg.pixel_size
+                )
+            else:
+                comp.epe = lw.epe * edge_placement_error(
+                    mask, self._target_image, cfg.epe_threshold, cfg.pixel_size
+                )
+
+        if lw.min_feature > 0:
+            method = cfg.min_feature_method.lower()
+            if method == 'morphology':
+                comp.min_feature = lw.min_feature * soft_min_feature_size_morphology(
+                    mask, cfg.min_feature_size
+                )
+            elif method == 'frequency':
+                comp.min_feature = lw.min_feature * min_feature_size_frequency(
+                    mask, cfg.min_feature_size, cfg.pixel_size
+                )
+            else:
+                comp.min_feature = lw.min_feature * min_feature_size_combined(
+                    mask, cfg.min_feature_size, cfg.pixel_size, cfg.min_feature_alpha
+                )
+
+        return comp
+
+    def _compute_mask_constraints_gradient(self, mask: np.ndarray) -> np.ndarray:
+        """
+        计算掩模约束项的梯度
+
+        Args:
+            mask: 掩模图案
+
+        Returns:
+            梯度数组
+        """
+        grad = np.zeros_like(mask, dtype=np.float64)
+        lw = self.config.loss_weights
+        cfg = self.config
+
+        if lw.binary_penalty > 0:
+            if cfg.binary_penalty_type == 'entropy':
+                grad += lw.binary_penalty * binary_entropy_penalty_gradient(mask)
+            else:
+                grad += lw.binary_penalty * manhattan_distance_penalty_gradient(mask)
+
+        if lw.tv_smooth > 0:
+            grad += lw.tv_smooth * total_variation_isotropic_gradient(mask)
+
+        if lw.epe > 0:
+            if cfg.epe_use_soft:
+                grad += lw.epe * soft_edge_placement_error_gradient(
+                    mask, self._target_image, cfg.epe_sigma
+                )
+            else:
+                grad += lw.epe * edge_placement_error_gradient(
+                    mask, self._target_image, cfg.epe_threshold
+                )
+
+        if lw.min_feature > 0:
+            method = cfg.min_feature_method.lower()
+            if method == 'morphology':
+                grad += lw.min_feature * soft_min_feature_size_morphology_gradient(
+                    mask, cfg.min_feature_size
+                )
+            elif method == 'frequency':
+                grad += lw.min_feature * min_feature_size_frequency_gradient(
+                    mask, cfg.min_feature_size, cfg.pixel_size
+                )
+            else:
+                grad += lw.min_feature * min_feature_size_combined_gradient(
+                    mask, cfg.min_feature_size, cfg.pixel_size, cfg.min_feature_alpha
+                )
+
+        return grad
 
     def _compute_composite_single_condition(self, mask: np.ndarray,
                                             imaging_model: PartialCoherentImaging,
@@ -683,6 +910,12 @@ class MaskOptimizer:
             if lw.mask_complexity > 0:
                 total_loss += lw.mask_complexity * total_variation(mask)
 
+            mask_constraints = self._compute_mask_constraints(mask)
+            total_loss += (mask_constraints.binary_penalty +
+                           mask_constraints.tv_smooth +
+                           mask_constraints.epe +
+                           mask_constraints.min_feature)
+
             total_loss += self._compute_regularization_loss(mask)
 
             if cfg.robustness_loss_weight > 0 and len(per_losses) > 1:
@@ -778,6 +1011,8 @@ class MaskOptimizer:
 
             if lw.mask_complexity > 0:
                 gradient += lw.mask_complexity * total_variation_gradient(mask)
+
+            gradient += self._compute_mask_constraints_gradient(mask)
 
             gradient += self._compute_regularization_gradient(mask)
 
@@ -909,6 +1144,13 @@ class MaskOptimizer:
             )
             if lw.mask_complexity > 0:
                 loss += lw.mask_complexity * total_variation(mask)
+
+            mask_constraints = self._compute_mask_constraints(mask)
+            loss += (mask_constraints.binary_penalty +
+                     mask_constraints.tv_smooth +
+                     mask_constraints.epe +
+                     mask_constraints.min_feature)
+
             loss += self._compute_regularization_loss(mask)
             return loss
 
@@ -968,6 +1210,8 @@ class MaskOptimizer:
 
             if lw.mask_complexity > 0:
                 gradient += lw.mask_complexity * total_variation_gradient(mask)
+
+            gradient += self._compute_mask_constraints_gradient(mask)
 
             gradient += self._compute_regularization_gradient(mask)
 
