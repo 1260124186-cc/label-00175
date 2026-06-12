@@ -8,6 +8,18 @@ from algorithms.advanced_optimizer import (
     BaseHeuristicOptimizer, GeneticAlgorithmOptimizer, ParticleSwarmOptimizer,
     ReinforcementLearningOptimizer, SimpleQLearningModel
 )
+from algorithms.deep_rl_models import (
+    TORCH_AVAILABLE,
+    MultiChannelStateEncoder,
+    StateEncoderConfig,
+    DQNModel,
+    DQNConfig,
+    PPOModel,
+    PPOConfig,
+    ActorCriticModel,
+    ActorCriticConfig,
+    DeepRLModelFactory,
+)
 from algorithms.mask_optimizer import MaskOptimizer, OptimizationConfig, MaskOptimizationResult
 
 __all__ = [
@@ -19,6 +31,16 @@ __all__ = [
     'ParticleSwarmOptimizer',
     'ReinforcementLearningOptimizer',
     'SimpleQLearningModel',
+    'TORCH_AVAILABLE',
+    'MultiChannelStateEncoder',
+    'StateEncoderConfig',
+    'DQNModel',
+    'DQNConfig',
+    'PPOModel',
+    'PPOConfig',
+    'ActorCriticModel',
+    'ActorCriticConfig',
+    'DeepRLModelFactory',
     'MaskOptimizer',
     'OptimizationConfig',
     'MaskOptimizationResult'

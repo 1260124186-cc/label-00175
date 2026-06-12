@@ -17,6 +17,18 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from algorithms.optimizer import OptimizationResult
+from algorithms.deep_rl_models import (
+    TORCH_AVAILABLE,
+    MultiChannelStateEncoder,
+    StateEncoderConfig,
+    DQNModel,
+    DQNConfig,
+    PPOModel,
+    PPOConfig,
+    ActorCriticModel,
+    ActorCriticConfig,
+    DeepRLModelFactory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -398,30 +410,45 @@ class ParticleSwarmOptimizer(BaseHeuristicOptimizer):
 
 class ReinforcementLearningOptimizer(BaseHeuristicOptimizer):
     """
-    强化学习优化器接口
-    
-    该类提供强化学习方法的接口框架，支持自定义RL模型接入。
-    可用于掩模优化的策略学习。
+    强化学习优化器
+
+    支持三种深度模型（DQN / PPO / Actor-Critic，PyTorch）和传统表格模型。
+    状态编码默认使用多通道表示：局部 patch + 频域特征 + 历史损失。
+    当 PyTorch 不可用时自动回退到传统简单状态编码。
     """
-    
-    def __init__(self, 
+
+    def __init__(self,
                  state_dim: Optional[int] = None,
                  action_dim: Optional[int] = None,
                  gamma: float = 0.99,
                  epsilon: float = 0.1,
                  epsilon_decay: float = 0.995,
                  min_epsilon: float = 0.01,
+                 model_type: str = 'simple',
+                 state_encoding: str = 'multichannel',
+                 encoder_config: Optional[StateEncoderConfig] = None,
+                 dqn_config: Optional[DQNConfig] = None,
+                 ppo_config: Optional[PPOConfig] = None,
+                 ac_config: Optional[ActorCriticConfig] = None,
+                 device: str = 'cpu',
                  **kwargs):
         """
         初始化强化学习优化器
-        
+
         Args:
-            state_dim: 状态空间维度
-            action_dim: 动作空间维度
+            state_dim: 状态空间维度（仅 simple 编码使用）
+            action_dim: 动作空间维度（仅 simple 编码使用）
             gamma: 折扣因子
             epsilon: 探索率
             epsilon_decay: 探索率衰减
             min_epsilon: 最小探索率
+            model_type: 模型类型 'simple' | 'dqn' | 'ppo' | 'actor_critic'
+            state_encoding: 状态编码方式 'simple' | 'multichannel'
+            encoder_config: 多通道编码器配置
+            dqn_config: DQN 配置
+            ppo_config: PPO 配置
+            ac_config: Actor-Critic 配置
+            device: PyTorch 设备
         """
         super().__init__(**kwargs)
         self.state_dim = state_dim
@@ -430,104 +457,157 @@ class ReinforcementLearningOptimizer(BaseHeuristicOptimizer):
         self.epsilon = epsilon
         self.epsilon_decay = epsilon_decay
         self.min_epsilon = min_epsilon
-        self._model = None
+        self.model_type = model_type
+        self.state_encoding = state_encoding
+        self.device = device
+
         self._replay_buffer: List[Tuple] = []
         self._buffer_size = 10000
-    
+
+        if state_encoding == 'multichannel':
+            self._state_encoder = MultiChannelStateEncoder(encoder_config)
+        else:
+            self._state_encoder = None
+
+        self._model = None
+        self._deep_model = None
+        if model_type != 'simple':
+            self._init_deep_model(model_type, dqn_config, ppo_config, ac_config)
+
+    def _init_deep_model(self, model_type: str,
+                         dqn_config: Optional[DQNConfig],
+                         ppo_config: Optional[PPOConfig],
+                         ac_config: Optional[ActorCriticConfig]):
+        if not TORCH_AVAILABLE:
+            logger.warning(
+                "PyTorch not available, falling back to simple model. "
+                "Install torch to use deep RL models."
+            )
+            self.model_type = 'simple'
+            return
+
+        if model_type == 'dqn':
+            self._deep_model = DQNModel(dqn_config or DQNConfig(), self.device)
+        elif model_type == 'ppo':
+            self._deep_model = PPOModel(ppo_config or PPOConfig(), self.device)
+        elif model_type == 'actor_critic':
+            self._deep_model = ActorCriticModel(ac_config or ActorCriticConfig(), self.device)
+        else:
+            raise ValueError(
+                f"Unknown model_type '{model_type}', "
+                f"available: {DeepRLModelFactory.available_models() + ['simple']}"
+            )
+
     def set_model(self, model):
         """
         设置强化学习模型
-        
+
         Args:
             model: 强化学习模型（需实现predict和update方法）
                    - predict(state) -> action
                    - update(batch) -> loss
         """
         self._model = model
-    
+
     def _get_state(self, mask: np.ndarray, target: np.ndarray) -> np.ndarray:
         """
         从掩模和目标图像提取状态特征
-        
+
+        当 state_encoding='multichannel' 时返回 (3, H, W) 多通道表示：
+          - 通道 1: 局部 patch 特征
+          - 通道 2: 频域特征
+          - 通道 3: 历史损失轨迹
+
+        当 state_encoding='simple' 时返回展平拼接的 (mask_flat, error) 向量。
+
         Args:
             mask: 当前掩模
             target: 目标图像
-            
+
         Returns:
-            状态向量
+            状态数组
         """
-        # 默认实现：展平并拼接
+        if self._state_encoder is not None:
+            return self._state_encoder.encode(mask, target)
+
         mask_flat = mask.flatten()
         target_flat = target.flatten()
-        
-        # 可以添加更多特征：误差图、频域特征等
         error = np.abs(mask_flat - target_flat)
-        
         return np.concatenate([mask_flat, error])
-    
+
     def _apply_action(self, mask: np.ndarray, action: np.ndarray,
                       bounds: Tuple[float, float]) -> np.ndarray:
         """
         将动作应用到掩模上
-        
+
         Args:
             mask: 当前掩模
             action: 动作（掩模调整量）
             bounds: 值边界
-            
+
         Returns:
             更新后的掩模
         """
-        new_mask = mask + action.reshape(mask.shape)
+        if self.model_type in ('dqn',):
+            delta = action
+            if isinstance(delta, np.ndarray) and delta.size <= 2:
+                h, w = mask.shape
+                full_delta = np.zeros_like(mask)
+                full_delta[:max(1, h // 8), :max(1, w // 8)] = delta.flat[0] if delta.size == 1 else delta[0, 0] if delta.ndim >= 2 else delta[0]
+                new_mask = mask + full_delta
+            else:
+                new_mask = mask + action.reshape(mask.shape)
+        else:
+            new_mask = mask + action.reshape(mask.shape)
         return np.clip(new_mask, bounds[0], bounds[1])
-    
+
     def _select_action(self, state: np.ndarray, shape: Tuple) -> np.ndarray:
         """
-        选择动作（epsilon-greedy策略）
-        
+        选择动作
+
         Args:
             state: 当前状态
             shape: 掩模形状
-            
+
         Returns:
             动作向量
         """
+        if self._deep_model is not None:
+            return self._deep_model.predict(state)
+
         if self._model is None or np.random.random() < self.epsilon:
-            # 随机探索
             return np.random.uniform(-0.1, 0.1, np.prod(shape))
         else:
-            # 利用模型
             return self._model.predict(state)
-    
+
     def _compute_reward(self, old_loss: float, new_loss: float) -> float:
         """
         计算奖励
-        
+
         Args:
             old_loss: 旧损失值
             new_loss: 新损失值
-            
+
         Returns:
             奖励值
         """
-        # 损失减少则正奖励
         improvement = old_loss - new_loss
-        return improvement * 100  # 放大奖励信号
-    
+        return improvement * 100
+
     def _store_transition(self, state: np.ndarray, action: np.ndarray,
                           reward: float, next_state: np.ndarray, done: bool):
         """存储经验到回放缓冲区"""
         if len(self._replay_buffer) >= self._buffer_size:
             self._replay_buffer.pop(0)
         self._replay_buffer.append((state, action, reward, next_state, done))
-    
+
     def _sample_batch(self, batch_size: int = 32) -> List[Tuple]:
         """从回放缓冲区采样"""
         if len(self._replay_buffer) < batch_size:
             return self._replay_buffer
         indices = np.random.choice(len(self._replay_buffer), batch_size, replace=False)
         return [self._replay_buffer[i] for i in indices]
-    
+
     def optimize(self,
                  objective: Callable[[np.ndarray], float],
                  x0: np.ndarray,
@@ -536,74 +616,101 @@ class ReinforcementLearningOptimizer(BaseHeuristicOptimizer):
                  **kwargs) -> OptimizationResult:
         """
         执行强化学习优化
-        
+
         Args:
             objective: 目标函数
             x0: 初始掩模
             bounds: 值边界
             target: 目标图像（用于状态构建）
-            
+
         Returns:
             OptimizationResult对象
         """
         shape = x0.shape
         mask = x0.copy()
-        
+
         if target is None:
             target = np.zeros_like(x0)
-        
+
+        if self._state_encoder is not None:
+            self._state_encoder.reset()
+
         self.history = []
         best_mask = mask.copy()
         best_loss = objective(mask)
         self.history.append(best_loss)
-        
+
+        if self._state_encoder is not None:
+            self._state_encoder.record_loss(best_loss)
+
         nfev = 1
-        
+
         for episode in range(self.max_iter):
             state = self._get_state(mask, target)
             action = self._select_action(state, shape)
-            
-            # 应用动作
+
             new_mask = self._apply_action(mask, action, bounds)
             new_loss = objective(new_mask)
             nfev += 1
-            
-            # 计算奖励
+
+            if self._state_encoder is not None:
+                self._state_encoder.record_loss(new_loss)
+
             reward = self._compute_reward(best_loss if best_loss < float('inf') else new_loss, new_loss)
-            
-            # 获取新状态
+
             next_state = self._get_state(new_mask, target)
             done = episode == self.max_iter - 1
-            
-            # 存储经验
-            self._store_transition(state, action, reward, next_state, done)
-            
-            # 更新模型（如果有）
+
+            if self._deep_model is not None:
+                if isinstance(self._deep_model, PPOModel):
+                    self._deep_model.store_transition(state, action, reward, done)
+                elif isinstance(self._deep_model, DQNModel):
+                    action_idx = 0
+                    if isinstance(action, np.ndarray):
+                        action_idx = int(np.argmax(np.abs(action.flatten()))) % self._deep_model.config.num_actions
+                    self._deep_model.store(state, action_idx, reward, next_state, done)
+                    self._deep_model.train_step()
+                else:
+                    self._store_transition(state, action, reward, next_state, done)
+            else:
+                self._store_transition(state, action, reward, next_state, done)
+
             if self._model is not None and len(self._replay_buffer) >= 32:
                 batch = self._sample_batch(32)
                 self._model.update(batch)
-            
-            # 更新最优解
+
+            if self._deep_model is not None and isinstance(self._deep_model, ActorCriticModel):
+                if len(self._replay_buffer) >= 16:
+                    batch = self._sample_batch(16)
+                    self._deep_model.update(batch)
+
+            if self._deep_model is not None and isinstance(self._deep_model, PPOModel):
+                if episode > 0 and (episode + 1) % 4 == 0:
+                    self._deep_model.update()
+
             if new_loss < best_loss:
                 best_loss = new_loss
                 best_mask = new_mask.copy()
-            
+
             mask = new_mask
             self.history.append(best_loss)
-            
-            # 衰减探索率
+
             self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
-            
+
             if self.verbose and episode % 10 == 0:
-                logger.info(f"Episode {episode}: loss = {best_loss:.6e}, epsilon = {self.epsilon:.4f}")
-        
+                model_info = self.model_type
+                logger.info(
+                    f"Episode {episode}: loss = {best_loss:.6e}, "
+                    f"epsilon = {self.epsilon:.4f}, model = {model_info}"
+                )
+
         return OptimizationResult(
             x=best_mask,
             fun=best_loss,
             nit=self.max_iter,
             nfev=nfev,
             success=True,
-            message="强化学习优化完成",
+            message=f"强化学习优化完成 (model={self.model_type}, encoding={self.state_encoding})",
             history=self.history
         )
 

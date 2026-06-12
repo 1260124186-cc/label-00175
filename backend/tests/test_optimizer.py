@@ -401,7 +401,8 @@ class TestReinforcementLearningOptimizer:
         optimizer = ReinforcementLearningOptimizer(
             max_iter=10,
             seed=42,
-            verbose=False
+            verbose=False,
+            state_encoding='simple',
         )
         optimizer.set_model(model)
         
