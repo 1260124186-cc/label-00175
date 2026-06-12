@@ -45,7 +45,8 @@ from algorithms.optimizer import (
     NewtonOptimizer, OptimizationResult, AdamOptimizer, RMSpropOptimizer
 )
 from algorithms.advanced_optimizer import (
-    BaseHeuristicOptimizer, GeneticAlgorithmOptimizer, ParticleSwarmOptimizer
+    BaseHeuristicOptimizer, GeneticAlgorithmOptimizer, ParticleSwarmOptimizer,
+    SimulatedAnnealingOptimizer, DifferentialEvolutionOptimizer, CMAESOptimizer
 )
 from algorithms.callbacks import (
     Callback, CallbackList, TrainerState,
@@ -505,10 +506,24 @@ class MaskOptimizer:
     def _setup_optimizer(self):
         """设置优化器"""
         opt_type = self.config.optimizer_type.lower()
-        seed = self.config.random_seed  # 从配置获取随机种子
+        seed = self.config.random_seed
 
         if opt_type == 'gradient_descent':
             self._optimizer = GradientDescentOptimizer(
+                learning_rate=self.config.learning_rate,
+                max_iter=self.config.max_iter,
+                tol=self.config.tol,
+                verbose=self.config.verbose
+            )
+        elif opt_type == 'adam':
+            self._optimizer = AdamOptimizer(
+                learning_rate=self.config.learning_rate,
+                max_iter=self.config.max_iter,
+                tol=self.config.tol,
+                verbose=self.config.verbose
+            )
+        elif opt_type == 'rmsprop':
+            self._optimizer = RMSpropOptimizer(
                 learning_rate=self.config.learning_rate,
                 max_iter=self.config.max_iter,
                 tol=self.config.tol,
@@ -543,6 +558,27 @@ class MaskOptimizer:
                 verbose=self.config.verbose,
                 seed=seed,
                 n_jobs=self.config.n_jobs
+            )
+        elif opt_type in ('sa', 'simulated_annealing'):
+            self._optimizer = SimulatedAnnealingOptimizer(
+                max_iter=self.config.max_iter,
+                verbose=self.config.verbose,
+                seed=seed
+            )
+        elif opt_type in ('de', 'differential_evolution'):
+            self._optimizer = DifferentialEvolutionOptimizer(
+                population_size=self.config.population_size,
+                max_iter=self.config.max_iter,
+                verbose=self.config.verbose,
+                seed=seed,
+                n_jobs=self.config.n_jobs
+            )
+        elif opt_type in ('cma_es', 'cmaes'):
+            self._optimizer = CMAESOptimizer(
+                population_size=self.config.population_size,
+                max_iter=self.config.max_iter,
+                verbose=self.config.verbose,
+                seed=seed
             )
         else:
             raise ValueError(f"未知的优化器类型: {opt_type}")
