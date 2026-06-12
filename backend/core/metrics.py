@@ -181,6 +181,149 @@ def ssim(image1: np.ndarray,
 
 
 @jit(nopython=True, cache=True)
+def _ssim_gradient_core(img1: np.ndarray,
+                        img2: np.ndarray,
+                        mean1: np.ndarray,
+                        var1: np.ndarray,
+                        mean2: np.ndarray,
+                        var2: np.ndarray,
+                        cov12: np.ndarray,
+                        window_size: int,
+                        c1: float,
+                        c2: float) -> np.ndarray:
+    """
+    SSIM 解析梯度核心计算（Numba JIT 编译）
+
+    Args:
+        img1: 图像1 (float64)
+        img2: 图像2 (float64)
+        mean1: 图像1局部均值
+        var1: 图像1局部方差
+        mean2: 图像2局部均值
+        var2: 图像2局部方差
+        cov12: 局部协方差
+        window_size: 窗口大小
+        c1: 稳定常数1
+        c2: 稳定常数2
+
+    Returns:
+        梯度数组
+    """
+    ny, nx = img1.shape
+    n_total = ny * nx
+    half_win = window_size // 2
+
+    A = 2.0 * mean1 * mean2 + c1
+    B = 2.0 * cov12 + c2
+    C = mean1 ** 2 + mean2 ** 2 + c1
+    D = var1 + var2 + c2
+
+    CD = C * D
+    denom = CD ** 2 + 1e-10
+
+    dmu_x = (2.0 * mean2 * B * CD - 2.0 * mean1 * A * B * D) / denom
+    dvar_x = (-A * B * C) / denom
+    dcov_xy = (2.0 * A * CD) / denom
+
+    grad = np.zeros((ny, nx), dtype=np.float64)
+
+    for i in range(ny):
+        for j in range(nx):
+            y_start = max(0, i - half_win)
+            y_end = min(ny, i + half_win + 1)
+            x_start = max(0, j - half_win)
+            x_end = min(nx, j + half_win + 1)
+            n_win = (y_end - y_start) * (x_end - x_start)
+
+            alpha = dmu_x[i, j] / n_win
+            beta = 2.0 * dvar_x[i, j] / n_win
+            gamma = dcov_xy[i, j] / n_win
+
+            for p in range(y_start, y_end):
+                for q in range(x_start, x_end):
+                    val = (alpha
+                           + beta * (img1[p, q] - mean1[i, j])
+                           + gamma * (img2[p, q] - mean2[i, j]))
+                    grad[p, q] += val
+
+    grad /= n_total
+    return grad
+
+
+def ssim_gradient(image1: np.ndarray,
+                  image2: np.ndarray,
+                  window_size: int = 11,
+                  k1: float = 0.01,
+                  k2: float = 0.03,
+                  data_range: float = 1.0) -> np.ndarray:
+    """
+    计算 SSIM 对 image1 像素的解析梯度。
+
+    SSIM 定义:
+        SSIM(x,y) = mean_{i,j} ssim_map[i,j]
+        ssim_map[i,j] = (A*B) / (C*D)
+            A = 2*mu_x*mu_y + C1
+            B = 2*sigma_xy + C2
+            C = mu_x^2 + mu_y^2 + C1
+            D = sigma_x^2 + sigma_y^2 + C2
+
+    梯度通过"窗口反传"计算：每个像素 (p,q) 的梯度等于所有
+    以 (i,j) 为中心、且 (p,q) 在窗口内的 ssim_map[i,j] 对 x[p,q]
+    的偏导之和，再除以总像素数 (因为 SSIM 是均值)。
+
+    核心循环使用 Numba JIT 编译，相比 O(N²) 数值差分提升数个数量级。
+
+    Args:
+        image1: 第一幅图像（变量，求梯度的对象）
+        image2: 第二幅图像（目标图像，视为常数）
+        window_size: 滑动窗口大小
+        k1: 稳定常数1
+        k2: 稳定常数2
+        data_range: 数据范围
+
+    Returns:
+        梯度数组，形状与 image1 相同
+    """
+    img1 = image1.astype(np.float64)
+    img2 = image2.astype(np.float64)
+
+    c1 = (k1 * data_range) ** 2
+    c2 = (k2 * data_range) ** 2
+
+    mean1, var1 = _compute_local_stats(img1, window_size)
+    mean2, var2 = _compute_local_stats(img2, window_size)
+    cov12 = _compute_local_covariance(img1, img2, mean1, mean2, window_size)
+
+    return _ssim_gradient_core(img1, img2, mean1, var1, mean2, var2, cov12,
+                               window_size, c1, c2)
+
+
+def ssim_loss_gradient(image1: np.ndarray,
+                       image2: np.ndarray,
+                       window_size: int = 11,
+                       k1: float = 0.01,
+                       k2: float = 0.03,
+                       data_range: float = 1.0) -> np.ndarray:
+    """
+    计算 (1 - SSIM) 损失对 image1 像素的解析梯度。
+
+    因为 d(1-SSIM)/dx = -d(SSIM)/dx，本函数返回 ssim_gradient 的负值。
+
+    Args:
+        image1: 第一幅图像（变量）
+        image2: 第二幅图像（目标）
+        window_size: 滑动窗口大小
+        k1: 稳定常数1
+        k2: 稳定常数2
+        data_range: 数据范围
+
+    Returns:
+        (1-SSIM) 的梯度数组
+    """
+    return -ssim_gradient(image1, image2, window_size, k1, k2, data_range)
+
+
+@jit(nopython=True, cache=True)
 def normalized_correlation(image1: np.ndarray, image2: np.ndarray) -> float:
     """
     计算归一化相关系数 (Normalized Cross-Correlation)

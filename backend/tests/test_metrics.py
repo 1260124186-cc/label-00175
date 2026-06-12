@@ -5,10 +5,12 @@
 
 import pytest
 import numpy as np
+import time
 from core.metrics import (
     mse, mae, ssim, normalized_correlation, psnr,
     evaluate_all, batch_evaluate, compute_error_map,
-    MetricsResult
+    MetricsResult,
+    ssim_gradient, ssim_loss_gradient
 )
 
 
@@ -251,3 +253,119 @@ class TestErrorMap:
         
         with pytest.raises(ValueError):
             compute_error_map(img1, img2, 'invalid')
+
+
+def _numerical_ssim_gradient(image1: np.ndarray,
+                             image2: np.ndarray,
+                             eps: float = 1e-5,
+                             window_size: int = 11,
+                             k1: float = 0.01,
+                             k2: float = 0.03,
+                             data_range: float = 1.0) -> np.ndarray:
+    """数值差分计算 SSIM 梯度（用于验证解析梯度）"""
+    ny, nx = image1.shape
+    grad = np.zeros((ny, nx), dtype=np.float64)
+    for i in range(ny):
+        for j in range(nx):
+            img_plus = image1.copy()
+            img_plus[i, j] += eps
+            img_minus = image1.copy()
+            img_minus[i, j] -= eps
+            ssim_plus = ssim(img_plus, image2, window_size, k1, k2, data_range)
+            ssim_minus = ssim(img_minus, image2, window_size, k1, k2, data_range)
+            grad[i, j] = (ssim_plus - ssim_minus) / (2 * eps)
+    return grad
+
+
+class TestSSIMGradient:
+    """SSIM 解析梯度测试"""
+
+    def test_gradient_shape(self):
+        """测试梯度输出形状与输入一致"""
+        np.random.seed(42)
+        img1 = np.random.random((16, 16))
+        img2 = np.random.random((16, 16))
+        grad = ssim_gradient(img1, img2)
+        assert grad.shape == img1.shape
+
+    def test_gradient_sign_vs_ssim_loss(self):
+        """测试 ssim_loss_gradient = -ssim_gradient"""
+        np.random.seed(42)
+        img1 = np.random.random((16, 16))
+        img2 = np.random.random((16, 16))
+        grad_ssim = ssim_gradient(img1, img2)
+        grad_loss = ssim_loss_gradient(img1, img2)
+        np.testing.assert_array_almost_equal(grad_loss, -grad_ssim)
+
+    def test_analytical_vs_numerical_small(self):
+        """小图像上解析梯度与数值梯度对比（8x8）"""
+        np.random.seed(42)
+        img1 = np.random.random((8, 8))
+        img2 = np.random.random((8, 8))
+        grad_analytical = ssim_gradient(img1, img2, window_size=3)
+        grad_numerical = _numerical_ssim_gradient(img1, img2, window_size=3, eps=1e-5)
+        rel_error = np.max(np.abs(grad_analytical - grad_numerical)) / (
+            np.max(np.abs(grad_numerical)) + 1e-12
+        )
+        assert rel_error < 1e-3, f"相对误差 {rel_error:.2e} 超过阈值 1e-3"
+
+    def test_analytical_vs_numerical_medium(self):
+        """中等图像上解析梯度与数值梯度对比（12x12）"""
+        np.random.seed(123)
+        img1 = np.random.random((12, 12))
+        img2 = np.random.random((12, 12))
+        grad_analytical = ssim_gradient(img1, img2, window_size=5)
+        grad_numerical = _numerical_ssim_gradient(img1, img2, window_size=5, eps=1e-5)
+        rel_error = np.max(np.abs(grad_analytical - grad_numerical)) / (
+            np.max(np.abs(grad_numerical)) + 1e-12
+        )
+        assert rel_error < 1e-3, f"相对误差 {rel_error:.2e} 超过阈值 1e-3"
+
+    def test_identical_images_gradient_finite(self):
+        """相同图像的梯度应为有限值（不全为 0，因均值等仍可能变化）"""
+        np.random.seed(7)
+        img = np.random.random((16, 16))
+        grad = ssim_gradient(img, img)
+        assert np.all(np.isfinite(grad))
+
+    def test_constant_image_gradient(self):
+        """常数图像：梯度数值应很小（SSIM≈1，对小扰动不敏感）"""
+        img1 = 0.5 * np.ones((10, 10), dtype=np.float64)
+        img2 = 0.5 * np.ones((10, 10), dtype=np.float64)
+        grad = ssim_gradient(img1, img2, window_size=3)
+        assert np.max(np.abs(grad)) < 1e-6
+
+    def test_performance_speedup(self):
+        """验证解析梯度远快于数值梯度（64x64 尺寸下）"""
+        np.random.seed(99)
+        size = 64
+        img1 = np.random.random((size, size))
+        img2 = np.random.random((size, size))
+
+        t0 = time.time()
+        _ = ssim_gradient(img1, img2)
+        _ = ssim_gradient(img1, img2)
+        t_analytical = time.time() - t0
+
+        n_pixels_numerical = 100
+        idx = np.random.choice(size * size, n_pixels_numerical, replace=False)
+        eps = 1e-5
+        t0 = time.time()
+        grad_num_partial = np.zeros(size * size, dtype=np.float64)
+        for k in idx:
+            i, j = divmod(k, size)
+            img_p = img1.copy()
+            img_p[i, j] += eps
+            img_m = img1.copy()
+            img_m[i, j] -= eps
+            ssim_p = ssim(img_p, img2)
+            ssim_m = ssim(img_m, img2)
+            grad_num_partial[k] = (ssim_p - ssim_m) / (2 * eps)
+        t_numerical_partial = time.time() - t0
+
+        estimated_numerical_total = t_numerical_partial * (size * size) / n_pixels_numerical
+        speedup = estimated_numerical_total / max(t_analytical, 1e-9)
+        assert speedup >= 10.0, (
+            f"解析梯度加速比 {speedup:.1f}x 低于预期 10x; "
+            f"解析耗时 {t_analytical:.3f}s, 估计数值耗时 {estimated_numerical_total:.3f}s"
+        )

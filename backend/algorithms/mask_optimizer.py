@@ -19,6 +19,7 @@ from core.imaging import (
 )
 from core.metrics import (
     mse, mae, ssim, evaluate_all, MetricsResult,
+    ssim_loss_gradient,
     total_variation, total_variation_gradient,
     pvb, pvb_gradient,
     l1_regularization, l1_regularization_gradient,
@@ -724,7 +725,7 @@ class MaskOptimizer:
                  + dR(mask)/dmask
                  + λ_robust * dVar(L_i)/dmask
 
-        对于包含 SSIM 或 PVB 的情况，退化为数值梯度。
+        对于包含 PVB 的情况，退化为数值梯度。
 
         Args:
             mask: 掩模图案
@@ -736,7 +737,7 @@ class MaskOptimizer:
 
         if cfg.use_composite_loss:
             lw = cfg.loss_weights
-            if lw.ssim > 0 or lw.pvb > 0:
+            if lw.pvb > 0:
                 return self._numerical_gradient(mask)
 
             gradient = np.zeros_like(mask)
@@ -756,6 +757,9 @@ class MaskOptimizer:
 
                 if lw.mse > 0:
                     error_grad += lw.mse * (2.0 * (image - self._target_image) / mask.size)
+
+                if lw.ssim > 0:
+                    error_grad += lw.ssim * ssim_loss_gradient(image, self._target_image)
 
                 imaging_grad = model.compute_image_gradient(mask)
 
@@ -795,6 +799,8 @@ class MaskOptimizer:
                     error_grad = np.zeros_like(image)
                     if lw.mse > 0:
                         error_grad += lw.mse * (2.0 * (image - self._target_image) / mask.size)
+                    if lw.ssim > 0:
+                        error_grad += lw.ssim * ssim_loss_gradient(image, self._target_image)
                     imaging_grad = model.compute_image_gradient(mask)
                     if cond.dose != 1.0:
                         error_grad = error_grad * cond.dose
@@ -803,9 +809,6 @@ class MaskOptimizer:
             return gradient
 
         metric = self.config.metric.lower()
-        if metric == 'ssim':
-            return self._numerical_gradient(mask)
-
         gradient = np.zeros_like(mask)
         per_losses = []
 
@@ -830,6 +833,8 @@ class MaskOptimizer:
                 error_grad = 2 * (image - self._target_image) / mask.size
             elif metric == 'mae':
                 error_grad = np.sign(image - self._target_image) / mask.size
+            elif metric == 'ssim':
+                error_grad = ssim_loss_gradient(image, self._target_image)
             else:
                 return self._numerical_gradient(mask)
 
@@ -869,6 +874,8 @@ class MaskOptimizer:
                     error_grad = 2 * (aerial_dosed - self._target_image) / mask.size
                 elif metric == 'mae':
                     error_grad = np.sign(aerial_dosed - self._target_image) / mask.size
+                elif metric == 'ssim':
+                    error_grad = ssim_loss_gradient(aerial_dosed, self._target_image)
                 imaging_grad = model.compute_image_gradient(mask)
                 if cond.dose != 1.0:
                     error_grad = error_grad * cond.dose
@@ -927,8 +934,6 @@ class MaskOptimizer:
         当启用多工艺条件联合优化时，自动调度到
         _compute_multi_process_gradient。
 
-        当 use_composite_loss=True 且包含 SSIM 时，退化为数值梯度。
-
         Args:
             mask: 掩模图案
 
@@ -942,8 +947,6 @@ class MaskOptimizer:
 
         if cfg.use_composite_loss:
             lw = cfg.loss_weights
-            if lw.ssim > 0:
-                return self._numerical_gradient(mask)
 
             aerial = self._imaging_model.compute_aerial_image(mask)
             image = self._prepare_image(aerial, dose=1.0)
@@ -953,6 +956,9 @@ class MaskOptimizer:
 
             if lw.mse > 0:
                 error_grad += lw.mse * (2.0 * (image - self._target_image) / mask.size)
+
+            if lw.ssim > 0:
+                error_grad += lw.ssim * ssim_loss_gradient(image, self._target_image)
 
             if cfg.use_wafer_image_loss:
                 threshold_grad = (aerial >= cfg.threshold).astype(np.float64)
@@ -978,6 +984,8 @@ class MaskOptimizer:
             error_grad = 2 * (wafer_image_for_grad - self._target_image) / mask.size
         elif self.config.metric.lower() == 'mae':
             error_grad = np.sign(wafer_image_for_grad - self._target_image) / mask.size
+        elif self.config.metric.lower() == 'ssim':
+            error_grad = ssim_loss_gradient(wafer_image_for_grad, self._target_image)
         else:
             return self._numerical_gradient(mask)
 
