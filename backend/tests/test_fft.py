@@ -8,7 +8,10 @@ import numpy as np
 from core.fft import (
     fft1d, ifft1d, fft2d, ifft2d,
     frequency_filter, phase_modulation,
-    compute_power_spectrum, get_frequency_coordinates
+    compute_power_spectrum, get_frequency_coordinates,
+    WindowType, hann_window_2d, hamming_window_2d, tukey_window_2d,
+    create_window, apply_zero_padding, remove_padding,
+    apply_window_and_padding, crop_to_original
 )
 
 
@@ -243,3 +246,184 @@ class TestNumbaAcceleration:
         normalized = _normalize_spectrum(spectrum, 100.0)
         
         np.testing.assert_array_almost_equal(normalized, np.ones((32, 32), dtype=np.complex128))
+
+
+class TestWindowType:
+    def test_window_type_values(self):
+        assert WindowType.HANN.value == "hann"
+        assert WindowType.HAMMING.value == "hamming"
+        assert WindowType.TUKEY.value == "tukey"
+
+    def test_window_type_from_string(self):
+        assert WindowType("hann") == WindowType.HANN
+        assert WindowType("hamming") == WindowType.HAMMING
+        assert WindowType("tukey") == WindowType.TUKEY
+
+
+class TestHannWindow2D:
+    def test_shape(self):
+        w = hann_window_2d((64, 128))
+        assert w.shape == (64, 128)
+
+    def test_range(self):
+        w = hann_window_2d((64, 64))
+        assert np.all(w >= 0.0)
+        assert np.all(w <= 1.0)
+
+    def test_center_maximum(self):
+        w = hann_window_2d((64, 64))
+        assert w[32, 32] > w[0, 0]
+        assert w[32, 32] > w[63, 63]
+
+    def test_boundary_near_zero(self):
+        w = hann_window_2d((64, 64))
+        assert abs(w[0, 0]) < 1e-10
+        assert abs(w[0, 63]) < 1e-10
+        assert abs(w[63, 0]) < 1e-10
+        assert abs(w[63, 63]) < 1e-10
+
+    def test_symmetry(self):
+        w = hann_window_2d((64, 64))
+        ny, nx = w.shape
+        np.testing.assert_array_almost_equal(w, w[::-1, ::-1])
+
+
+class TestHammingWindow2D:
+    def test_shape(self):
+        w = hamming_window_2d((32, 64))
+        assert w.shape == (32, 64)
+
+    def test_range(self):
+        w = hamming_window_2d((64, 64))
+        assert np.all(w >= 0.0)
+        assert np.all(w <= 1.0)
+
+    def test_center_maximum(self):
+        w = hamming_window_2d((64, 64))
+        assert w[32, 32] > w[0, 0]
+
+    def test_boundary_nonzero(self):
+        w = hamming_window_2d((64, 64))
+        assert w[0, 0] > 0.0
+        assert w[63, 63] > 0.0
+
+
+class TestTukeyWindow2D:
+    def test_shape(self):
+        w = tukey_window_2d((64, 64), alpha=0.5)
+        assert w.shape == (64, 64)
+
+    def test_range(self):
+        w = tukey_window_2d((64, 64), alpha=0.5)
+        assert np.all(w >= 0.0)
+        assert np.all(w <= 1.0)
+
+    def test_alpha_zero_rectangular(self):
+        w = tukey_window_2d((64, 64), alpha=0.0)
+        np.testing.assert_array_almost_equal(w, np.ones((64, 64)))
+
+    def test_alpha_one_hann_like(self):
+        w = tukey_window_2d((64, 64), alpha=1.0)
+        hann = hann_window_2d((64, 64))
+        np.testing.assert_array_almost_equal(w, hann, decimal=12)
+
+    def test_center_is_one(self):
+        w = tukey_window_2d((64, 64), alpha=0.5)
+        assert abs(w[32, 32] - 1.0) < 1e-10
+
+
+class TestCreateWindow:
+    def test_hann(self):
+        w = create_window((32, 32), WindowType.HANN)
+        expected = hann_window_2d((32, 32))
+        np.testing.assert_array_almost_equal(w, expected)
+
+    def test_hamming(self):
+        w = create_window((32, 32), WindowType.HAMMING)
+        expected = hamming_window_2d((32, 32))
+        np.testing.assert_array_almost_equal(w, expected)
+
+    def test_tukey(self):
+        w = create_window((32, 32), WindowType.TUKEY, tukey_alpha=0.3)
+        expected = tukey_window_2d((32, 32), alpha=0.3)
+        np.testing.assert_array_almost_equal(w, expected)
+
+    def test_string_type(self):
+        w = create_window((32, 32), "hann")
+        expected = hann_window_2d((32, 32))
+        np.testing.assert_array_almost_equal(w, expected)
+
+    def test_invalid_type_raises(self):
+        with pytest.raises(ValueError):
+            create_window((32, 32), "invalid")
+
+
+class TestZeroPadding:
+    def test_uniform_padding(self):
+        image = np.ones((32, 32))
+        padded, pw = apply_zero_padding(image, pad_width=8)
+        assert padded.shape == (48, 48)
+        assert pw == ((8, 8), (8, 8))
+        np.testing.assert_array_equal(padded[8:40, 8:40], image)
+        assert padded[0, 0] == 0.0
+
+    def test_asymmetric_padding(self):
+        image = np.ones((32, 32))
+        padded, pw = apply_zero_padding(image, pad_width=(4, 8))
+        assert padded.shape == (40, 48)
+        assert pw == ((4, 4), (8, 8))
+
+    def test_no_padding(self):
+        image = np.ones((32, 32))
+        padded, pw = apply_zero_padding(image, pad_width=0)
+        assert padded.shape == (32, 32)
+
+    def test_remove_padding(self):
+        image = np.random.random((32, 32))
+        padded, pw = apply_zero_padding(image, pad_width=16)
+        recovered = remove_padding(padded, pw)
+        np.testing.assert_array_equal(recovered, image)
+
+    def test_remove_asymmetric_padding(self):
+        image = np.random.random((32, 32))
+        padded, pw = apply_zero_padding(image, pad_width=(4, 8))
+        recovered = remove_padding(padded, pw)
+        np.testing.assert_array_equal(recovered, image)
+
+
+class TestApplyWindowAndPadding:
+    def test_no_window_no_padding(self):
+        image = np.ones((32, 32))
+        result, info = apply_window_and_padding(image)
+        np.testing.assert_array_equal(result, image)
+        assert info['pad_width'] == ((0, 0), (0, 0))
+
+    def test_window_only(self):
+        image = np.ones((32, 32))
+        result, info = apply_window_and_padding(image, window_type=WindowType.HANN)
+        expected = hann_window_2d((32, 32))
+        np.testing.assert_array_almost_equal(result, expected)
+        assert info['pad_width'] == ((0, 0), (0, 0))
+
+    def test_padding_only(self):
+        image = np.ones((32, 32))
+        result, info = apply_window_and_padding(image, pad_width=16)
+        assert result.shape == (64, 64)
+        assert info['pad_width'] == ((16, 16), (16, 16))
+
+    def test_window_and_padding(self):
+        image = np.ones((32, 32))
+        result, info = apply_window_and_padding(
+            image, window_type=WindowType.HANN, pad_width=16
+        )
+        assert result.shape == (64, 64)
+        assert result[0, 0] == 0.0
+        assert info['original_shape'] == (32, 32)
+
+    def test_crop_to_original(self):
+        image = np.random.random((32, 32))
+        result, info = apply_window_and_padding(
+            image, window_type=WindowType.HANN, pad_width=16
+        )
+        cropped = crop_to_original(result, info)
+        assert cropped.shape == (32, 32)

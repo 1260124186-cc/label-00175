@@ -15,6 +15,12 @@ from typing import Tuple, Optional, Dict, Any, List, Union
 from dataclasses import dataclass, field
 from enum import Enum
 from itertools import product
+from core.fft import (
+    WindowType,
+    create_window,
+    apply_zero_padding,
+    remove_padding,
+)
 
 
 class AberrationType(Enum):
@@ -1247,25 +1253,81 @@ class PartialCoherentImaging:
 
     实现Hopkins部分相干成像理论，用于计算掩模图案在晶圆上的成像结果。
     支持完整TCC矩阵计算和SOCS低秩分解近似。
+
+    支持在成像前对掩模做零填充（zero-padding）与加窗（windowing），
+    缓解 FFT 边界效应引起的频谱伪影。
+
+    Attributes:
+        optics: 光学系统参数
+        image_size: 原始掩模尺寸 (height, width)
+        window_type: 窗函数类型，None 表示不加窗
+        pad_width: 零填充宽度（像素），None 表示不填充；
+                   整数表示各方向均匀填充，元组 (py, px) 表示各方向不同
+        tukey_alpha: Tukey 窗的渐变比例因子 (0~1)，仅 window_type=Tukey 时生效
     """
 
-    def __init__(self, optical_system: OpticalSystem, image_size: Tuple[int, int]):
+    def __init__(self, optical_system: OpticalSystem,
+                 image_size: Tuple[int, int],
+                 window_type: Optional[Union[WindowType, str]] = None,
+                 pad_width: Optional[Union[int, Tuple[int, int]]] = None,
+                 tukey_alpha: float = 0.5):
         """
         初始化部分相干成像模型
 
         Args:
             optical_system: 光学系统参数
             image_size: 图像尺寸 (height, width)
+            window_type: 窗函数类型 ('hann', 'hamming', 'tukey')，None 不加窗
+            pad_width: 零填充宽度，None 不填充
+            tukey_alpha: Tukey 窗渐变比例因子
         """
         self.optics = optical_system
         self.image_size = image_size
+        self.window_type = self._normalize_window_type(window_type)
+        self.pad_width = pad_width
+        self.tukey_alpha = tukey_alpha
+
+        self._effective_size = self._compute_effective_size()
+        self._window_2d = self._create_window_for_original()
+
         self._setup_frequency_grid()
         self._compute_source_and_pupil()
         self._compute_transfer_functions()
 
+    @staticmethod
+    def _normalize_window_type(window_type: Optional[Union[WindowType, str]]) -> Optional[WindowType]:
+        if window_type is None:
+            return None
+        if isinstance(window_type, str):
+            return WindowType(window_type)
+        return window_type
+
+    def _compute_effective_size(self) -> Tuple[int, int]:
+        ny, nx = self.image_size
+        if self.pad_width is not None:
+            if isinstance(self.pad_width, int):
+                py, px = self.pad_width, self.pad_width
+            else:
+                py, px = self.pad_width
+            return (ny + 2 * py, nx + 2 * px)
+        return (ny, nx)
+
+    def _create_window_for_original(self) -> Optional[np.ndarray]:
+        if self.window_type is None:
+            return None
+        return create_window(self.image_size, self.window_type, self.tukey_alpha)
+
+    def _preprocess_mask(self, mask: np.ndarray) -> np.ndarray:
+        processed = mask.astype(np.float64)
+        if self._window_2d is not None:
+            processed = processed * self._window_2d
+        if self.pad_width is not None:
+            processed, _ = apply_zero_padding(processed, self.pad_width)
+        return processed
+
     def _setup_frequency_grid(self):
         """设置频率网格"""
-        ny, nx = self.image_size
+        ny, nx = self._effective_size
 
         self.dfx = 1.0 / (nx * self.optics.pixel_size)
         self.dfy = 1.0 / (ny * self.optics.pixel_size)
@@ -1325,17 +1387,21 @@ class PartialCoherentImaging:
         使用Hopkins公式: I = ∫ S(fs) * |FFT^{-1}[M(f) * P(f - fs)]|^2 dfs
         或通过SOCS分解加速计算
 
+        如果初始化时指定了窗函数和/或零填充，会在FFT前对掩模
+        做加窗和零填充处理，计算完成后裁剪回原始尺寸。
+
         Args:
             mask: 掩模图案 (2D numpy数组, 0-1值)
 
         Returns:
-            空间像光强分布
+            空间像光强分布（原始掩模尺寸）
         """
-        mask_c = mask.astype(np.complex128)
-        ny, nx = mask.shape
+        processed_mask = self._preprocess_mask(mask)
+        mask_c = processed_mask.astype(np.complex128)
+        ny_eff, nx_eff = processed_mask.shape
 
         if self.optics.use_socs and self.socs_eigenvalues is not None:
-            intensity = np.zeros((ny, nx), dtype=np.float64)
+            intensity = np.zeros((ny_eff, nx_eff), dtype=np.float64)
             mask_spectrum = np.fft.fft2(mask_c)
 
             for i, (lam, phi) in enumerate(zip(self.socs_eigenvalues, self.socs_eigenfunctions)):
@@ -1345,7 +1411,7 @@ class PartialCoherentImaging:
                 field_i = np.fft.ifft2(filtered)
                 intensity += lam * np.abs(field_i)**2
         else:
-            intensity = np.zeros((ny, nx), dtype=np.float64)
+            intensity = np.zeros((ny_eff, nx_eff), dtype=np.float64)
             mask_spectrum = np.fft.fft2(mask_c)
             cutoff = self.optics.cutoff_frequency
 
@@ -1369,6 +1435,13 @@ class PartialCoherentImaging:
                 field_i = np.fft.ifft2(filtered)
                 intensity += src_val * np.abs(field_i)**2
 
+        if self.pad_width is not None:
+            if isinstance(self.pad_width, int):
+                py, px = self.pad_width, self.pad_width
+            else:
+                py, px = self.pad_width
+            intensity = intensity[py:py + self.image_size[0], px:px + self.image_size[1]]
+
         if intensity.max() > 0:
             intensity = intensity / intensity.max()
 
@@ -1378,15 +1451,18 @@ class PartialCoherentImaging:
         """
         计算空间像对掩模的梯度（用于优化）
 
+        如果启用了窗函数，梯度会自动乘以窗函数以保持链式法则一致性。
+
         Args:
             mask: 掩模图案
 
         Returns:
-            梯度数组
+            梯度数组（原始掩模尺寸）
         """
-        mask_c = mask.astype(np.complex128)
-        ny, nx = mask.shape
-        gradient = np.zeros((ny, nx), dtype=np.float64)
+        processed_mask = self._preprocess_mask(mask)
+        mask_c = processed_mask.astype(np.complex128)
+        ny_eff, nx_eff = processed_mask.shape
+        gradient = np.zeros((ny_eff, nx_eff), dtype=np.float64)
         mask_spectrum = np.fft.fft2(mask_c)
         cutoff = self.optics.cutoff_frequency
 
@@ -1419,6 +1495,16 @@ class PartialCoherentImaging:
                 field_i = np.fft.ifft2(filtered)
                 grad_field_i = np.fft.ifft2(pupil_shifted)
                 gradient += 2 * src_val * np.real(np.conj(field_i) * grad_field_i)
+
+        if self.pad_width is not None:
+            if isinstance(self.pad_width, int):
+                py, px = self.pad_width, self.pad_width
+            else:
+                py, px = self.pad_width
+            gradient = gradient[py:py + self.image_size[0], px:px + self.image_size[1]]
+
+        if self._window_2d is not None:
+            gradient = gradient * self._window_2d
 
         return gradient.astype(np.float64)
 
@@ -1793,11 +1879,14 @@ def simulate_wafer_image(mask: np.ndarray,
                          threshold: float = 0.3,
                          apply_resist: bool = True,
                          dose: float = 1.0,
-                         resist_model: Optional[ResistModel] = None) -> np.ndarray:
+                         resist_model: Optional[ResistModel] = None,
+                         window_type: Optional[Union[WindowType, str]] = None,
+                         pad_width: Optional[Union[int, Tuple[int, int]]] = None,
+                         tukey_alpha: float = 0.5) -> np.ndarray:
     """
     模拟晶圆成像
 
-    完整的成像流程：掩模 -> 光学成像 -> 剂量缩放 -> 光刻胶响应
+    完整的成像流程：掩模 -> 加窗/零填充 -> 光学成像 -> 剂量缩放 -> 光刻胶响应
 
     Args:
         mask: 掩模图案 (2D numpy数组)
@@ -1806,6 +1895,9 @@ def simulate_wafer_image(mask: np.ndarray,
         apply_resist: 是否应用光刻胶响应
         dose: 曝光相对剂量，1.0为标称剂量，大于1为过曝，小于1为欠曝
         resist_model: 高级光刻胶模型配置，优先于 threshold/apply_resist 参数
+        window_type: 窗函数类型 ('hann', 'hamming', 'tukey')，None 不加窗
+        pad_width: 零填充宽度（像素），None 不填充；整数表示各方向均匀填充
+        tukey_alpha: Tukey 窗渐变比例因子 (0~1)
 
     Returns:
         晶圆成像结果
@@ -1813,7 +1905,12 @@ def simulate_wafer_image(mask: np.ndarray,
     if optical_system is None:
         optical_system = OpticalSystem()
 
-    imaging_model = PartialCoherentImaging(optical_system, mask.shape)
+    imaging_model = PartialCoherentImaging(
+        optical_system, mask.shape,
+        window_type=window_type,
+        pad_width=pad_width,
+        tukey_alpha=tukey_alpha
+    )
 
     aerial_image = imaging_model.compute_aerial_image(mask)
 
@@ -1836,7 +1933,10 @@ def simulate_multi_process(
     base_optics: Optional[OpticalSystem] = None,
     threshold: float = 0.3,
     apply_resist: bool = True,
-    resist_model: Optional[ResistModel] = None
+    resist_model: Optional[ResistModel] = None,
+    window_type: Optional[Union[WindowType, str]] = None,
+    pad_width: Optional[Union[int, Tuple[int, int]]] = None,
+    tukey_alpha: float = 0.5
 ) -> MultiProcessSimulationResult:
     """
     多工艺条件联合仿真
@@ -1851,6 +1951,9 @@ def simulate_multi_process(
         threshold: 光刻胶阈值（当 resist_model 为 None 时生效）
         apply_resist: 是否应用光刻胶响应
         resist_model: 高级光刻胶模型配置，优先于 threshold/apply_resist 参数
+        window_type: 窗函数类型 ('hann', 'hamming', 'tukey')，None 不加窗
+        pad_width: 零填充宽度（像素），None 不填充
+        tukey_alpha: Tukey 窗渐变比例因子 (0~1)
 
     Returns:
         MultiProcessSimulationResult，包含所有工艺条件下的仿真结果
@@ -1863,7 +1966,12 @@ def simulate_multi_process(
 
     for cond in conditions:
         optics = cond.to_optical_system(base_optics=base_optics)
-        imaging_model = PartialCoherentImaging(optics, mask.shape)
+        imaging_model = PartialCoherentImaging(
+            optics, mask.shape,
+            window_type=window_type,
+            pad_width=pad_width,
+            tukey_alpha=tukey_alpha
+        )
         aerial = imaging_model.compute_aerial_image(mask)
 
         if cond.dose != 1.0:

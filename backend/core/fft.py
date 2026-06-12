@@ -14,6 +14,14 @@ import numpy as np
 from numba import jit, prange, complex128, float64
 from typing import Tuple, Optional, Union
 from scipy import fft as scipy_fft
+from scipy.signal.windows import tukey as _scipy_tukey
+from enum import Enum
+
+
+class WindowType(Enum):
+    HANN = "hann"
+    HAMMING = "hamming"
+    TUKEY = "tukey"
 
 
 @jit(nopython=True, cache=True)
@@ -434,3 +442,98 @@ def get_frequency_coordinates(shape: Tuple[int, int],
     FX, FY = np.meshgrid(fx, fy)
     
     return FX, FY
+
+
+def hann_window_2d(shape: Tuple[int, int]) -> np.ndarray:
+    ny, nx = shape
+    wy = np.hanning(ny)
+    wx = np.hanning(nx)
+    return np.outer(wy, wx).astype(np.float64)
+
+
+def hamming_window_2d(shape: Tuple[int, int]) -> np.ndarray:
+    ny, nx = shape
+    wy = np.hamming(ny)
+    wx = np.hamming(nx)
+    return np.outer(wy, wx).astype(np.float64)
+
+
+def tukey_window_2d(shape: Tuple[int, int], alpha: float = 0.5) -> np.ndarray:
+    ny, nx = shape
+    wy = _scipy_tukey(ny, alpha=alpha)
+    wx = _scipy_tukey(nx, alpha=alpha)
+    return np.outer(wy, wx).astype(np.float64)
+
+
+def create_window(shape: Tuple[int, int],
+                  window_type: Union[WindowType, str] = WindowType.HANN,
+                  tukey_alpha: float = 0.5) -> np.ndarray:
+    if isinstance(window_type, str):
+        window_type = WindowType(window_type)
+
+    if window_type == WindowType.HANN:
+        return hann_window_2d(shape)
+    elif window_type == WindowType.HAMMING:
+        return hamming_window_2d(shape)
+    elif window_type == WindowType.TUKEY:
+        return tukey_window_2d(shape, alpha=tukey_alpha)
+    else:
+        raise ValueError(f"未知窗函数类型: {window_type}")
+
+
+def apply_zero_padding(image: np.ndarray,
+                       pad_width: Union[int, Tuple[int, int], Tuple[Tuple[int, int], Tuple[int, int]]] = 32,
+                       mode: str = 'constant') -> Tuple[np.ndarray, Tuple]:
+    if isinstance(pad_width, int):
+        pw = ((pad_width, pad_width), (pad_width, pad_width))
+    elif isinstance(pad_width, tuple) and len(pad_width) == 2 and isinstance(pad_width[0], int):
+        pw = ((pad_width[0], pad_width[0]), (pad_width[1], pad_width[1]))
+    else:
+        pw = pad_width
+
+    padded = np.pad(image, pw, mode=mode)
+    return padded, pw
+
+
+def remove_padding(padded_image: np.ndarray, pad_width: Tuple) -> np.ndarray:
+    top = pad_width[0][0]
+    bottom = padded_image.shape[0] - pad_width[0][1]
+    left = pad_width[1][0]
+    right = padded_image.shape[1] - pad_width[1][1]
+    return padded_image[top:bottom, left:right]
+
+
+def apply_window_and_padding(image: np.ndarray,
+                             window_type: Optional[Union[WindowType, str]] = None,
+                             pad_width: Optional[Union[int, Tuple[int, int]]] = None,
+                             tukey_alpha: float = 0.5) -> Tuple[np.ndarray, dict]:
+    if window_type is None and pad_width is None:
+        return image.copy(), {'original_shape': image.shape, 'pad_width': ((0, 0), (0, 0)), 'window': None}
+
+    original_shape = image.shape
+    processed = image.copy().astype(np.float64)
+
+    if window_type is not None:
+        win = create_window(image.shape, window_type, tukey_alpha)
+        processed = processed * win
+    else:
+        win = None
+
+    if pad_width is not None:
+        processed, pw = apply_zero_padding(processed, pad_width)
+    else:
+        pw = ((0, 0), (0, 0))
+
+    info = {
+        'original_shape': original_shape,
+        'pad_width': pw,
+        'window': window_type,
+    }
+    return processed, info
+
+
+def crop_to_original(padded_image: np.ndarray, info: dict) -> np.ndarray:
+    pw = info['pad_width']
+    if pw == ((0, 0), (0, 0)):
+        return padded_image.copy()
+    return remove_padding(padded_image, pw)

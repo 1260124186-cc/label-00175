@@ -32,6 +32,7 @@ from core.imaging import (
     create_aberration_sweep,
     ProcessCondition
 )
+from core.fft import WindowType
 
 
 class TestOpticalSystem:
@@ -1221,3 +1222,204 @@ class TestCreateAberrationSweep:
         assert len(sweep) == 2
         for name, opt in sweep:
             assert 7 in opt.zernike_coefficients
+
+
+class TestPartialCoherentImagingWindowPadding:
+    """窗函数与零填充边界处理测试"""
+
+    def test_no_window_no_padding_backward_compat(self):
+        """测试无窗无填充时向后兼容"""
+        optics = OpticalSystem()
+        imaging_old = PartialCoherentImaging(optics, (32, 32))
+        imaging_new = PartialCoherentImaging(
+            optics, (32, 32), window_type=None, pad_width=None
+        )
+        mask = np.zeros((32, 32))
+        mask[10:22, 10:22] = 1.0
+        aerial_old = imaging_old.compute_aerial_image(mask)
+        aerial_new = imaging_new.compute_aerial_image(mask)
+        np.testing.assert_array_almost_equal(aerial_old, aerial_new)
+
+    def test_hann_window_aerial_shape(self):
+        """测试 Hann 窗成像输出形状不变"""
+        optics = OpticalSystem()
+        imaging = PartialCoherentImaging(
+            optics, (32, 32), window_type=WindowType.HANN
+        )
+        mask = np.zeros((32, 32))
+        mask[10:22, 10:22] = 1.0
+        aerial = imaging.compute_aerial_image(mask)
+        assert aerial.shape == (32, 32)
+        assert aerial.min() >= 0
+        assert aerial.max() <= 1
+
+    def test_hamming_window_aerial_shape(self):
+        """测试 Hamming 窗成像输出形状不变"""
+        optics = OpticalSystem()
+        imaging = PartialCoherentImaging(
+            optics, (32, 32), window_type=WindowType.HAMMING
+        )
+        mask = np.zeros((32, 32))
+        mask[10:22, 10:22] = 1.0
+        aerial = imaging.compute_aerial_image(mask)
+        assert aerial.shape == (32, 32)
+
+    def test_tukey_window_aerial_shape(self):
+        """测试 Tukey 窗成像输出形状不变"""
+        optics = OpticalSystem()
+        imaging = PartialCoherentImaging(
+            optics, (32, 32), window_type=WindowType.TUKEY, tukey_alpha=0.3
+        )
+        mask = np.zeros((32, 32))
+        mask[10:22, 10:22] = 1.0
+        aerial = imaging.compute_aerial_image(mask)
+        assert aerial.shape == (32, 32)
+
+    def test_padding_aerial_shape(self):
+        """测试零填充后成像输出裁剪回原始尺寸"""
+        optics = OpticalSystem()
+        imaging = PartialCoherentImaging(
+            optics, (32, 32), pad_width=8
+        )
+        assert imaging._effective_size == (48, 48)
+        mask = np.zeros((32, 32))
+        mask[10:22, 10:22] = 1.0
+        aerial = imaging.compute_aerial_image(mask)
+        assert aerial.shape == (32, 32)
+
+    def test_window_and_padding_combined(self):
+        """测试同时加窗和零填充"""
+        optics = OpticalSystem()
+        imaging = PartialCoherentImaging(
+            optics, (32, 32),
+            window_type=WindowType.HANN,
+            pad_width=8
+        )
+        mask = np.zeros((32, 32))
+        mask[10:22, 10:22] = 1.0
+        aerial = imaging.compute_aerial_image(mask)
+        assert aerial.shape == (32, 32)
+        assert aerial.min() >= 0
+        assert aerial.max() <= 1
+
+    def test_window_string_type(self):
+        """测试字符串类型的窗函数"""
+        optics = OpticalSystem()
+        imaging = PartialCoherentImaging(
+            optics, (32, 32), window_type='hann'
+        )
+        mask = np.zeros((32, 32))
+        mask[10:22, 10:22] = 1.0
+        aerial = imaging.compute_aerial_image(mask)
+        assert aerial.shape == (32, 32)
+
+    def test_gradient_with_window(self):
+        """测试加窗时梯度计算形状"""
+        optics = OpticalSystem()
+        imaging = PartialCoherentImaging(
+            optics, (32, 32), window_type=WindowType.HANN
+        )
+        mask = np.random.random((32, 32))
+        gradient = imaging.compute_image_gradient(mask)
+        assert gradient.shape == (32, 32)
+
+    def test_gradient_with_padding(self):
+        """测试零填充时梯度计算形状"""
+        optics = OpticalSystem()
+        imaging = PartialCoherentImaging(
+            optics, (32, 32), pad_width=8
+        )
+        mask = np.random.random((32, 32))
+        gradient = imaging.compute_image_gradient(mask)
+        assert gradient.shape == (32, 32)
+
+    def test_gradient_with_window_and_padding(self):
+        """测试同时加窗和零填充时梯度计算形状"""
+        optics = OpticalSystem()
+        imaging = PartialCoherentImaging(
+            optics, (32, 32),
+            window_type=WindowType.TUKEY,
+            pad_width=8,
+            tukey_alpha=0.25
+        )
+        mask = np.random.random((32, 32))
+        gradient = imaging.compute_image_gradient(mask)
+        assert gradient.shape == (32, 32)
+
+    def test_asymmetric_padding(self):
+        """测试非对称零填充"""
+        optics = OpticalSystem()
+        imaging = PartialCoherentImaging(
+            optics, (32, 32), pad_width=(4, 8)
+        )
+        assert imaging._effective_size == (40, 48)
+        mask = np.zeros((32, 32))
+        mask[10:22, 10:22] = 1.0
+        aerial = imaging.compute_aerial_image(mask)
+        assert aerial.shape == (32, 32)
+
+    def test_window_reduces_boundary_artifacts(self):
+        """测试窗函数缓解边界效应"""
+        optics = OpticalSystem(pixel_size=5.0)
+        mask = np.zeros((64, 64))
+        mask[20:44, 20:44] = 1.0
+
+        imaging_no_window = PartialCoherentImaging(optics, (64, 64))
+        imaging_hann = PartialCoherentImaging(
+            optics, (64, 64), window_type=WindowType.HANN
+        )
+
+        aerial_no = imaging_no_window.compute_aerial_image(mask)
+        aerial_hann = imaging_hann.compute_aerial_image(mask)
+
+        boundary_no = np.mean(aerial_no[0:3, :]) + np.mean(aerial_no[-3:, :])
+        boundary_hann = np.mean(aerial_hann[0:3, :]) + np.mean(aerial_hann[-3:, :])
+
+        assert boundary_hann <= boundary_no + 1e-10
+
+
+class TestSimulateWaferWithWindowPadding:
+    """simulate_wafer_image 窗函数/零填充集成测试"""
+
+    def test_simulate_with_hann_window(self):
+        """测试 Hann 窗晶圆仿真端到端"""
+        mask = np.zeros((32, 32))
+        mask[10:22, 10:22] = 1.0
+        wafer = simulate_wafer_image(
+            mask, window_type='hann', apply_resist=False
+        )
+        assert wafer.shape == (32, 32)
+        assert wafer.dtype == np.float64
+
+    def test_simulate_with_padding(self):
+        """测试零填充晶圆仿真端到端"""
+        mask = np.zeros((32, 32))
+        mask[10:22, 10:22] = 1.0
+        wafer = simulate_wafer_image(
+            mask, pad_width=8, apply_resist=False
+        )
+        assert wafer.shape == (32, 32)
+
+    def test_simulate_with_window_and_padding(self):
+        """测试同时加窗和零填充晶圆仿真端到端"""
+        mask = np.zeros((32, 32))
+        mask[10:22, 10:22] = 1.0
+        wafer = simulate_wafer_image(
+            mask,
+            window_type=WindowType.TUKEY,
+            pad_width=8,
+            tukey_alpha=0.25,
+            apply_resist=True
+        )
+        assert wafer.shape == (32, 32)
+        assert wafer.dtype == np.float64
+
+    def test_backward_compat_no_window_padding(self):
+        """测试不传窗/填充参数时向后兼容"""
+        mask = np.zeros((32, 32))
+        mask[10:22, 10:22] = 1.0
+        wafer_old = simulate_wafer_image(mask, apply_resist=False)
+        wafer_new = simulate_wafer_image(
+            mask, window_type=None, pad_width=None, apply_resist=False
+        )
+        np.testing.assert_array_almost_equal(wafer_old, wafer_new)
