@@ -19,7 +19,18 @@ from core.imaging import (
     IlluminationType,
     generate_source,
     compute_tcc_kernel_2d,
-    socs_decomposition
+    socs_decomposition,
+    compute_zernike_phase,
+    _compute_pupil_with_aberrations,
+    _zernike_polynomial,
+    _noll_to_nm,
+    _parse_zernike_coefficients,
+    ZERNIKE_NAMES,
+    ZERNIKE_NAME_TO_INDEX,
+    AberrationType,
+    load_aberration_scenarios,
+    create_aberration_sweep,
+    ProcessCondition
 )
 
 
@@ -717,3 +728,496 @@ class TestSimulateWaferWithResistModel:
         wafer_new = simulate_wafer_image(mask, threshold=0.3, apply_resist=True,
                                          resist_model=None)
         np.testing.assert_array_equal(wafer_old, wafer_new)
+
+
+class TestZernikePolynomials:
+    """Zernike 多项式测试"""
+
+    @pytest.fixture
+    def grid(self):
+        nx, ny = 64, 64
+        rho = np.linspace(0, 1, nx)
+        theta = np.linspace(0, 2 * np.pi, ny)
+        rho_grid, theta_grid = np.meshgrid(rho, theta)
+        return rho_grid, theta_grid
+
+    def test_piston(self, grid):
+        """测试活塞项 Z_0 = 1"""
+        rho, theta = grid
+        z0 = _zernike_polynomial(0, rho, theta)
+        np.testing.assert_allclose(z0, 1.0)
+
+    def test_tilt_x(self, grid):
+        """测试X倾斜 Z_1 = 2ρ cos(θ)"""
+        rho, theta = grid
+        z1 = _zernike_polynomial(1, rho, theta)
+        expected = 2.0 * rho * np.cos(theta)
+        np.testing.assert_allclose(z1, expected, atol=1e-12)
+
+    def test_tilt_y(self, grid):
+        """测试Y倾斜 Z_2 = 2ρ sin(θ)"""
+        rho, theta = grid
+        z2 = _zernike_polynomial(2, rho, theta)
+        expected = 2.0 * rho * np.sin(theta)
+        np.testing.assert_allclose(z2, expected, atol=1e-12)
+
+    def test_defocus(self, grid):
+        """测试离焦 Z_3 = √3 (2ρ² - 1)"""
+        rho, theta = grid
+        z3 = _zernike_polynomial(3, rho, theta)
+        expected = np.sqrt(3.0) * (2.0 * rho ** 2 - 1.0)
+        np.testing.assert_allclose(z3, expected, atol=1e-12)
+
+    def test_spherical(self, grid):
+        """测试球差 Z_10 = √5 (6ρ⁴ - 6ρ² + 1)"""
+        rho, theta = grid
+        z10 = _zernike_polynomial(10, rho, theta)
+        expected = np.sqrt(5.0) * (6.0 * rho ** 4 - 6.0 * rho ** 2 + 1.0)
+        np.testing.assert_allclose(z10, expected, atol=1e-12)
+
+    def test_coma_x(self, grid):
+        """测试X彗差 Z_7 = √8 (3ρ³ - 2ρ) cos(θ)"""
+        rho, theta = grid
+        z7 = _zernike_polynomial(7, rho, theta)
+        expected = np.sqrt(8.0) * (3.0 * rho ** 3 - 2.0 * rho) * np.cos(theta)
+        np.testing.assert_allclose(z7, expected, atol=1e-12)
+
+    def test_coma_y(self, grid):
+        """测试Y彗差 Z_6 = √8 (3ρ³ - 2ρ) sin(θ)"""
+        rho, theta = grid
+        z6 = _zernike_polynomial(6, rho, theta)
+        expected = np.sqrt(8.0) * (3.0 * rho ** 3 - 2.0 * rho) * np.sin(theta)
+        np.testing.assert_allclose(z6, expected, atol=1e-12)
+
+    def test_astigmatism_x(self, grid):
+        """测试X像散 Z_5 = √6 ρ² cos(2θ)"""
+        rho, theta = grid
+        z5 = _zernike_polynomial(5, rho, theta)
+        expected = np.sqrt(6.0) * rho ** 2 * np.cos(2.0 * theta)
+        np.testing.assert_allclose(z5, expected, atol=1e-12)
+
+    def test_astigmatism_y(self, grid):
+        """测试Y像散 Z_4 = √6 ρ² sin(2θ)"""
+        rho, theta = grid
+        z4 = _zernike_polynomial(4, rho, theta)
+        expected = np.sqrt(6.0) * rho ** 2 * np.sin(2.0 * theta)
+        np.testing.assert_allclose(z4, expected, atol=1e-12)
+
+    def test_noll_to_nm(self):
+        """测试 Noll 索引到 (n, m) 的转换"""
+        assert _noll_to_nm(0) == (0, 0)
+        assert _noll_to_nm(1) == (1, 1)
+        assert _noll_to_nm(2) == (1, -1)
+        assert _noll_to_nm(3) == (2, 0)
+        assert _noll_to_nm(10) == (4, 0)
+        assert _noll_to_nm(4) == (2, -2)
+        assert _noll_to_nm(5) == (2, 2)
+        assert _noll_to_nm(7) == (3, 1)
+
+    def test_zernike_unit_circle(self):
+        """测试 Zernike 多项式在单位圆上的正交性"""
+        n = 256
+        x = np.linspace(-1, 1, n)
+        y = np.linspace(-1, 1, n)
+        xx, yy = np.meshgrid(x, y)
+        rho = np.sqrt(xx ** 2 + yy ** 2)
+        theta = np.arctan2(yy, xx)
+        mask = rho <= 1.0
+
+        z3 = _zernike_polynomial(3, rho, theta)
+        z10 = _zernike_polynomial(10, rho, theta)
+
+        area = np.sum(mask)
+        overlap = np.sum(z3[mask] * z10[mask]) / area
+        assert abs(overlap) < 0.1
+
+        norm3 = np.sum(z3[mask] ** 2) / area
+        assert abs(norm3 - 1.0) < 0.1
+
+
+class TestZernikePhase:
+    """Zernike 像差相位计算测试"""
+
+    @pytest.fixture
+    def freq_grid(self):
+        pixel_size = 5.0
+        nx, ny = 64, 64
+        fx = np.fft.fftfreq(nx, pixel_size)
+        fy = np.fft.fftfreq(ny, pixel_size)
+        fx, fy = np.meshgrid(fx, fy)
+        cutoff = 1.35 / 193.0
+        return fx, fy, cutoff
+
+    def test_empty_coefficients(self, freq_grid):
+        """测试空系数返回零相位"""
+        fx, fy, cutoff = freq_grid
+        phase = compute_zernike_phase(fx, fy, cutoff, {})
+        assert np.allclose(phase, 0.0)
+
+    def test_phase_shape(self, freq_grid):
+        """测试相位输出形状"""
+        fx, fy, cutoff = freq_grid
+        phase = compute_zernike_phase(fx, fy, cutoff, {10: 0.05})
+        assert phase.shape == fx.shape
+
+    def test_phase_outside_pupil_zero(self, freq_grid):
+        """测试光瞳外相位为零"""
+        fx, fy, cutoff = freq_grid
+        phase = compute_zernike_phase(fx, fy, cutoff, {10: 0.05})
+        rho = np.sqrt(fx ** 2 + fy ** 2) / cutoff
+        assert np.allclose(phase[rho > 1.0], 0.0)
+
+    def test_spherical_phase_nonzero(self, freq_grid):
+        """测试球差相位非零"""
+        fx, fy, cutoff = freq_grid
+        phase = compute_zernike_phase(fx, fy, cutoff, {10: 0.05})
+        rho = np.sqrt(fx ** 2 + fy ** 2) / cutoff
+        inside = rho <= 1.0
+        assert np.any(np.abs(phase[inside]) > 1e-10)
+
+
+class TestPupilWithAberrations:
+    """含像差光瞳函数测试"""
+
+    @pytest.fixture
+    def freq_grid(self):
+        pixel_size = 5.0
+        nx, ny = 64, 64
+        fx = np.fft.fftfreq(nx, pixel_size)
+        fy = np.fft.fftfreq(ny, pixel_size)
+        fx, fy = np.meshgrid(fx, fy)
+        cutoff = 1.35 / 193.0
+        return fx, fy, cutoff
+
+    def test_pupil_shape(self, freq_grid):
+        """测试光瞳函数输出形状"""
+        fx, fy, cutoff = freq_grid
+        zernike_phase = np.zeros_like(fx)
+        pupil = _compute_pupil_with_aberrations(fx, fy, cutoff, 0.0, 193.0, zernike_phase)
+        assert pupil.shape == fx.shape
+        assert pupil.dtype == np.complex128
+
+    def test_pupil_zero_defocus_no_aberration(self, freq_grid):
+        """测试零离焦无像差时光瞳内幅度为1"""
+        fx, fy, cutoff = freq_grid
+        zernike_phase = np.zeros_like(fx)
+        pupil = _compute_pupil_with_aberrations(fx, fy, cutoff, 0.0, 193.0, zernike_phase)
+        rho = np.sqrt(fx ** 2 + fy ** 2) / cutoff
+        inside = rho <= 1.0
+        np.testing.assert_allclose(np.abs(pupil[inside]), 1.0, atol=1e-12)
+
+    def test_pupil_outside_zero(self, freq_grid):
+        """测试光瞳外为零"""
+        fx, fy, cutoff = freq_grid
+        zernike_phase = np.zeros_like(fx)
+        pupil = _compute_pupil_with_aberrations(fx, fy, cutoff, 0.0, 193.0, zernike_phase)
+        rho = np.sqrt(fx ** 2 + fy ** 2) / cutoff
+        outside = rho > 1.0
+        assert np.allclose(pupil[outside], 0.0)
+
+    def test_aberration_modifies_pupil(self, freq_grid):
+        """测试像差改变光瞳函数"""
+        fx, fy, cutoff = freq_grid
+        no_aberr = _compute_pupil_with_aberrations(
+            fx, fy, cutoff, 0.0, 193.0, np.zeros_like(fx))
+        zernike_phase = compute_zernike_phase(fx, fy, cutoff, {10: 0.1})
+        with_aberr = _compute_pupil_with_aberrations(
+            fx, fy, cutoff, 0.0, 193.0, zernike_phase)
+        rho = np.sqrt(fx ** 2 + fy ** 2) / cutoff
+        inside = rho <= 1.0
+        assert not np.allclose(no_aberr[inside], with_aberr[inside])
+
+
+class TestOpticalSystemZernike:
+    """OpticalSystem 的 Zernike 系数支持测试"""
+
+    def test_default_zernike_empty(self):
+        """测试默认 Zernike 系数为空"""
+        optics = OpticalSystem()
+        assert optics.zernike_coefficients == {}
+
+    def test_custom_zernike(self):
+        """测试自定义 Zernike 系数"""
+        optics = OpticalSystem(zernike_coefficients={10: 0.05, 7: 0.03})
+        assert optics.zernike_coefficients[10] == 0.05
+        assert optics.zernike_coefficients[7] == 0.03
+
+    def test_from_config_with_zernike_names(self):
+        """测试从配置创建（名称格式）"""
+        config = {
+            'optical_system': {
+                'wavelength': 193.0,
+                'na': 1.35,
+                'zernike_coefficients': {
+                    'spherical': 0.05,
+                    'coma_x': 0.03
+                }
+            }
+        }
+        optics = OpticalSystem.from_config(config)
+        assert 10 in optics.zernike_coefficients
+        assert 7 in optics.zernike_coefficients
+        assert optics.zernike_coefficients[10] == 0.05
+        assert optics.zernike_coefficients[7] == 0.03
+
+    def test_from_config_with_zernike_indices(self):
+        """测试从配置创建（索引格式）"""
+        config = {
+            'optical_system': {
+                'zernike_coefficients': {
+                    '10': 0.05,
+                    '7': 0.03
+                }
+            }
+        }
+        optics = OpticalSystem.from_config(config)
+        assert optics.zernike_coefficients[10] == 0.05
+        assert optics.zernike_coefficients[7] == 0.03
+
+    def test_to_dict_with_zernike(self):
+        """测试带 Zernike 系数的 to_dict"""
+        optics = OpticalSystem(zernike_coefficients={10: 0.05, 7: 0.03})
+        d = optics.to_dict()
+        assert 'zernike_coefficients' in d
+        assert 'spherical' in d['zernike_coefficients']
+        assert d['zernike_coefficients']['spherical'] == 0.05
+
+    def test_to_dict_without_zernike(self):
+        """测试无 Zernike 系数的 to_dict"""
+        optics = OpticalSystem()
+        d = optics.to_dict()
+        assert 'zernike_coefficients' in d
+        assert d['zernike_coefficients'] == {}
+
+
+class TestParseZernikeCoefficients:
+    """Zernike 系数解析测试"""
+
+    def test_name_format(self):
+        """测试名称格式解析"""
+        raw = {'spherical': 0.05, 'coma_x': 0.03}
+        result = _parse_zernike_coefficients(raw)
+        assert result == {10: 0.05, 7: 0.03}
+
+    def test_index_string_format(self):
+        """测试字符串索引格式解析"""
+        raw = {'10': 0.05, '7': 0.03}
+        result = _parse_zernike_coefficients(raw)
+        assert result == {10: 0.05, 7: 0.03}
+
+    def test_int_index_format(self):
+        """测试整数索引格式解析"""
+        raw = {10: 0.05, 7: 0.03}
+        result = _parse_zernike_coefficients(raw)
+        assert result == {10: 0.05, 7: 0.03}
+
+    def test_mixed_format(self):
+        """测试混合格式解析"""
+        raw = {'spherical': 0.05, '7': 0.03}
+        result = _parse_zernike_coefficients(raw)
+        assert result == {10: 0.05, 7: 0.03}
+
+    def test_empty(self):
+        """测试空输入"""
+        assert _parse_zernike_coefficients({}) == {}
+
+    def test_unknown_key_ignored(self):
+        """测试未知键被忽略"""
+        raw = {'unknown_aberration': 0.05}
+        result = _parse_zernike_coefficients(raw)
+        assert result == {}
+
+
+class TestProcessConditionZernike:
+    """ProcessCondition 的 Zernike 支持测试"""
+
+    def test_default_zernike_empty(self):
+        """测试默认 Zernike 系数为空"""
+        cond = ProcessCondition()
+        assert cond.zernike_coefficients == {}
+
+    def test_custom_zernike(self):
+        """测试自定义 Zernike 系数"""
+        cond = ProcessCondition(zernike_coefficients={10: 0.05})
+        assert cond.zernike_coefficients[10] == 0.05
+
+    def test_to_optical_system_merges_zernike(self):
+        """测试 to_optical_system 合并 Zernike 系数"""
+        base = OpticalSystem(zernike_coefficients={10: 0.02})
+        cond = ProcessCondition(zernike_coefficients={7: 0.03})
+        opt = cond.to_optical_system(base_optics=base)
+        assert opt.zernike_coefficients[10] == 0.02
+        assert opt.zernike_coefficients[7] == 0.03
+
+    def test_to_optical_system_cond_overrides_zernike(self):
+        """测试 ProcessCondition 的 Zernike 系数覆盖 base"""
+        base = OpticalSystem(zernike_coefficients={10: 0.02})
+        cond = ProcessCondition(zernike_coefficients={10: 0.08})
+        opt = cond.to_optical_system(base_optics=base)
+        assert opt.zernike_coefficients[10] == 0.08
+
+
+class TestImagingWithAberrations:
+    """含像差的光学成像测试"""
+
+    def test_imaging_with_spherical(self):
+        """测试球差下的成像"""
+        optics = OpticalSystem(zernike_coefficients={10: 0.05})
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        mask = np.zeros((32, 32))
+        mask[10:22, 10:22] = 1.0
+        aerial = imaging.compute_aerial_image(mask)
+        assert aerial.shape == (32, 32)
+        assert aerial.min() >= 0
+        assert aerial.max() <= 1
+
+    def test_imaging_with_coma(self):
+        """测试彗差下的成像"""
+        optics = OpticalSystem(zernike_coefficients={7: 0.03, 6: 0.02})
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        mask = np.zeros((32, 32))
+        mask[10:22, 10:22] = 1.0
+        aerial = imaging.compute_aerial_image(mask)
+        assert aerial.shape == (32, 32)
+
+    def test_imaging_with_defocus_and_spherical(self):
+        """测试离焦+球差联合成像"""
+        optics = OpticalSystem(defocus=50.0, zernike_coefficients={10: 0.05})
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        mask = np.zeros((32, 32))
+        mask[10:22, 10:22] = 1.0
+        aerial = imaging.compute_aerial_image(mask)
+        assert aerial.shape == (32, 32)
+        assert aerial.min() >= 0
+
+    def test_aberration_affects_image(self):
+        """测试像差确实影响成像结果"""
+        mask = np.zeros((32, 32))
+        mask[10:22, 10:22] = 1.0
+
+        optics_clean = OpticalSystem(pixel_size=5.0)
+        imaging_clean = PartialCoherentImaging(optics_clean, (32, 32))
+        aerial_clean = imaging_clean.compute_aerial_image(mask)
+
+        optics_aberr = OpticalSystem(
+            pixel_size=5.0,
+            zernike_coefficients={10: 0.1, 7: 0.05}
+        )
+        imaging_aberr = PartialCoherentImaging(optics_aberr, (32, 32))
+        aerial_aberr = imaging_aberr.compute_aerial_image(mask)
+
+        diff = np.abs(aerial_clean - aerial_aberr)
+        assert np.max(diff) > 1e-6
+
+    def test_gradient_with_aberrations(self):
+        """测试含像差的梯度计算"""
+        optics = OpticalSystem(zernike_coefficients={10: 0.05})
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        mask = np.random.random((32, 32))
+        gradient = imaging.compute_image_gradient(mask)
+        assert gradient.shape == (32, 32)
+
+
+class TestLoadAberrationScenarios:
+    """像差场景批量加载测试"""
+
+    def test_load_all_scenarios(self):
+        """测试加载所有场景"""
+        import os
+        config_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            'config', 'aberration_scenarios.yaml'
+        )
+        if not os.path.exists(config_path):
+            pytest.skip("aberration_scenarios.yaml 不存在")
+
+        scenarios = load_aberration_scenarios(config_path)
+        assert len(scenarios) > 0
+        for name, opt in scenarios:
+            assert isinstance(opt, OpticalSystem)
+
+    def test_load_specific_scenarios(self):
+        """测试加载指定场景"""
+        import os
+        config_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            'config', 'aberration_scenarios.yaml'
+        )
+        if not os.path.exists(config_path):
+            pytest.skip("aberration_scenarios.yaml 不存在")
+
+        scenarios = load_aberration_scenarios(
+            config_path, scenario_names=['spherical_only', 'coma_only'])
+        names = [n for n, _ in scenarios]
+        assert 'spherical_only' in names
+        assert 'coma_only' in names
+        assert len(scenarios) == 2
+
+    def test_load_with_custom_base(self):
+        """测试使用自定义 base_optics"""
+        import os
+        config_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            'config', 'aberration_scenarios.yaml'
+        )
+        if not os.path.exists(config_path):
+            pytest.skip("aberration_scenarios.yaml 不存在")
+
+        base = OpticalSystem(wavelength=248.0, na=0.93)
+        scenarios = load_aberration_scenarios(config_path, base_optics=base)
+        for name, opt in scenarios:
+            assert opt.wavelength == 248.0
+            assert opt.na == 0.93
+
+    def test_ideal_scenario_no_aberration(self):
+        """测试理想场景无像差"""
+        import os
+        config_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            'config', 'aberration_scenarios.yaml'
+        )
+        if not os.path.exists(config_path):
+            pytest.skip("aberration_scenarios.yaml 不存在")
+
+        scenarios = load_aberration_scenarios(
+            config_path, scenario_names=['ideal'])
+        assert len(scenarios) == 1
+        name, opt = scenarios[0]
+        assert opt.zernike_coefficients == {}
+
+    def test_file_not_found(self):
+        """测试配置文件不存在"""
+        with pytest.raises(FileNotFoundError):
+            load_aberration_scenarios('/nonexistent/path.yaml')
+
+
+class TestCreateAberrationSweep:
+    """Zernike 系数扫描测试"""
+
+    def test_default_sweep(self):
+        """测试默认系数扫描"""
+        sweep = create_aberration_sweep()
+        assert len(sweep) == 5
+        for name, opt in sweep:
+            assert 10 in opt.zernike_coefficients
+
+    def test_custom_coeff_values(self):
+        """测试自定义系数扫描值"""
+        coeff_vals = [0.0, 0.05, 0.1]
+        sweep = create_aberration_sweep(coeff_values=coeff_vals)
+        assert len(sweep) == 3
+
+    def test_sweep_with_defocus(self):
+        """测试带离焦的系数扫描"""
+        sweep = create_aberration_sweep(
+            defocus_values=[0.0, 50.0],
+            coeff_values=[0.0, 0.05]
+        )
+        assert len(sweep) == 4
+
+    def test_sweep_different_zernike_order(self):
+        """测试扫描不同 Zernike 阶"""
+        sweep = create_aberration_sweep(zernike_j=7, coeff_values=[0.0, 0.03])
+        assert len(sweep) == 2
+        for name, opt in sweep:
+            assert 7 in opt.zernike_coefficients

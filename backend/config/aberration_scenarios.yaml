@@ -1,0 +1,112 @@
+# 像差场景批量配置文件
+# Aberration Scenario Batch Configuration
+#
+# 每个场景定义一组 Zernike 像差系数（单位为波长 λ）和光学参数覆盖。
+# load_aberration_scenarios() 会解析此文件并返回 OpticalSystem 列表。
+#
+# Zernike 系数支持两种 key 格式:
+#   1. 像差名称: spherical, coma_x, coma_y, astigmatism_x, astigmatism_y 等
+#   2. Noll 索引: 0, 1, 2, ... (0-based)
+#
+# 像差名称对照表:
+#   piston=0, tilt_x=1, tilt_y=2, defocus=3,
+#   astigmatism_x=4, astigmatism_y=5,
+#   coma_x=7, coma_y=6,
+#   trefoil_x=9, trefoil_y=8,
+#   spherical=10,
+#   secondary_astigmatism_x=11, secondary_astigmatism_y=12,
+#   secondary_coma_x=13, secondary_coma_y=14,
+#   secondary_spherical=15
+
+base_optics:
+  wavelength: 193.0
+  na: 1.35
+  sigma: 0.75
+  pixel_size: 1.0
+  defocus: 0.0
+  magnification: 4.0
+  illumination_type: conventional
+  source_params:
+    sigma_inner: 0.0
+    sigma_outer: 0.75
+  use_socs: true
+  socs_num_terms: 5
+
+scenarios:
+  ideal:
+    description: "理想光学系统（无像差）"
+    defocus: 0.0
+    zernike_coefficients: {}
+
+  spherical_only:
+    description: "纯球差场景"
+    defocus: 0.0
+    zernike_coefficients:
+      spherical: 0.05
+
+  coma_only:
+    description: "纯彗差场景（X方向）"
+    defocus: 0.0
+    zernike_coefficients:
+      coma_x: 0.03
+
+  astigmatism_only:
+    description: "纯像散场景"
+    defocus: 0.0
+    zernike_coefficients:
+      astigmatism_x: 0.04
+      astigmatism_y: 0.02
+
+  trefoil_only:
+    description: "纯三叶草像差场景"
+    defocus: 0.0
+    zernike_coefficients:
+      trefoil_x: 0.025
+
+  mixed_low:
+    description: "低阶混合像差（球差+彗差+像散）"
+    defocus: 0.0
+    zernike_coefficients:
+      spherical: 0.03
+      coma_x: 0.02
+      coma_y: 0.01
+      astigmatism_x: 0.015
+      astigmatism_y: 0.01
+
+  mixed_high:
+    description: "高阶混合像差（含二阶像差）"
+    defocus: 0.0
+    zernike_coefficients:
+      spherical: 0.04
+      coma_x: 0.03
+      astigmatism_x: 0.02
+      secondary_astigmatism_x: 0.015
+      secondary_coma_x: 0.01
+      secondary_spherical: 0.008
+
+  defocus_with_spherical:
+    description: "离焦+球差联合场景"
+    defocus: 50.0
+    zernike_coefficients:
+      spherical: 0.05
+
+  defocus_with_coma:
+    description: "离焦+彗差联合场景"
+    defocus: -80.0
+    zernike_coefficients:
+      coma_x: 0.04
+      coma_y: 0.02
+
+  full_aberration:
+    description: "全像差场景（包含所有主要像差类型）"
+    defocus: 30.0
+    zernike_coefficients:
+      spherical: 0.05
+      coma_x: 0.03
+      coma_y: 0.02
+      astigmatism_x: 0.025
+      astigmatism_y: 0.015
+      trefoil_x: 0.01
+      trefoil_y: 0.008
+      secondary_astigmatism_x: 0.005
+      secondary_spherical: 0.003

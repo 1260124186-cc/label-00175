@@ -300,6 +300,26 @@ def validate_config(config: Dict[str, Any]) -> bool:
             logger.error("opening_angle必须在(0, 180]度范围内")
             return False
 
+    # 验证Zernike像差系数
+    zernike = optics.get('zernike_coefficients', {})
+    if zernike:
+        valid_names = {
+            'piston', 'tilt_x', 'tilt_y', 'defocus',
+            'astigmatism_x', 'astigmatism_y', 'coma_x', 'coma_y',
+            'trefoil_x', 'trefoil_y', 'spherical',
+            'secondary_astigmatism_x', 'secondary_astigmatism_y',
+            'secondary_coma_x', 'secondary_coma_y', 'secondary_spherical'
+        }
+        for key, value in zernike.items():
+            if isinstance(key, str) and not key.isdigit() and key not in valid_names:
+                logger.error(f"未知的Zernike像差名称: {key}")
+                return False
+            try:
+                float(value)
+            except (ValueError, TypeError):
+                logger.error(f"Zernike系数值必须为数值: {key}={value}")
+                return False
+
     # 验证优化参数
     opt = config.get('optimization', {})
     if opt.get('max_iter', 0) <= 0:

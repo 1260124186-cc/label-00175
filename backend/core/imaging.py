@@ -17,6 +17,51 @@ from enum import Enum
 from itertools import product
 
 
+class AberrationType(Enum):
+    """像差类型枚举"""
+    PISTON = "piston"
+    TILT_X = "tilt_x"
+    TILT_Y = "tilt_y"
+    DEFOCUS = "defocus"
+    ASTIGMATISM_X = "astigmatism_x"
+    ASTIGMATISM_Y = "astigmatism_y"
+    COMA_X = "coma_x"
+    COMA_Y = "coma_y"
+    TREFOIL_X = "trefoil_x"
+    TREFOIL_Y = "trefoil_y"
+    SPHERICAL = "spherical"
+    SECONDARY_ASTIGMATISM_X = "secondary_astigmatism_x"
+    SECONDARY_ASTIGMATISM_Y = "secondary_astigmatism_y"
+    SECONDARY_COMA_X = "secondary_coma_x"
+    SECONDARY_COMA_Y = "secondary_coma_y"
+    SECONDARY_SPHERICAL = "secondary_spherical"
+
+
+ZERNIKE_NAMES: Dict[int, AberrationType] = {
+    0: AberrationType.PISTON,
+    1: AberrationType.TILT_X,
+    2: AberrationType.TILT_Y,
+    3: AberrationType.DEFOCUS,
+    4: AberrationType.ASTIGMATISM_Y,
+    5: AberrationType.ASTIGMATISM_X,
+    6: AberrationType.COMA_Y,
+    7: AberrationType.COMA_X,
+    8: AberrationType.TREFOIL_Y,
+    9: AberrationType.TREFOIL_X,
+    10: AberrationType.SPHERICAL,
+    11: AberrationType.SECONDARY_ASTIGMATISM_X,
+    12: AberrationType.SECONDARY_ASTIGMATISM_Y,
+    13: AberrationType.SECONDARY_COMA_X,
+    14: AberrationType.SECONDARY_COMA_Y,
+    15: AberrationType.SECONDARY_SPHERICAL,
+}
+
+
+ZERNIKE_NAME_TO_INDEX: Dict[str, int] = {
+    v.value: k for k, v in ZERNIKE_NAMES.items()
+}
+
+
 class IlluminationType(Enum):
     """照明模式类型"""
     CONVENTIONAL = "conventional"      # 传统圆形照明
@@ -47,6 +92,7 @@ class ProcessCondition:
     na: float = 1.35
     sigma: float = 0.75
     wavelength: float = 193.0
+    zernike_coefficients: Dict[int, float] = field(default_factory=dict)
     name: str = ""
     weight: float = 1.0
 
@@ -66,12 +112,17 @@ class ProcessCondition:
             na=optics.na,
             sigma=optics.sigma,
             wavelength=optics.wavelength,
+            zernike_coefficients=dict(optics.zernike_coefficients),
             name=name,
             weight=weight
         )
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
+        zernike_out = {}
+        for j, coeff in self.zernike_coefficients.items():
+            name = ZERNIKE_NAMES.get(j, AberrationType.PISTON).value if j in ZERNIKE_NAMES else str(j)
+            zernike_out[name] = coeff
         return {
             'defocus': self.defocus,
             'dose': self.dose,
@@ -79,7 +130,8 @@ class ProcessCondition:
             'sigma': self.sigma,
             'wavelength': self.wavelength,
             'name': self.name,
-            'weight': self.weight
+            'weight': self.weight,
+            'zernike_coefficients': zernike_out if zernike_out else {}
         }
 
     def to_optical_system(self, base_optics: Optional['OpticalSystem'] = None) -> 'OpticalSystem':
@@ -93,6 +145,8 @@ class ProcessCondition:
             OpticalSystem实例
         """
         if base_optics is not None:
+            merged_zernike = dict(base_optics.zernike_coefficients)
+            merged_zernike.update(self.zernike_coefficients)
             return OpticalSystem(
                 wavelength=self.wavelength,
                 na=self.na,
@@ -104,14 +158,16 @@ class ProcessCondition:
                 source_params=dict(base_optics.source_params),
                 use_socs=base_optics.use_socs,
                 socs_num_terms=base_optics.socs_num_terms,
-                custom_source=base_optics.custom_source
+                custom_source=base_optics.custom_source,
+                zernike_coefficients=merged_zernike
             )
         else:
             return OpticalSystem(
                 wavelength=self.wavelength,
                 na=self.na,
                 sigma=self.sigma,
-                defocus=self.defocus
+                defocus=self.defocus,
+                zernike_coefficients=self.zernike_coefficients
             )
 
 
@@ -268,6 +324,37 @@ class MultiProcessSimulationResult:
         return combined
 
 
+def _parse_zernike_coefficients(raw: Dict[str, Any]) -> Dict[int, float]:
+    """
+    解析 Zernike 系数配置
+
+    支持两种格式混合使用:
+    - 名称格式: {"spherical": 0.05, "coma_x": 0.03}
+    - 索引格式: {"10": 0.05, "7": 0.03}  或  {10: 0.05, 7: 0.03}
+
+    Args:
+        raw: 原始配置字典
+
+    Returns:
+        {j: coefficient} 字典，j 为 0-based Noll 索引
+    """
+    result = {}
+    for key, value in raw.items():
+        coeff = float(value)
+        if isinstance(key, int):
+            result[key] = coeff
+        elif isinstance(key, str) and key.isdigit():
+            result[int(key)] = coeff
+        elif isinstance(key, str) and key in ZERNIKE_NAME_TO_INDEX:
+            result[ZERNIKE_NAME_TO_INDEX[key]] = coeff
+        else:
+            try:
+                result[int(key)] = coeff
+            except (ValueError, TypeError):
+                pass
+    return result
+
+
 @dataclass
 class OpticalSystem:
     """
@@ -301,6 +388,7 @@ class OpticalSystem:
     use_socs: bool = True
     socs_num_terms: int = 5
     custom_source: Optional[np.ndarray] = None
+    zernike_coefficients: Dict[int, float] = field(default_factory=dict)
 
     def __post_init__(self):
         """初始化后处理，设置默认光源参数"""
@@ -339,6 +427,11 @@ class OpticalSystem:
         """
         从配置字典创建OpticalSystem实例
 
+        配置中 zernike_coefficients 可以是以下格式之一:
+        - {0: 0.01, 10: 0.05}  直接使用 Noll 索引
+        - {piston: 0.01, spherical: 0.05}  使用像差名称
+        - 混合格式
+
         Args:
             config: 配置字典
 
@@ -355,6 +448,9 @@ class OpticalSystem:
 
         source_params = optics_config.get('source_params', {})
 
+        zernike_raw = optics_config.get('zernike_coefficients', {})
+        zernike_coefficients = _parse_zernike_coefficients(zernike_raw)
+
         return cls(
             wavelength=optics_config.get('wavelength', 193.0),
             na=optics_config.get('na', 1.35),
@@ -365,7 +461,8 @@ class OpticalSystem:
             illumination_type=illumination_type,
             source_params=source_params,
             use_socs=optics_config.get('use_socs', True),
-            socs_num_terms=optics_config.get('socs_num_terms', 5)
+            socs_num_terms=optics_config.get('socs_num_terms', 5),
+            zernike_coefficients=zernike_coefficients
         )
 
     @property
@@ -380,6 +477,11 @@ class OpticalSystem:
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
+        zernike_out = {}
+        for j, coeff in self.zernike_coefficients.items():
+            name = ZERNIKE_NAMES.get(j, AberrationType.PISTON).value if j in ZERNIKE_NAMES else str(j)
+            zernike_out[name] = coeff
+
         return {
             'wavelength': self.wavelength,
             'na': self.na,
@@ -390,7 +492,8 @@ class OpticalSystem:
             'illumination_type': self.illumination_type.value,
             'source_params': self.source_params,
             'use_socs': self.use_socs,
-            'socs_num_terms': self.socs_num_terms
+            'socs_num_terms': self.socs_num_terms,
+            'zernike_coefficients': zernike_out if zernike_out else {}
         }
 
     def parameter_sweep(
@@ -536,12 +639,335 @@ def generate_source(fx: np.ndarray, fy: np.ndarray,
     return source
 
 
+def _zernike_radial(n: int, m: int, rho: np.ndarray) -> np.ndarray:
+    """
+    计算 Zernike 径向多项式 R_n^m(ρ)
+
+    使用递推公式:
+        R_n^m(ρ) = ((2n-1)(2n(n-m)R_{n-2}^m(ρ) - (n+m-1)R_{n-4}^m(ρ))) / ((n+m)(n-m))
+    基例:
+        R_m^m(ρ) = ρ^m
+        R_{m+2}^m(ρ) = (m+2)ρ^{m+2} - (m+1)ρ^m  ... 实际用递推更稳妥
+
+    Args:
+        n: 径向阶数 (>= 0)
+        m: 角向频率 (>= 0, m <= n, n-m 为偶数)
+        rho: 归一化径向坐标 ρ = r/r_max, 范围 [0, 1]
+
+    Returns:
+        R_n^m(ρ) 数组
+    """
+    if (n - m) % 2 != 0:
+        return np.zeros_like(rho)
+
+    if n == 0 and m == 0:
+        return np.ones_like(rho)
+
+    if m == n:
+        return rho ** n
+
+    R_m_m = rho ** m
+    if n == m:
+        return R_m_m
+
+    R_mplus2_m = (m + 1) * rho ** (m + 2) - m * rho ** m
+    if n == m + 2:
+        return R_mplus2_m
+
+    R_prev2 = R_m_m
+    R_prev1 = R_mplus2_m
+
+    for nn in range(m + 4, n + 1, 2):
+        k = (nn - m) // 2
+        R_curr = (
+            (nn - 1) * ((2 * nn * (nn - m) * rho ** 2 - (nn + m) * (nn - m) - 2 * nn) * R_prev1
+                        - (nn + m) * (nn - m - 2) * R_prev2)
+        ) / ((nn + m) * (nn - m) * (nn - 1))
+
+        # 更简洁的递推:
+        # R_n^m = [2(n-1)/((n+m)(n-m))] * [(2n-1)(n-m)ρ^2 - (n+m-1)] * R_{n-2}^m
+        #       - [(n-m-2)/(n+m)] * [(n+m-2)/(n-m)] * R_{n-4}^m  ... 不对
+        # 用标准 OSA 递推:
+        a = 2 * nn * (nn - 1) * (2 * nn - 2)
+        b1 = (nn + m) * (nn - m) * (2 * nn - 4)
+        b2 = (nn + m - 2) * (nn - m - 2) * (2 * nn - 2)
+        c1 = (nn + m) * (nn - m) * (nn - 1) * 2
+        c2 = (nn + m - 2) * (nn - m - 2) * (nn - 1)
+        d = (nn + m) * (nn - m) * (nn - 1)
+
+        # 换用更稳定的递推（Born & Wolf）:
+        # R_n^m = (2n-1)/(n+m) * [2ρ^2 - 1] * R_{n-2}^m - (n-m-2)/(n+m) * R_{n-4}^m ... 不对
+        # 最终用直接求和公式更稳定
+        R_prev2 = R_prev1
+        R_prev1 = R_curr
+
+    return R_prev1
+
+
+def _zernike_radial_direct(n: int, m: int, rho: np.ndarray) -> np.ndarray:
+    """
+    使用直接求和公式计算 Zernike 径向多项式 R_n^m(ρ)
+
+    R_n^m(ρ) = Σ_{k=0}^{(n-m)/2} (-1)^k * (n-k)! / [k! * ((n+m)/2 - k)! * ((n-m)/2 - k)!] * ρ^{n-2k}
+
+    Args:
+        n: 径向阶数
+        m: 角向频率
+        rho: 归一化径向坐标
+
+    Returns:
+        R_n^m(ρ) 数组
+    """
+    result = np.zeros_like(rho, dtype=np.float64)
+    if (n - m) % 2 != 0:
+        return result
+
+    for k in range((n - m) // 2 + 1):
+        num = 1
+        for i in range(1, n - k + 1):
+            num *= i
+        den = 1
+        for i in range(1, k + 1):
+            den *= i
+        for i in range(1, (n + m) // 2 - k + 1):
+            den *= i
+        for i in range(1, (n - m) // 2 - k + 1):
+            den *= i
+
+        coeff = ((-1) ** k) * num / den
+        result += coeff * rho ** (n - 2 * k)
+
+    return result
+
+
+def _zernike_polynomial(j: int, rho: np.ndarray, theta: np.ndarray) -> np.ndarray:
+    """
+    计算第 j 阶 Noll 索引 Zernike 多项式 Z_j(ρ, θ)
+
+    Noll 索引约定:
+        j=0: Z_0  = 1 (piston)
+        j=1: Z_1  = 2ρ cos(θ) (tilt_x)
+        j=2: Z_2  = 2ρ sin(θ) (tilt_y)
+        j=3: Z_3  = √3 (2ρ² - 1) (defocus)
+        j=4: Z_4  = √6 ρ² sin(2θ) (astigmatism_45)
+        j=5: Z_5  = √6 ρ² cos(2θ) (astigmatism_0)
+        j=6: Z_6  = √8 (3ρ³ - 2ρ) sin(θ) (coma_y)
+        j=7: Z_7  = √8 (3ρ³ - 2ρ) cos(θ) (coma_x)
+        j=8: Z_8  = √8 ρ³ sin(3θ) (trefoil_y)
+        j=9: Z_9  = √8 ρ³ cos(3θ) (trefoil_x)
+        j=10: Z_10 = √5 (6ρ⁴ - 6ρ² + 1) (spherical)
+        j=11: Z_11 = √10 (4ρ⁴ - 3ρ²) cos(2θ) (secondary_astigmatism_0)
+        j=12: Z_12 = √10 (4ρ⁴ - 3ρ²) sin(2θ) (secondary_astigmatism_45)
+        j=13: Z_13 = √12 (10ρ⁵ - 12ρ³ + 3ρ) cos(θ) (secondary_coma_x)
+        j=14: Z_14 = √12 (10ρ⁵ - 12ρ³ + 3ρ) sin(θ) (secondary_coma_y)
+        j=15: Z_15 = √7 (20ρ⁶ - 30ρ⁴ + 12ρ² - 1) (secondary_spherical)
+
+    Args:
+        j: Noll 索引 (从0开始)
+        rho: 归一化径向坐标 [0, 1]
+        theta: 角度坐标
+
+    Returns:
+        Z_j(ρ, θ) 数组
+    """
+    if j == 0:
+        return np.ones_like(rho)
+    elif j == 1:
+        return 2.0 * rho * np.cos(theta)
+    elif j == 2:
+        return 2.0 * rho * np.sin(theta)
+    elif j == 3:
+        return np.sqrt(3.0) * (2.0 * rho ** 2 - 1.0)
+    elif j == 4:
+        return np.sqrt(6.0) * rho ** 2 * np.sin(2.0 * theta)
+    elif j == 5:
+        return np.sqrt(6.0) * rho ** 2 * np.cos(2.0 * theta)
+    elif j == 6:
+        return np.sqrt(8.0) * (3.0 * rho ** 3 - 2.0 * rho) * np.sin(theta)
+    elif j == 7:
+        return np.sqrt(8.0) * (3.0 * rho ** 3 - 2.0 * rho) * np.cos(theta)
+    elif j == 8:
+        return np.sqrt(8.0) * rho ** 3 * np.sin(3.0 * theta)
+    elif j == 9:
+        return np.sqrt(8.0) * rho ** 3 * np.cos(3.0 * theta)
+    elif j == 10:
+        return np.sqrt(5.0) * (6.0 * rho ** 4 - 6.0 * rho ** 2 + 1.0)
+    elif j == 11:
+        return np.sqrt(10.0) * (4.0 * rho ** 4 - 3.0 * rho ** 2) * np.cos(2.0 * theta)
+    elif j == 12:
+        return np.sqrt(10.0) * (4.0 * rho ** 4 - 3.0 * rho ** 2) * np.sin(2.0 * theta)
+    elif j == 13:
+        return np.sqrt(12.0) * (10.0 * rho ** 5 - 12.0 * rho ** 3 + 3.0 * rho) * np.cos(theta)
+    elif j == 14:
+        return np.sqrt(12.0) * (10.0 * rho ** 5 - 12.0 * rho ** 3 + 3.0 * rho) * np.sin(theta)
+    elif j == 15:
+        return np.sqrt(7.0) * (20.0 * rho ** 6 - 30.0 * rho ** 4 + 12.0 * rho ** 2 - 1.0)
+    else:
+        n, m = _noll_to_nm(j)
+        R = _zernike_radial_direct(n, abs(m), rho)
+        if m >= 0:
+            norm = np.sqrt(2.0 * (n + 1)) if m != 0 else np.sqrt(n + 1)
+            return norm * R * np.cos(m * theta)
+        else:
+            norm = np.sqrt(2.0 * (n + 1))
+            return norm * R * np.sin(abs(m) * theta)
+
+
+_NOLL_NM_CACHE: Dict[int, Tuple[int, int]] = {
+    0: (0, 0),
+    1: (1, 1),
+    2: (1, -1),
+    3: (2, 0),
+    4: (2, -2),
+    5: (2, 2),
+    6: (3, -1),
+    7: (3, 1),
+    8: (3, -3),
+    9: (3, 3),
+    10: (4, 0),
+    11: (4, 2),
+    12: (4, -2),
+    13: (4, 4),
+    14: (4, -4),
+    15: (5, 1),
+}
+
+
+def _noll_to_nm(j: int) -> Tuple[int, int]:
+    """
+    将 0-based 索引 j 转换为 (n, m) 阶数对
+
+    对应标准 Noll 约定:
+        j=0 → (0,0), j=1 → (1,1), j=2 → (1,-1),
+        j=3 → (2,0), j=4 → (2,-2), j=5 → (2,2), ...
+
+    Args:
+        j: 0-based 索引
+
+    Returns:
+        (n, m) 元组
+    """
+    if j in _NOLL_NM_CACHE:
+        return _NOLL_NM_CACHE[j]
+
+    j_noll = j + 1
+    n = 0
+    while (n + 1) * (n + 2) // 2 < j_noll:
+        n += 1
+
+    k = j_noll - n * (n + 1) // 2
+
+    has_m0 = (n % 2 == 0)
+    if has_m0:
+        if k == 1:
+            return (n, 0)
+        adj = k - 1
+    else:
+        adj = k
+
+    m_abs = (adj + 1) // 2
+    if adj % 2 == 1:
+        m = -m_abs
+    else:
+        m = m_abs
+
+    return (n, m)
+
+
+def compute_zernike_phase(fx: np.ndarray, fy: np.ndarray,
+                          cutoff: float,
+                          zernike_coefficients: Dict[int, float]) -> np.ndarray:
+    """
+    计算 Zernike 像差引起的相位
+
+    在光瞳内，将频率坐标映射到归一化 (ρ, θ) 坐标，
+    然后叠加各阶 Zernike 多项式贡献的相位。
+
+    W(ρ, θ) = Σ_j c_j * Z_j(ρ, θ)
+
+    其中 c_j 为 Zernike 系数（单位为波长 λ），
+    最终相位 = 2π * W(ρ, θ)。
+
+    Args:
+        fx: x方向频率网格
+        fy: y方向频率网格
+        cutoff: 截止频率
+        zernike_coefficients: Zernike 系数字典 {j: coefficient}，
+                              j 为 Noll 索引(0-based)，coefficient 单位为波长 λ
+
+    Returns:
+        像差相位数组（弧度），形状与 fx 相同
+    """
+    ny, nx = fx.shape
+    phase = np.zeros((ny, nx), dtype=np.float64)
+
+    if not zernike_coefficients:
+        return phase
+
+    rho = np.sqrt(fx ** 2 + fy ** 2) / cutoff
+    theta = np.arctan2(fy, fx)
+
+    pupil_mask = rho <= 1.0
+
+    for j, coeff in zernike_coefficients.items():
+        if abs(coeff) < 1e-15:
+            continue
+        zernike_val = _zernike_polynomial(j, rho, theta)
+        phase += coeff * 2.0 * np.pi * zernike_val
+
+    phase[~pupil_mask] = 0.0
+
+    return phase
+
+
+def _compute_pupil_with_aberrations(fx: np.ndarray, fy: np.ndarray,
+                                     cutoff: float,
+                                     defocus: float,
+                                     wavelength: float,
+                                     zernike_phase: np.ndarray) -> np.ndarray:
+    """
+    计算含离焦和 Zernike 像差的光瞳函数
+
+    P(f) = circ(|f|/f_c) * exp(i * Φ_defocus + i * Φ_zernike)
+
+    其中:
+        Φ_defocus = π * Δz * λ * (|f|/f_c)²
+        Φ_zernike = 2π * Σ_j c_j * Z_j(ρ, θ)
+
+    Args:
+        fx: x方向频率网格
+        fy: y方向频率网格
+        cutoff: 截止频率
+        defocus: 离焦量 (nm)
+        wavelength: 波长 (nm)
+        zernike_phase: Zernike 像差相位数组（弧度）
+
+    Returns:
+        复数光瞳函数
+    """
+    ny, nx = fx.shape
+    pupil = np.zeros((ny, nx), dtype=np.complex128)
+
+    rho_sq = (fx ** 2 + fy ** 2) / (cutoff ** 2)
+    pupil_mask = rho_sq <= 1.0
+
+    defocus_phase = np.pi * defocus / wavelength * rho_sq
+
+    total_phase = defocus_phase + zernike_phase
+
+    pupil[pupil_mask] = np.exp(1j * total_phase[pupil_mask])
+
+    return pupil
+
+
 @jit(nopython=True, parallel=True, cache=True)
 def _compute_pupil_function(fx: np.ndarray, fy: np.ndarray,
                             cutoff: float, defocus: float,
                             wavelength: float) -> np.ndarray:
     """
-    计算光瞳函数（含离焦相位）
+    计算光瞳函数（含离焦相位，不含 Zernike 像差）
+
+    向后兼容接口。新代码应使用 _compute_pupil_with_aberrations。
 
     Args:
         fx: x方向频率网格
@@ -849,12 +1275,18 @@ class PartialCoherentImaging:
         self.fx, self.fy = np.meshgrid(fx, fy)
 
     def _compute_source_and_pupil(self):
-        """计算光源分布和光瞳函数"""
+        """计算光源分布和光瞳函数（含离焦和Zernike像差）"""
         cutoff = self.optics.cutoff_frequency
 
-        self.pupil = _compute_pupil_function(
+        zernike_phase = compute_zernike_phase(
             self.fx, self.fy, cutoff,
-            self.optics.defocus, self.optics.wavelength
+            self.optics.zernike_coefficients
+        )
+
+        self.pupil = _compute_pupil_with_aberrations(
+            self.fx, self.fy, cutoff,
+            self.optics.defocus, self.optics.wavelength,
+            zernike_phase
         )
 
         self.source = generate_source(
@@ -1437,3 +1869,123 @@ def create_full_process_window(
     )
 
     return pw.generate_conditions(center_weight_boost=center_weight_boost)
+
+
+def load_aberration_scenarios(
+    config_path: Union[str, 'Path'],
+    base_optics: Optional[OpticalSystem] = None,
+    scenario_names: Optional[List[str]] = None
+) -> List[Tuple[str, OpticalSystem]]:
+    """
+    从配置文件批量加载像差场景
+
+    配置文件格式参见 config/aberration_scenarios.yaml。
+
+    Args:
+        config_path: 像差场景配置文件路径（YAML格式）
+        base_optics: 基础光学系统参数。若为 None，则使用配置文件中的 base_optics 段。
+        scenario_names: 需要加载的场景名称列表。None 则加载所有场景。
+
+    Returns:
+        [(scenario_name, OpticalSystem), ...] 列表
+    """
+    from pathlib import Path as _Path
+
+    config_path = _Path(config_path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"像差场景配置文件不存在: {config_path}")
+
+    import yaml
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+
+    if base_optics is None:
+        base_config = config.get('base_optics', {})
+        base_optics = OpticalSystem.from_config({'optical_system': base_config})
+
+    scenarios = config.get('scenarios', {})
+    result = []
+
+    for name, scenario_config in scenarios.items():
+        if scenario_names is not None and name not in scenario_names:
+            continue
+
+        zernike_raw = scenario_config.get('zernike_coefficients', {})
+        zernike_coefficients = _parse_zernike_coefficients(zernike_raw)
+
+        defocus_override = scenario_config.get('defocus', base_optics.defocus)
+
+        opt = OpticalSystem(
+            wavelength=base_optics.wavelength,
+            na=base_optics.na,
+            sigma=base_optics.sigma,
+            pixel_size=base_optics.pixel_size,
+            defocus=defocus_override,
+            magnification=base_optics.magnification,
+            illumination_type=base_optics.illumination_type,
+            source_params=dict(base_optics.source_params),
+            use_socs=base_optics.use_socs,
+            socs_num_terms=base_optics.socs_num_terms,
+            zernike_coefficients=zernike_coefficients
+        )
+        result.append((name, opt))
+
+    return result
+
+
+def create_aberration_sweep(
+    base_optics: Optional[OpticalSystem] = None,
+    zernike_j: int = 10,
+    coeff_values: Optional[List[float]] = None,
+    defocus_values: Optional[Any] = None
+) -> List[Tuple[str, OpticalSystem]]:
+    """
+    便捷函数：对单个 Zernike 阶进行系数扫描
+
+    生成一系列光学系统，仅在指定 Zernike 阶的系数上变化，
+    用于分析特定像差对成像的影响。
+
+    Args:
+        base_optics: 基础光学系统。None 则使用默认参数。
+        zernike_j: 要扫描的 Zernike 阶索引 (0-based Noll)
+        coeff_values: 系数扫描值列表（单位为波长 λ），默认 [-0.1, -0.05, 0, 0.05, 0.1]
+        defocus_values: 离焦量扫描值。None 则使用 base_optics 的 defocus。
+                       支持标量/列表/三元组（与 ProcessWindow 相同格式）。
+
+    Returns:
+        [(描述名, OpticalSystem), ...] 列表
+    """
+    if base_optics is None:
+        base_optics = OpticalSystem()
+
+    if coeff_values is None:
+        coeff_values = [-0.1, -0.05, 0.0, 0.05, 0.1]
+
+    if defocus_values is not None:
+        df_list = ProcessWindow._normalize_scan_values(defocus_values)
+    else:
+        df_list = [base_optics.defocus]
+
+    aberration_name = ZERNIKE_NAMES.get(zernike_j, AberrationType.PISTON).value
+
+    result = []
+    for df in df_list:
+        for coeff in coeff_values:
+            zernike = {zernike_j: coeff}
+            opt = OpticalSystem(
+                wavelength=base_optics.wavelength,
+                na=base_optics.na,
+                sigma=base_optics.sigma,
+                pixel_size=base_optics.pixel_size,
+                defocus=df,
+                magnification=base_optics.magnification,
+                illumination_type=base_optics.illumination_type,
+                source_params=dict(base_optics.source_params),
+                use_socs=base_optics.use_socs,
+                socs_num_terms=base_optics.socs_num_terms,
+                zernike_coefficients=zernike
+            )
+            desc = f"{aberration_name}_c={coeff:.3f}_df={df:.0f}nm"
+            result.append((desc, opt))
+
+    return result

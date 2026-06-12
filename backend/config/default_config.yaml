@@ -22,6 +22,18 @@ optical_system:
   # SOCS低秩分解配置
   use_socs: true         # 是否使用SOCS加速
   socs_num_terms: 5      # SOCS分解项数
+  # Zernike像差系数（单位: 波长λ）
+  # 支持名称和索引两种格式，名称对照:
+  #   piston=0, tilt_x=1, tilt_y=2, defocus=3,
+  #   astigmatism_x=4, astigmatism_y=5, coma_y=6, coma_x=7,
+  #   trefoil_y=8, trefoil_x=9, spherical=10,
+  #   secondary_astigmatism_x=11, secondary_astigmatism_y=12,
+  #   secondary_coma_x=13, secondary_coma_y=14, secondary_spherical=15
+  zernike_coefficients: {}
+  # 示例: 注入球差和彗差
+  # zernike_coefficients:
+  #   spherical: 0.05
+  #   coma_x: 0.03
 
 # 优化参数
 optimization:
