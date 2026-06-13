@@ -60,7 +60,7 @@ from algorithms.callbacks import (
     LearningRateSchedulerCallback, EarlyStoppingCallback,
     ModelCheckpointCallback, MaskSnapshotCallback,
     ConvergencePlotCallback, LoggerCallback, HistoryCallback,
-    LambdaCallback
+    LambdaCallback, AnimationCallback
 )
 
 logger = logging.getLogger(__name__)
@@ -345,6 +345,19 @@ class OptimizationConfig:
     plot_log_scale: bool = True  # 是否使用对数坐标
     plot_lr: bool = True  # 是否同时绘制学习率曲线
     plot_live_update: bool = False  # 是否实时更新显示
+
+    # 优化过程动画配置（GIF/MP4）
+    animation_enable: bool = False  # 是否启用优化过程动画
+    animation_dir: str = './animations'  # 动画保存目录
+    animation_freq: int = 1  # 每多少个 epoch 记录一帧
+    animation_format: str = 'gif'  # 输出格式: 'gif' 或 'mp4'
+    animation_fps: int = 10  # 动画帧率
+    animation_dpi: int = 100  # 动画分辨率 (DPI)
+    animation_figsize: tuple = None  # 图像尺寸 (width, height)，None 自动推算
+    animation_show_info: bool = True  # 是否显示 epoch/loss 标题信息
+    animation_show_convergence: bool = True  # 是否显示损失收敛曲线子图
+    animation_consistent_error: bool = True  # 误差图是否使用一致色标（便于帧间对比）
+    animation_show_wafer: bool = True  # 是否同时显示Wafer图像（光刻胶阈值后）
 
     # 中间掩模历史记录配置（用于批量评估与Pareto前沿分析）
     save_mask_history: bool = False  # 是否在内存中保存每一步的中间掩模
@@ -782,6 +795,56 @@ class MaskOptimizer:
                     plot_lr=cfg.plot_lr,
                     live_update=cfg.plot_live_update
                 ))
+
+            if cfg.animation_enable:
+                imaging_model_for_anim = self._imaging_model
+                if (cfg.use_multi_process
+                        and self._multi_imaging_models is not None
+                        and len(self._multi_imaging_models) > 0):
+                    mid_idx = len(self._multi_imaging_models) // 2
+                    imaging_model_for_anim = self._multi_imaging_models[mid_idx]
+
+                if imaging_model_for_anim is not None:
+                    def compute_aerial_wrapper(mask, model=imaging_model_for_anim):
+                        return model.compute_aerial_image(mask)
+
+                    compute_wafer_wrapper = None
+                    if cfg.animation_show_wafer:
+                        wafer_threshold = cfg.threshold
+                        wafer_use_resist = cfg.use_wafer_image_loss
+                        dose_for_anim = 1.0
+                        if (cfg.use_multi_process
+                                and self._multi_conditions is not None
+                                and len(self._multi_conditions) > 0):
+                            mid_idx2 = len(self._multi_conditions) // 2
+                            dose_for_anim = self._multi_conditions[mid_idx2].dose
+
+                        def compute_wafer_wrapper(mask,
+                                                  model=imaging_model_for_anim,
+                                                  dose=float(dose_for_anim),
+                                                  use_resist=wafer_use_resist,
+                                                  thresh=wafer_threshold):
+                            aerial = model.compute_aerial_image(mask)
+                            if dose != 1.0:
+                                aerial = np.clip(aerial * dose, 0.0, 1.0)
+                            if use_resist:
+                                return _apply_threshold_for_loss(aerial, thresh)
+                            return aerial
+
+                    callbacks.append(AnimationCallback(
+                        save_dir=cfg.animation_dir,
+                        save_freq=cfg.animation_freq,
+                        output_format=cfg.animation_format,
+                        fps=cfg.animation_fps,
+                        dpi=cfg.animation_dpi,
+                        figsize=tuple(cfg.animation_figsize) if cfg.animation_figsize is not None else None,
+                        compute_aerial_fn=compute_aerial_wrapper,
+                        compute_wafer_fn=compute_wafer_wrapper,
+                        target_image=self._target_image,
+                        show_title_info=cfg.animation_show_info,
+                        show_convergence=cfg.animation_show_convergence,
+                        consistent_error_scale=cfg.animation_consistent_error,
+                    ))
 
     def add_callback(self, callback: Callback):
         """
@@ -1832,6 +1895,67 @@ class MaskOptimizer:
 
         return gradient
 
+    def _make_callback_driven_objective(self,
+                                     original_obj: Callable[[np.ndarray], float],
+                                     original_mask_shape: Tuple[int, int],
+                                     base_epoch_interval: int = 1):
+        """
+        为非 step-training 优化器包装目标函数，用于驱动 callback 系统。
+
+        Args:
+            original_obj: 原始目标函数 f(mask_2d) -> float
+            original_mask_shape: 原始掩模 2D 形状
+            base_epoch_interval: 每多少次函数评估对应一个逻辑 epoch（对于启发式算法，因为每代调用次数很多。）
+
+        Returns:
+            (wrapped_obj, initial_epoch_counter)  —— wrapped_obj(x_flat_or_2d) -> float
+        """
+        cfg = self.config
+        callbacks = self._callbacks
+        state = self._trainer_state
+
+        interval = max(1, int(base_epoch_interval))
+        counter = {'eval_count': 0, 'logical_epoch': 0}
+
+        def wrapped(x: np.ndarray) -> float:
+            if x.ndim == 1:
+                mask_2d = x.reshape(original_mask_shape)
+            else:
+                mask_2d = x
+            loss = float(original_obj(mask_2d))
+
+            counter['eval_count'] += 1
+
+            if state is not None:
+                state.mask = mask_2d.copy()
+                state.loss = loss
+                if not state.loss_history or state.loss_history[-1] != loss:
+                    state.loss_history.append(loss)
+                if not state.lr_history:
+                    state.lr_history.append(cfg.learning_rate)
+                if state.best_mask is None or loss < state.best_loss:
+                    state.best_loss = loss
+                    state.best_mask = mask_2d.copy()
+
+            new_logical = counter['eval_count'] // interval
+            if new_logical > counter['logical_epoch'] and state is not None:
+                counter['logical_epoch'] = new_logical
+                epoch = counter['logical_epoch']
+                state.epoch = epoch
+                logs = {'loss': loss, 'learning_rate': state.learning_rate}
+                try:
+                    callbacks.on_epoch_begin(epoch)
+                except Exception:
+                    pass
+                try:
+                    callbacks.on_epoch_end(epoch, logs)
+                except Exception:
+                    pass
+
+            return loss
+
+        return wrapped
+
     def optimize(self,
                  initial_mask: np.ndarray,
                  target_image: np.ndarray,
@@ -1870,13 +1994,6 @@ class MaskOptimizer:
             self._setup_optimizer()
             self._setup_lr_scheduler()
             self._setup_early_stopping()
-
-        if self.config.use_multi_process:
-            self._setup_multi_process_models(initial_mask.shape)
-        else:
-            self._multi_imaging_models = None
-            self._multi_conditions = None
-            self._multi_weights = None
 
         initial_wafer = self._imaging_model.compute_aerial_image(initial_mask)
         initial_metrics = evaluate_all(initial_wafer, target_image)
@@ -1918,6 +2035,35 @@ class MaskOptimizer:
                 starting_mask = initial_mask.copy()
                 start_epoch = 0
 
+        needs_callback_driver = (not use_step_training) and self.config.use_callbacks and (
+            self.config.animation_enable
+            or self.config.snapshot_enable
+            or self.config.plot_enable
+            or self.config.checkpoint_enable
+            or self.config.early_stopping_enable
+            or self.config.save_mask_history
+        )
+
+        if needs_callback_driver:
+            self._setup_callbacks(starting_mask)
+            initial_loss = self._compute_loss(starting_mask)
+            self._trainer_state.loss = initial_loss
+            if not self._trainer_state.loss_history:
+                self._trainer_state.loss_history = [initial_loss]
+            if not self._trainer_state.lr_history:
+                self._trainer_state.lr_history = [self.config.learning_rate]
+            if self._trainer_state.best_mask is None or initial_loss < self._trainer_state.best_loss:
+                self._trainer_state.best_loss = initial_loss
+                self._trainer_state.best_mask = starting_mask.copy()
+            self._callbacks.on_train_begin({'loss': initial_loss})
+
+        if self.config.use_multi_process:
+            self._setup_multi_process_models(initial_mask.shape)
+        else:
+            self._multi_imaging_models = None
+            self._multi_conditions = None
+            self._multi_weights = None
+
         if self.config.use_multi_process:
             logger.info(f"开始多工艺条件联合掩模优化，{len(self._multi_conditions)} 个工艺条件，"
                        f"初始MSE: {initial_metrics.mse:.6e}")
@@ -1927,8 +2073,10 @@ class MaskOptimizer:
         if use_step_training:
             result = self._step_train(starting_mask, old_callback=callback)
         elif isinstance(self._optimizer, BaseHeuristicOptimizer):
+            interval = max(1, self.config.population_size)
+
             if self._bandlimit_mask is not None:
-                def wrapped_obj(x):
+                def original_obj(x):
                     x_proj = self._apply_bandlimit_projection(
                         x.reshape(starting_mask.shape)
                     )
@@ -1936,26 +2084,42 @@ class MaskOptimizer:
                     return self._compute_loss(x_proj)
                 starting_mask = self._apply_bandlimit_projection(starting_mask)
                 starting_mask = self._clip_to_bounds(starting_mask)
+
+                if needs_callback_driver:
+                    wrapped_obj = self._make_callback_driven_objective(
+                        original_obj, starting_mask.shape, interval
+                    )
+                else:
+                    wrapped_obj = original_obj
+
                 result = self._optimizer.optimize(
                     objective=wrapped_obj,
                     x0=starting_mask,
                     bounds=self.config.bounds
                 )
             else:
+                original_obj = self._compute_loss
+                if needs_callback_driver:
+                    wrapped_obj = self._make_callback_driven_objective(
+                        original_obj, starting_mask.shape, interval
+                    )
+                else:
+                    wrapped_obj = original_obj
+
                 result = self._optimizer.optimize(
-                    objective=self._compute_loss,
+                    objective=wrapped_obj,
                     x0=starting_mask,
                     bounds=self.config.bounds
                 )
         else:
             if self._bandlimit_mask is not None:
-                def wrapped_obj(x):
+                def original_obj(x):
                     x_proj = self._apply_bandlimit_projection(
                         x.reshape(starting_mask.shape)
                     )
                     x_proj = self._clip_to_bounds(x_proj)
                     return self._compute_loss(x_proj)
-                def wrapped_grad(x):
+                def wrapped_grad_base(x):
                     x_proj = self._apply_bandlimit_projection(
                         x.reshape(starting_mask.shape)
                     )
@@ -1965,19 +2129,50 @@ class MaskOptimizer:
                     return g.flatten()
                 starting_mask = self._apply_bandlimit_projection(starting_mask)
                 starting_mask = self._clip_to_bounds(starting_mask)
+
+                if needs_callback_driver:
+                    wrapped_obj = self._make_callback_driven_objective(
+                        original_obj, starting_mask.shape, 1
+                    )
+                else:
+                    wrapped_obj = original_obj
+
                 result = self._optimizer.optimize(
                     objective=wrapped_obj,
                     x0=starting_mask,
-                    gradient=wrapped_grad,
+                    gradient=wrapped_grad_base,
                     bounds=self.config.bounds
                 )
             else:
+                original_obj = self._compute_loss
+                def grad_base(x):
+                    if x.ndim == 1:
+                        x = x.reshape(starting_mask.shape)
+                    return self._compute_gradient(x).flatten()
+
+                if needs_callback_driver:
+                    wrapped_obj = self._make_callback_driven_objective(
+                        original_obj, starting_mask.shape, 1
+                    )
+                else:
+                    wrapped_obj = original_obj
+
                 result = self._optimizer.optimize(
-                    objective=self._compute_loss,
+                    objective=wrapped_obj,
                     x0=starting_mask,
-                    gradient=self._compute_gradient,
+                    gradient=grad_base,
                     bounds=self.config.bounds
                 )
+
+        if needs_callback_driver:
+            final_loss = float(getattr(result, 'fun', float('inf')))
+            final_mask = getattr(result, 'x', None)
+            if final_mask is not None and final_mask.ndim == 1:
+                try:
+                    final_mask = final_mask.reshape(starting_mask.shape)
+                except Exception:
+                    pass
+            self._callbacks.on_train_end({'loss': final_loss})
 
         optimized_mask = result.x
         if self._bandlimit_mask is not None:

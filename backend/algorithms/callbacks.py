@@ -14,6 +14,7 @@ from typing import List, Optional, Dict, Any, Callable, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
 import logging
+from io import BytesIO
 
 logger = logging.getLogger(__name__)
 
@@ -764,3 +765,399 @@ class HistoryCallback(Callback):
         if self.save_masks:
             result['masks'] = self.mask_history
         return result
+
+
+class AnimationCallback(Callback):
+    """
+    优化过程动画生成回调
+
+    每 N 步记录当前掩模、空间像、(可选)wafer图像、误差图，训练结束后生成
+    GIF 或 MP4 动画文件，直观展示优化演进过程。支持附带收敛曲线子图。
+    """
+
+    def __init__(self,
+                 save_dir: str = './animations',
+                 save_freq: int = 1,
+                 output_format: str = 'gif',
+                 fps: int = 10,
+                 dpi: int = 100,
+                 figsize: Optional[Tuple[int, int]] = None,
+                 compute_aerial_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+                 compute_wafer_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+                 target_image: Optional[np.ndarray] = None,
+                 filename_prefix: str = 'optimization_animation',
+                 show_title_info: bool = True,
+                 show_convergence: bool = True,
+                 consistent_error_scale: bool = True,
+                 cmap_mask: str = 'gray',
+                 cmap_aerial: str = 'gray',
+                 cmap_wafer: str = 'gray',
+                 cmap_error: str = 'hot'):
+        """
+        初始化动画回调
+
+        Args:
+            save_dir: 动画文件保存目录
+            save_freq: 保存频率（每多少个 epoch 记录一帧）
+            output_format: 输出格式: 'gif' 或 'mp4'
+            fps: 动画帧率
+            dpi: 输出分辨率
+            figsize: 图像尺寸 (width, height)，为 None 时根据子图数量自动推算
+            compute_aerial_fn: 计算空间像的函数: fn(mask) -> aerial_image
+            compute_wafer_fn: 计算wafer图像的函数: fn(mask) -> wafer_image (可选)
+            target_image: 目标图像，用于计算误差图
+            filename_prefix: 输出文件名前缀
+            show_title_info: 是否在标题中显示 epoch/loss 等信息
+            show_convergence: 是否附带显示损失收敛曲线子图
+            consistent_error_scale: 是否在所有帧中使用一致的误差色标范围（便于对比）
+            cmap_mask: 掩模图的颜色映射
+            cmap_aerial: 空间像的颜色映射
+            cmap_wafer: wafer图像的颜色映射
+            cmap_error: 误差图的颜色映射
+        """
+        super().__init__()
+        self.save_dir = Path(save_dir)
+        self.save_freq = max(1, int(save_freq))
+        self.output_format = output_format.lower()
+        self.fps = fps
+        self.dpi = dpi
+        self.figsize = figsize
+        self.compute_aerial_fn = compute_aerial_fn
+        self.compute_wafer_fn = compute_wafer_fn
+        self.target_image = target_image
+        self.filename_prefix = filename_prefix
+        self.show_title_info = show_title_info
+        self.show_convergence = show_convergence
+        self.consistent_error_scale = consistent_error_scale
+        self.cmap_mask = cmap_mask
+        self.cmap_aerial = cmap_aerial
+        self.cmap_wafer = cmap_wafer
+        self.cmap_error = cmap_error
+
+        self._frames: List[Dict[str, Any]] = []
+        self._matplotlib_imported = False
+        self._plt = None
+        self._animation = None
+        self._import_matplotlib()
+
+        self.output_path: Optional[Path] = None
+        self._error_vmax: Optional[float] = None
+        self._n_image_cols: int = 3  # 默认 mask / aerial / error
+
+    def _import_matplotlib(self):
+        """延迟导入 matplotlib，避免无显示环境报错"""
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            import matplotlib.animation as animation
+            self._plt = plt
+            self._animation = animation
+            self._matplotlib_imported = True
+        except Exception as e:
+            logger.warning(f"matplotlib 导入失败，动画回调将不生效: {e}")
+            self._matplotlib_imported = False
+
+    def on_train_begin(self, logs: Optional[Dict[str, Any]] = None):
+        """训练开始，初始化保存目录和帧缓存"""
+        self._frames.clear()
+        self.output_path = None
+        self._error_vmax = None
+        if self._matplotlib_imported:
+            self.save_dir.mkdir(parents=True, exist_ok=True)
+
+    def on_epoch_end(self, epoch: int, logs: Optional[Dict[str, Any]] = None):
+        """每个 epoch 结束，按需记录一帧"""
+        if not self._matplotlib_imported:
+            return
+        if self.state is None or self.state.mask is None:
+            return
+        if epoch % self.save_freq != 0 and epoch > 0:
+            return
+
+        try:
+            mask = self.state.mask.copy()
+            loss = float(logs.get('loss', self.state.loss)) if logs else float(self.state.loss)
+            lr = float(self.state.learning_rate)
+
+            aerial = None
+            wafer = None
+            error = None
+            if self.compute_aerial_fn is not None:
+                try:
+                    aerial = self.compute_aerial_fn(mask)
+                except Exception as e:
+                    logger.debug(f"计算空间像失败: {e}")
+                    aerial = None
+
+            if self.compute_wafer_fn is not None:
+                try:
+                    wafer = self.compute_wafer_fn(mask)
+                except Exception as e:
+                    logger.debug(f"计算wafer图像失败: {e}")
+                    wafer = None
+
+            ref_image = None
+            if wafer is not None:
+                ref_image = wafer
+            elif aerial is not None:
+                ref_image = aerial
+
+            if ref_image is not None and self.target_image is not None:
+                try:
+                    if ref_image.shape == self.target_image.shape:
+                        error = np.abs(ref_image - self.target_image)
+                except Exception as e:
+                    logger.debug(f"计算误差图失败: {e}")
+                    error = None
+
+            self._frames.append({
+                'epoch': epoch,
+                'mask': mask,
+                'aerial': aerial,
+                'wafer': wafer,
+                'error': error,
+                'loss': loss,
+                'learning_rate': lr,
+            })
+        except Exception as e:
+            logger.debug(f"记录动画帧失败 (epoch {epoch}): {e}")
+
+    def on_train_end(self, logs: Optional[Dict[str, Any]] = None):
+        """训练结束，生成并保存动画文件"""
+        if not self._matplotlib_imported or len(self._frames) == 0:
+            if len(self._frames) == 0:
+                logger.debug("没有可用的动画帧，跳过动画生成")
+            return
+
+        if self.consistent_error_scale:
+            errors = [f['error'] for f in self._frames if f['error'] is not None]
+            if errors:
+                self._error_vmax = float(max(np.max(e) for e in errors))
+                if self._error_vmax <= 0:
+                    self._error_vmax = 1.0
+
+        self._n_image_cols = 3
+        if self._frames[0].get('wafer') is not None:
+            self._n_image_cols = 4
+
+        try:
+            self._generate_animation()
+        except Exception as e:
+            logger.warning(f"生成动画失败: {e}")
+
+    def _figure_layout(self) -> Tuple[Any, List[Any], Optional[Any]]:
+        """
+        创建 Figure 与子图布局
+
+        Returns:
+            (fig, image_axes, convergence_ax_or_None)
+        """
+        plt = self._plt
+        n_img = self._n_image_cols
+
+        if self.show_convergence:
+            fig = plt.figure(figsize=self.figsize or (5 * n_img + 3, 5.5))
+            gs = fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.3)
+            gs_img = gs[0].subgridspec(1, n_img, wspace=0.15)
+            image_axes = [fig.add_subplot(gs_img[i]) for i in range(n_img)]
+            conv_ax = fig.add_subplot(gs[1])
+            return fig, image_axes, conv_ax
+        else:
+            fig, axes = plt.subplots(1, n_img, figsize=self.figsize or (5 * n_img, 4.5))
+            if n_img == 1:
+                axes = [axes]
+            return fig, list(axes), None
+
+    def _draw_images(self, image_axes: List[Any], frame: Dict[str, Any]):
+        """在 image_axes 上绘制各幅图像（不创建新的 colorbar，而是复用已有的）"""
+        plt = self._plt
+        mask = frame['mask']
+        aerial = frame.get('aerial')
+        wafer = frame.get('wafer')
+        error = frame.get('error')
+
+        col_idx = 0
+
+        ax = image_axes[col_idx]
+        ax.imshow(mask, cmap=self.cmap_mask, vmin=0, vmax=1)
+        ax.set_title('Mask')
+        ax.axis('off')
+        col_idx += 1
+
+        if wafer is not None:
+            ax = image_axes[col_idx]
+            ax.imshow(aerial, cmap=self.cmap_aerial, vmin=0, vmax=1)
+            ax.set_title('Aerial Image')
+            ax.axis('off')
+            col_idx += 1
+
+            ax = image_axes[col_idx]
+            ax.imshow(wafer, cmap=self.cmap_wafer, vmin=0, vmax=1)
+            ax.set_title('Wafer Image')
+            ax.axis('off')
+            col_idx += 1
+        else:
+            ax = image_axes[col_idx]
+            if aerial is not None:
+                ax.imshow(aerial, cmap=self.cmap_aerial, vmin=0, vmax=1)
+                ax.set_title('Aerial Image')
+            else:
+                ax.text(0.5, 0.5, 'N/A', ha='center', va='center',
+                        transform=ax.transAxes, fontsize=14)
+                ax.set_title('Aerial Image')
+            ax.axis('off')
+            col_idx += 1
+
+        ax = image_axes[col_idx]
+        if error is not None:
+            vmax = self._error_vmax if self._error_vmax is not None else (
+                float(np.max(error)) if np.max(error) > 0 else 1.0
+            )
+            im = ax.imshow(error, cmap=self.cmap_error, vmin=0, vmax=vmax)
+            cbar_ax = getattr(ax, '_cbar_ax', None)
+            if cbar_ax is None:
+                from mpl_toolkits.axes_grid1 import make_axes_locatable
+                divider = make_axes_locatable(ax)
+                cbar_ax = divider.append_axes('right', size='5%', pad=0.05)
+                ax._cbar_ax = cbar_ax
+                fig = ax.figure
+                fig.colorbar(im, cax=cbar_ax)
+            else:
+                cbar_ax.clear()
+                fig = ax.figure
+                fig.colorbar(im, cax=cbar_ax)
+            ax.set_title(f'Error Map (max={vmax:.3f})')
+        else:
+            ax.text(0.5, 0.5, 'N/A', ha='center', va='center',
+                    transform=ax.transAxes, fontsize=14)
+            ax.set_title('Error Map')
+        ax.axis('off')
+
+    def _draw_convergence(self, conv_ax: Any, frame: Dict[str, Any]):
+        """在 conv_ax 上绘制到当前帧为止的损失曲线"""
+        if self.state is None or not self.state.loss_history:
+            losses = [f['loss'] for f in self._frames]
+        else:
+            losses = list(self.state.loss_history)
+
+        conv_ax.clear()
+        epochs = list(range(1, len(losses) + 1))
+        conv_ax.plot(epochs, losses, 'b-', linewidth=1.2, label='loss')
+        if losses:
+            current_epoch = frame['epoch']
+            current_idx = min(len(losses) - 1, max(0, current_epoch - 1))
+            conv_ax.axvline(x=epochs[current_idx], color='r', linestyle='--',
+                            linewidth=1, alpha=0.7, label=f'current')
+            conv_ax.scatter([epochs[current_idx]], [losses[current_idx]],
+                            color='r', s=25, zorder=5)
+        conv_ax.set_title('Loss Convergence')
+        conv_ax.set_xlabel('Epoch')
+        conv_ax.set_ylabel('Loss')
+        conv_ax.grid(True, alpha=0.3)
+        if losses and min(losses) > 0 and (max(losses) / max(min(losses), 1e-12)) > 100:
+            conv_ax.set_yscale('log')
+        conv_ax.legend(loc='upper right', fontsize=8)
+
+    def _render_frame(self, frame_idx: int) -> Any:
+        """渲染第 frame_idx 帧，返回 matplotlib Figure"""
+        frame = self._frames[frame_idx]
+        fig, image_axes, conv_ax = self._figure_layout()
+        self._draw_images(image_axes, frame)
+        if conv_ax is not None:
+            self._draw_convergence(conv_ax, frame)
+        if self.show_title_info:
+            info = (f"Epoch {frame['epoch']} | "
+                    f"Loss {frame['loss']:.3e} | "
+                    f"LR {frame['learning_rate']:.3e}")
+            fig.suptitle(info, fontsize=12, y=1.02)
+        return fig
+
+    def _generate_animation(self):
+        """使用 FuncAnimation 生成动画并保存"""
+        plt = self._plt
+        animation = self._animation
+        n_frames = len(self._frames)
+
+        fig, image_axes_ref, conv_ax_ref = self._figure_layout()
+        self._draw_images(image_axes_ref, self._frames[0])
+        if conv_ax_ref is not None:
+            self._draw_convergence(conv_ax_ref, self._frames[0])
+        if self.show_title_info:
+            frame = self._frames[0]
+            info = (f"Epoch {frame['epoch']} | "
+                    f"Loss {frame['loss']:.3e} | "
+                    f"LR {frame['learning_rate']:.3e}")
+            fig.suptitle(info, fontsize=12, y=1.02)
+
+        def update(frame_idx: int):
+            """更新第 frame_idx 帧内容（复用已有 figure）"""
+            frame = self._frames[frame_idx]
+            self._draw_images(image_axes_ref, frame)
+            if conv_ax_ref is not None:
+                self._draw_convergence(conv_ax_ref, frame)
+            if self.show_title_info:
+                info = (f"Epoch {frame['epoch']} | "
+                        f"Loss {frame['loss']:.3e} | "
+                        f"LR {frame['learning_rate']:.3e}")
+                fig.suptitle(info, fontsize=12, y=1.02)
+            return []
+
+        ani = animation.FuncAnimation(
+            fig,
+            update,
+            frames=n_frames,
+            interval=int(1000 / max(1, self.fps)),
+            blit=False,
+            repeat=True,
+        )
+
+        save_kwargs = dict(fps=self.fps, dpi=self.dpi)
+
+        if self.output_format == 'gif':
+            filename = f'{self.filename_prefix}.gif'
+            self.output_path = self.save_dir / filename
+            writer = None
+            try:
+                ani.save(str(self.output_path), writer='pillow', **save_kwargs)
+            except Exception as e:
+                logger.debug(f"pillow writer 失败，尝试 imagemagick: {e}")
+                try:
+                    ani.save(str(self.output_path), writer='imagemagick', **save_kwargs)
+                except Exception as e2:
+                    logger.warning(f"GIF 保存失败 (pillow & imagemagick): {e2}")
+                    plt.close(fig)
+                    return
+        elif self.output_format == 'mp4':
+            filename = f'{self.filename_prefix}.mp4'
+            self.output_path = self.save_dir / filename
+            try:
+                writer = animation.FFMpegWriter(
+                    fps=self.fps,
+                    metadata=dict(artist='MaskOptimizer'),
+                    bitrate=2000,
+                )
+                ani.save(str(self.output_path), writer=writer, dpi=self.dpi)
+            except Exception as e:
+                logger.debug(f"ffmpeg writer 失败，回退到 GIF: {e}")
+                try:
+                    filename = f'{self.filename_prefix}.gif'
+                    self.output_path = self.save_dir / filename
+                    ani.save(str(self.output_path), writer='pillow', **save_kwargs)
+                    logger.info("ffmpeg 不可用，已回退为 GIF 格式输出")
+                except Exception as e2:
+                    logger.warning(f"MP4/GIF 保存均失败: {e2}")
+                    plt.close(fig)
+                    return
+        else:
+            logger.warning(f"未知的动画格式: {self.output_format}，回退为 GIF")
+            filename = f'{self.filename_prefix}.gif'
+            self.output_path = self.save_dir / filename
+            ani.save(str(self.output_path), writer='pillow', **save_kwargs)
+
+        plt.close(fig)
+        logger.info(f"优化动画已保存: {self.output_path} (共 {n_frames} 帧, {self.fps} fps)")
+
+    def get_frames(self) -> List[Dict[str, Any]]:
+        """获取所有记录的帧数据"""
+        return list(self._frames)
