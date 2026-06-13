@@ -1161,3 +1161,175 @@ class AnimationCallback(Callback):
     def get_frames(self) -> List[Dict[str, Any]]:
         """获取所有记录的帧数据"""
         return list(self._frames)
+
+
+class ExperimentTrackingCallback(Callback):
+    """
+    实验追踪回调
+
+    将训练过程中的配置、指标、耗时等信息记录到实验追踪系统中。
+    支持 MLflow、WandB 和本地文件后端。
+    """
+
+    def __init__(self,
+                 backend: str = "local",
+                 experiment_name: str = "mask_optimization",
+                 run_name: Optional[str] = None,
+                 tags: Optional[Dict[str, str]] = None,
+                 tracking_dir: str = "./mlruns",
+                 tracking_uri: Optional[str] = None,
+                 wandb_project: Optional[str] = None,
+                 wandb_entity: Optional[str] = None,
+                 log_config: bool = True,
+                 log_metrics_freq: int = 1,
+                 log_system_metrics: bool = False):
+        """
+        初始化实验追踪回调
+
+        Args:
+            backend: 追踪后端: 'local', 'mlflow', 'wandb'
+            experiment_name: 实验名称
+            run_name: 运行名称
+            tags: 标签字典
+            tracking_dir: 本地追踪目录（local 后端）
+            tracking_uri: MLflow tracking URI（mlflow 后端）
+            wandb_project: WandB 项目名（wandb 后端）
+            wandb_entity: WandB 实体名（wandb 后端）
+            log_config: 是否记录配置
+            log_metrics_freq: 记录指标的频率（每多少 epoch 记录一次）
+            log_system_metrics: 是否记录系统指标
+        """
+        super().__init__()
+        self.backend = backend.lower()
+        self.experiment_name = experiment_name
+        self.run_name = run_name
+        self.tags = tags or {}
+        self.tracking_dir = tracking_dir
+        self.tracking_uri = tracking_uri
+        self.wandb_project = wandb_project
+        self.wandb_entity = wandb_entity
+        self.log_config = log_config
+        self.log_metrics_freq = max(1, log_metrics_freq)
+        self.log_system_metrics = log_system_metrics
+
+        self._tracker = None
+        self._run_id: Optional[str] = None
+        self._start_time: float = 0.0
+        self._epoch_count: int = 0
+
+    def _init_tracker(self):
+        """初始化追踪器"""
+        from utils.experiment_tracking import create_tracker
+
+        kwargs = {
+            "experiment_name": self.experiment_name,
+        }
+
+        if self.backend == "local":
+            kwargs["tracking_dir"] = self.tracking_dir
+        elif self.backend == "mlflow":
+            if self.tracking_uri:
+                kwargs["tracking_uri"] = self.tracking_uri
+        elif self.backend == "wandb":
+            if self.wandb_project:
+                kwargs["project"] = self.wandb_project
+            if self.wandb_entity:
+                kwargs["entity"] = self.wandb_entity
+
+        self._tracker = create_tracker(self.backend, **kwargs)
+
+    def on_train_begin(self, logs: Optional[Dict[str, Any]] = None):
+        """训练开始，初始化实验追踪"""
+        try:
+            self._init_tracker()
+
+            tags = dict(self.tags)
+            if self.params:
+                for k, v in self.params.items():
+                    if isinstance(v, (str, int, float, bool)):
+                        tags[f"param_{k}"] = str(v)
+
+            self._run_id = self._tracker.start_run(
+                run_name=self.run_name,
+                tags=tags,
+            )
+            self._start_time = time.time()
+            self._epoch_count = 0
+
+            if self.log_config and self.params:
+                self._tracker.log_config(self.params)
+
+            logger.info(f"实验追踪已启动: {self._run_id} (后端: {self.backend})")
+
+        except Exception as e:
+            logger.warning(f"实验追踪初始化失败，将跳过追踪: {e}")
+            self._tracker = None
+
+    def on_epoch_end(self, epoch: int, logs: Optional[Dict[str, Any]] = None):
+        """每个 epoch 结束，记录指标"""
+        if self._tracker is None:
+            return
+
+        if epoch % self.log_metrics_freq != 0:
+            return
+
+        self._epoch_count = epoch
+
+        try:
+            metrics = {}
+
+            if logs:
+                for key, value in logs.items():
+                    if isinstance(value, (int, float, np.integer, np.floating)):
+                        metrics[key] = float(value)
+
+            if self.state is not None:
+                metrics["learning_rate"] = float(self.state.learning_rate)
+
+            if metrics:
+                self._tracker.log_metrics(metrics, step=epoch)
+
+        except Exception as e:
+            logger.debug(f"记录实验指标失败 (epoch {epoch}): {e}")
+
+    def on_train_end(self, logs: Optional[Dict[str, Any]] = None):
+        """训练结束，记录最终结果和耗时"""
+        if self._tracker is None:
+            return
+
+        try:
+            total_time = time.time() - self._start_time
+            self._tracker.log_metric("total_time", total_time, step=self._epoch_count)
+
+            if self.state is not None:
+                self._tracker.log_metric("best_loss", float(self.state.best_loss), step=self._epoch_count)
+
+            if logs:
+                final_metrics = {}
+                for key, value in logs.items():
+                    if isinstance(value, (int, float, np.integer, np.floating)):
+                        final_metrics[f"final_{key}"] = float(value)
+                if final_metrics:
+                    self._tracker.log_metrics(final_metrics, step=self._epoch_count)
+
+            self._tracker.set_tag("status", "completed")
+            self._tracker.end_run(status="completed")
+
+            logger.info(f"实验追踪已完成: {self._run_id}")
+
+        except Exception as e:
+            logger.warning(f"结束实验追踪时出错: {e}")
+            try:
+                self._tracker.end_run(status="failed")
+            except Exception:
+                pass
+
+    @property
+    def run_id(self) -> Optional[str]:
+        """获取当前运行 ID"""
+        return self._run_id
+
+    @property
+    def tracker(self):
+        """获取底层追踪器"""
+        return self._tracker

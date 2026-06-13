@@ -362,6 +362,19 @@ class OptimizationConfig:
     # 中间掩模历史记录配置（用于批量评估与Pareto前沿分析）
     save_mask_history: bool = False  # 是否在内存中保存每一步的中间掩模
 
+    # 实验追踪配置
+    experiment_tracking_enable: bool = False  # 是否启用实验追踪
+    experiment_tracking_backend: str = 'local'  # 追踪后端: 'local', 'mlflow', 'wandb'
+    experiment_name: str = 'mask_optimization'  # 实验名称
+    run_name: Optional[str] = None  # 运行名称
+    experiment_tags: Optional[Dict[str, str]] = None  # 实验标签
+    tracking_dir: str = './mlruns'  # 本地追踪目录
+    tracking_uri: Optional[str] = None  # MLflow tracking URI
+    wandb_project: Optional[str] = None  # WandB 项目名
+    wandb_entity: Optional[str] = None  # WandB 实体名
+    log_experiment_config: bool = True  # 是否记录配置
+    log_metrics_freq: int = 1  # 记录指标的频率
+
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'OptimizationConfig':
         if d is None:
@@ -845,6 +858,21 @@ class MaskOptimizer:
                         show_convergence=cfg.animation_show_convergence,
                         consistent_error_scale=cfg.animation_consistent_error,
                     ))
+
+            if cfg.experiment_tracking_enable:
+                from algorithms.callbacks import ExperimentTrackingCallback
+                callbacks.append(ExperimentTrackingCallback(
+                    backend=cfg.experiment_tracking_backend,
+                    experiment_name=cfg.experiment_name,
+                    run_name=cfg.run_name,
+                    tags=cfg.experiment_tags,
+                    tracking_dir=cfg.tracking_dir,
+                    tracking_uri=cfg.tracking_uri,
+                    wandb_project=cfg.wandb_project,
+                    wandb_entity=cfg.wandb_entity,
+                    log_config=cfg.log_experiment_config,
+                    log_metrics_freq=cfg.log_metrics_freq,
+                ))
 
     def add_callback(self, callback: Callback):
         """
