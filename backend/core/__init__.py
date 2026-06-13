@@ -63,6 +63,21 @@ from core.test_structures import (
     SRAMBitcellGenerator,
     generate_test_structure,
 )
+from core.litho_metrics import (
+    extract_edges,
+    compute_epe,
+    compute_cd,
+    compute_cd_error,
+    compute_ils,
+    compute_nils,
+    compute_process_window_area,
+    compute_meef,
+    compute_meef_simple,
+    LithoMetricsResult,
+    evaluate_litho_metrics,
+    ProcessWindowScanResult,
+    extract_process_window_scan,
+)
 
 __all__ = [
     'OpticalSystem',
@@ -132,4 +147,17 @@ __all__ = [
     'TJunctionGenerator',
     'SRAMBitcellGenerator',
     'generate_test_structure',
+    'extract_edges',
+    'compute_epe',
+    'compute_cd',
+    'compute_cd_error',
+    'compute_ils',
+    'compute_nils',
+    'compute_process_window_area',
+    'compute_meef',
+    'compute_meef_simple',
+    'LithoMetricsResult',
+    'evaluate_litho_metrics',
+    'ProcessWindowScanResult',
+    'extract_process_window_scan',
 ]

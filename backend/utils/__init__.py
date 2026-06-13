@@ -10,7 +10,11 @@ from utils.data_io import (
     save_hdf5_results, load_hdf5_results,
     save_optimization_result
 )
-from utils.visualization import plot_mask, plot_frequency_domain, plot_wafer_image, plot_error_curve, plot_comparison
+from utils.visualization import (
+    plot_mask, plot_frequency_domain, plot_wafer_image, plot_error_curve,
+    plot_comparison, plot_bossung, plot_process_window_heatmap,
+    plot_process_window_summary, plot_multi_metric_heatmaps
+)
 from utils.logger import setup_logger, get_logger
 from utils.config import load_config, save_config, save_results
 
@@ -31,6 +35,10 @@ __all__ = [
     'plot_wafer_image',
     'plot_error_curve',
     'plot_comparison',
+    'plot_bossung',
+    'plot_process_window_heatmap',
+    'plot_process_window_summary',
+    'plot_multi_metric_heatmaps',
     'setup_logger',
     'get_logger',
     'load_config',

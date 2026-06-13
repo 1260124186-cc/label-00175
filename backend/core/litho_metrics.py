@@ -668,3 +668,136 @@ def evaluate_litho_metrics(
         pw_area={},
         meef={},
     )
+
+
+@dataclass
+class ProcessWindowScanResult:
+    """
+    Focus-Dose 工艺窗口扫描结果
+
+    用于存储在 focus-dose 网格上各工艺条件的评估指标，
+    为 Bossung 图和可打印区域热力图提供数据。
+    """
+    focus_values: np.ndarray
+    dose_values: np.ndarray
+    unique_focus: np.ndarray
+    unique_dose: np.ndarray
+    cd_matrix: np.ndarray
+    cd_error_matrix: np.ndarray
+    epe_matrix: np.ndarray
+    mse_matrix: np.ndarray
+    ssim_matrix: np.ndarray
+    ils_matrix: np.ndarray
+    nils_matrix: np.ndarray
+    passing_mask: Optional[np.ndarray] = None
+
+    @property
+    def n_focus(self) -> int:
+        return len(self.unique_focus)
+
+    @property
+    def n_dose(self) -> int:
+        return len(self.unique_dose)
+
+
+def extract_process_window_scan(
+        multi_result,
+        target_binary: np.ndarray,
+        cd_target: Optional[float] = None,
+        cd_tolerance: float = 0.1,
+        pixel_size: float = 1.0,
+        threshold: float = 0.3) -> ProcessWindowScanResult:
+    """
+    从多工艺仿真结果中提取 focus-dose 扫描的指标矩阵
+
+    对每个 (focus, dose) 工艺条件，计算 CD、CD误差、EPE、MSE、SSIM、ILS、NILS 等指标，
+    并整理为二维矩阵形式，便于后续可视化。
+
+    Args:
+        multi_result: MultiProcessSimulationResult 实例
+        target_binary: 二值化目标图像
+        cd_target: 目标CD (nm)；None 则从目标图自动测量
+        cd_tolerance: CD 相对容差，用于判定可打印区域
+        pixel_size: 像素尺寸 (nm)
+        threshold: 光刻胶阈值
+
+    Returns:
+        ProcessWindowScanResult，包含各指标的二维矩阵
+    """
+    from core.metrics import mse, ssim
+
+    conditions = multi_result.conditions
+    wafer_images = multi_result.wafer_images
+    aerial_images = multi_result.aerial_images
+
+    n = len(conditions)
+    if n == 0:
+        raise ValueError("工艺条件列表为空")
+
+    focus_values = np.array([c.defocus for c in conditions], dtype=np.float64)
+    dose_values = np.array([c.dose for c in conditions], dtype=np.float64)
+
+    unique_focus = np.sort(np.unique(focus_values))
+    unique_dose = np.sort(np.unique(dose_values))
+    n_f = len(unique_focus)
+    n_d = len(unique_dose)
+
+    focus_to_idx = {f: i for i, f in enumerate(unique_focus)}
+    dose_to_idx = {d: j for j, d in enumerate(unique_dose)}
+
+    cd_matrix = np.full((n_f, n_d), np.nan)
+    cd_error_matrix = np.full((n_f, n_d), np.nan)
+    epe_matrix = np.full((n_f, n_d), np.nan)
+    mse_matrix = np.full((n_f, n_d), np.nan)
+    ssim_matrix = np.full((n_f, n_d), np.nan)
+    ils_matrix = np.full((n_f, n_d), np.nan)
+    nils_matrix = np.full((n_f, n_d), np.nan)
+
+    if cd_target is None:
+        cd_target = compute_cd(target_binary, pixel_size=pixel_size)['cd_mean']
+
+    for idx in range(n):
+        fi = focus_to_idx[focus_values[idx]]
+        di = dose_to_idx[dose_values[idx]]
+
+        wafer = wafer_images[idx]
+        wafer_bin = (wafer >= threshold).astype(np.float64)
+
+        cd_info = compute_cd(wafer_bin, pixel_size=pixel_size)
+        cd_matrix[fi, di] = cd_info['cd_mean']
+
+        cd_err_info = compute_cd_error(wafer_bin, target_binary, pixel_size=pixel_size)
+        cd_error_matrix[fi, di] = cd_err_info['cd_error_mean']
+
+        epe_info = compute_epe(wafer_bin, target_binary, pixel_size=pixel_size)
+        epe_matrix[fi, di] = epe_info['epe_mean']
+
+        mse_matrix[fi, di] = mse(wafer, target_binary)
+        ssim_matrix[fi, di] = ssim(wafer, target_binary)
+
+        if idx < len(aerial_images) and aerial_images[idx] is not None:
+            ils_info = compute_ils(aerial_images[idx], threshold=threshold, pixel_size=pixel_size)
+            ils_matrix[fi, di] = ils_info['ils_mean']
+            if cd_target and cd_target > 0:
+                nils_info = compute_nils(aerial_images[idx], cd_target=cd_target,
+                                         threshold=threshold, pixel_size=pixel_size)
+                nils_matrix[fi, di] = nils_info['nils_mean']
+
+    cd_lower = cd_target * (1.0 - cd_tolerance)
+    cd_upper = cd_target * (1.0 + cd_tolerance)
+    passing_mask = (cd_matrix >= cd_lower) & (cd_matrix <= cd_upper)
+
+    return ProcessWindowScanResult(
+        focus_values=focus_values,
+        dose_values=dose_values,
+        unique_focus=unique_focus,
+        unique_dose=unique_dose,
+        cd_matrix=cd_matrix,
+        cd_error_matrix=cd_error_matrix,
+        epe_matrix=epe_matrix,
+        mse_matrix=mse_matrix,
+        ssim_matrix=ssim_matrix,
+        ils_matrix=ils_matrix,
+        nils_matrix=nils_matrix,
+        passing_mask=passing_mask,
+    )
