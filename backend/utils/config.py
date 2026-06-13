@@ -209,7 +209,8 @@ def create_default_config() -> Dict[str, Any]:
                 'sigma_outer': 0.75
             },
             'use_socs': True,
-            'socs_num_terms': 5
+            'socs_num_terms': 5,
+            'tcc_mode': 'socs'
         },
         'optimization': {
             'optimizer_type': 'gradient_descent',
@@ -286,6 +287,13 @@ def validate_config(config: Dict[str, Any]) -> bool:
     # 验证SOCS参数
     if optics.get('socs_num_terms', 5) <= 0:
         logger.error("SOCS分解项数必须为正整数")
+        return False
+
+    # 验证 TCC 模式
+    valid_tcc_modes = ['full_tcc', 'socs', 'kernel_2d']
+    tcc_mode = optics.get('tcc_mode', None)
+    if tcc_mode is not None and tcc_mode not in valid_tcc_modes:
+        logger.error(f"tcc_mode 必须为以下之一: {valid_tcc_modes}")
         return False
 
     # 验证光源参数

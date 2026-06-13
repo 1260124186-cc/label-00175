@@ -29,8 +29,9 @@ base_optics:
   source_params:
     sigma_inner: 0.0
     sigma_outer: 0.75
-  use_socs: true
+  tcc_mode: socs
   socs_num_terms: 5
+  use_socs: true       # [已弃用] 向后兼容
 
 scenarios:
   ideal:

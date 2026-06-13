@@ -17,6 +17,7 @@ from core.imaging import (
     ResistThresholdMode,
     ResistModel,
     IlluminationType,
+    TCCMode,
     generate_source,
     compute_tcc_kernel_2d,
     socs_decomposition,
@@ -521,12 +522,13 @@ class TestVisualizationHelpers:
         assert tcc_img.shape == (32, 32)
 
     def test_get_tcc_image_with_socs(self):
-        """测试获取TCC图像（SOCS模式返回None）"""
+        """测试获取TCC图像（SOCS模式也返回2D核对角近似，便于可视化）"""
         optics = OpticalSystem(use_socs=True)
         imaging = PartialCoherentImaging(optics, (32, 32))
 
         tcc_img = imaging.get_tcc_image()
-        assert tcc_img is None
+        assert tcc_img is not None
+        assert tcc_img.shape == (32, 32)
 
 
 class TestSigmoidThreshold:
@@ -1423,3 +1425,321 @@ class TestSimulateWaferWithWindowPadding:
             mask, window_type=None, pad_width=None, apply_resist=False
         )
         np.testing.assert_array_almost_equal(wafer_old, wafer_new)
+
+
+class TestTCCMode:
+    """TCCMode 枚举测试"""
+
+    def test_tcc_modes_exist(self):
+        """测试三种 TCC 模式存在"""
+        assert TCCMode.FULL_TCC.value == "full_tcc"
+        assert TCCMode.SOCS.value == "socs"
+        assert TCCMode.KERNEL_2D.value == "kernel_2d"
+
+    def test_tcc_mode_from_string(self):
+        """测试从字符串创建 TCCMode"""
+        assert TCCMode("full_tcc") == TCCMode.FULL_TCC
+        assert TCCMode("socs") == TCCMode.SOCS
+        assert TCCMode("kernel_2d") == TCCMode.KERNEL_2D
+
+    def test_invalid_tcc_mode_raises(self):
+        """测试无效 TCC 模式抛出异常"""
+        with pytest.raises(ValueError):
+            TCCMode("invalid_mode")
+
+
+class TestOpticalSystemTCCMode:
+    """OpticalSystem 的 TCC 模式配置测试"""
+
+    def test_default_tcc_mode_is_socs(self):
+        """测试默认 TCC 模式为 SOCS"""
+        optics = OpticalSystem()
+        assert optics.tcc_mode == TCCMode.SOCS
+
+    def test_custom_tcc_mode_full(self):
+        """测试自定义 FULL_TCC 模式"""
+        optics = OpticalSystem(tcc_mode=TCCMode.FULL_TCC)
+        assert optics.tcc_mode == TCCMode.FULL_TCC
+
+    def test_custom_tcc_mode_kernel_2d(self):
+        """测试自定义 KERNEL_2D 模式"""
+        optics = OpticalSystem(tcc_mode=TCCMode.KERNEL_2D)
+        assert optics.tcc_mode == TCCMode.KERNEL_2D
+
+    def test_use_socs_true_backward_compat(self):
+        """测试 use_socs=True 向后兼容（转换为 SOCS 模式）"""
+        optics = OpticalSystem(use_socs=True)
+        assert optics.tcc_mode == TCCMode.SOCS
+        assert optics.use_socs == True
+
+    def test_use_socs_false_backward_compat(self):
+        """测试 use_socs=False 向后兼容（转换为 FULL_TCC 模式）"""
+        optics = OpticalSystem(use_socs=False)
+        assert optics.tcc_mode == TCCMode.FULL_TCC
+        assert optics.use_socs == False
+
+    def test_tcc_mode_overrides_use_socs(self):
+        """测试 tcc_mode 优先于 use_socs"""
+        optics = OpticalSystem(tcc_mode=TCCMode.KERNEL_2D, use_socs=True)
+        assert optics.tcc_mode == TCCMode.KERNEL_2D
+        assert optics.use_socs == True
+
+    def test_from_config_with_tcc_mode(self):
+        """测试从配置创建（tcc_mode 格式）"""
+        config = {
+            'optical_system': {
+                'tcc_mode': 'kernel_2d',
+                'socs_num_terms': 10
+            }
+        }
+        optics = OpticalSystem.from_config(config)
+        assert optics.tcc_mode == TCCMode.KERNEL_2D
+        assert optics.socs_num_terms == 10
+
+    def test_from_config_with_use_socs_backward_compat(self):
+        """测试从配置创建（use_socs 旧格式向后兼容）"""
+        config = {
+            'optical_system': {
+                'use_socs': False
+            }
+        }
+        optics = OpticalSystem.from_config(config)
+        assert optics.tcc_mode == TCCMode.FULL_TCC
+
+    def test_from_config_tcc_mode_priority(self):
+        """测试 tcc_mode 优先级高于 use_socs"""
+        config = {
+            'optical_system': {
+                'tcc_mode': 'kernel_2d',
+                'use_socs': True
+            }
+        }
+        optics = OpticalSystem.from_config(config)
+        assert optics.tcc_mode == TCCMode.KERNEL_2D
+
+    def test_to_dict_includes_tcc_mode(self):
+        """测试 to_dict 包含 tcc_mode"""
+        optics = OpticalSystem(tcc_mode=TCCMode.FULL_TCC)
+        d = optics.to_dict()
+        assert 'tcc_mode' in d
+        assert d['tcc_mode'] == 'full_tcc'
+        assert 'use_socs' not in d
+
+
+class TestTCCModesImaging:
+    """三种 TCC 模式下的成像测试"""
+
+    @pytest.fixture
+    def mask(self):
+        mask = np.zeros((32, 32))
+        mask[8:24, 8:24] = 1.0
+        return mask
+
+    def test_full_tcc_imaging_shape(self, mask):
+        """测试 FULL_TCC 模式成像输出形状"""
+        optics = OpticalSystem(tcc_mode=TCCMode.FULL_TCC, pixel_size=5.0, sigma=0.5)
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        aerial = imaging.compute_aerial_image(mask)
+        assert aerial.shape == (32, 32)
+        assert aerial.min() >= 0
+        assert aerial.max() <= 1
+
+    def test_socs_imaging_shape(self, mask):
+        """测试 SOCS 模式成像输出形状"""
+        optics = OpticalSystem(tcc_mode=TCCMode.SOCS, socs_num_terms=5, pixel_size=5.0, sigma=0.5)
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        aerial = imaging.compute_aerial_image(mask)
+        assert aerial.shape == (32, 32)
+        assert aerial.min() >= 0
+        assert aerial.max() <= 1
+
+    def test_kernel_2d_imaging_shape(self, mask):
+        """测试 KERNEL_2D 模式成像输出形状"""
+        optics = OpticalSystem(tcc_mode=TCCMode.KERNEL_2D, pixel_size=5.0, sigma=0.5)
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        aerial = imaging.compute_aerial_image(mask)
+        assert aerial.shape == (32, 32)
+        assert aerial.min() >= 0
+        assert aerial.max() <= 1
+
+    def test_socs_approx_full_tcc(self, mask):
+        """测试 SOCS 近似与 FULL_TCC 参考结果相近（使用较多 SOCS 项）"""
+        pixel_size = 5.0
+        optics_full = OpticalSystem(tcc_mode=TCCMode.FULL_TCC, pixel_size=pixel_size, sigma=0.5)
+        imaging_full = PartialCoherentImaging(optics_full, (32, 32))
+        aerial_full = imaging_full.compute_aerial_image(mask)
+
+        optics_socs = OpticalSystem(tcc_mode=TCCMode.SOCS, socs_num_terms=15,
+                                    pixel_size=pixel_size, sigma=0.5)
+        imaging_socs = PartialCoherentImaging(optics_socs, (32, 32))
+        aerial_socs = imaging_socs.compute_aerial_image(mask)
+
+        assert np.mean(np.abs(aerial_full - aerial_socs)) < 0.1
+
+    def test_kernel_2d_fastest_approximate(self, mask):
+        """测试 KERNEL_2D 模式输出为有效图像（近似但有效）"""
+        optics = OpticalSystem(tcc_mode=TCCMode.KERNEL_2D, pixel_size=5.0, sigma=0.5)
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        aerial = imaging.compute_aerial_image(mask)
+
+        assert aerial.shape == (32, 32)
+        assert np.all(aerial >= 0)
+        assert np.all(aerial <= 1)
+        assert np.std(aerial) > 0.01
+
+    def test_uniform_mask_all_modes(self):
+        """测试均匀掩模在所有模式下输出接近均匀"""
+        mask = np.ones((32, 32))
+        pixel_size = 5.0
+
+        for mode in [TCCMode.FULL_TCC, TCCMode.SOCS, TCCMode.KERNEL_2D]:
+            optics = OpticalSystem(tcc_mode=mode, socs_num_terms=10, pixel_size=pixel_size, sigma=0.5)
+            imaging = PartialCoherentImaging(optics, (32, 32))
+            aerial = imaging.compute_aerial_image(mask)
+            assert np.std(aerial) < 0.15
+
+    def test_get_tcc_image_kernel_2d(self):
+        """测试 KERNEL_2D 模式下 get_tcc_image 返回 2D 核"""
+        optics = OpticalSystem(tcc_mode=TCCMode.KERNEL_2D, pixel_size=5.0, sigma=0.5)
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        tcc_img = imaging.get_tcc_image()
+        assert tcc_img is not None
+        assert tcc_img.shape == (32, 32)
+
+    def test_get_tcc_image_all_modes(self):
+        """测试所有模式下 get_tcc_image 均返回 2D 核（向后兼容）"""
+        for mode in [TCCMode.FULL_TCC, TCCMode.SOCS, TCCMode.KERNEL_2D]:
+            optics = OpticalSystem(tcc_mode=mode, socs_num_terms=5, pixel_size=5.0, sigma=0.5)
+            imaging = PartialCoherentImaging(optics, (32, 32))
+            tcc_img = imaging.get_tcc_image()
+            assert tcc_img is not None
+            assert tcc_img.shape == (32, 32)
+
+
+class TestTCCModesGradient:
+    """三种 TCC 模式下的梯度测试"""
+
+    @pytest.fixture
+    def mask(self):
+        return np.random.random((32, 32))
+
+    def test_full_tcc_gradient_shape(self, mask):
+        """测试 FULL_TCC 模式梯度形状"""
+        optics = OpticalSystem(tcc_mode=TCCMode.FULL_TCC, pixel_size=5.0, sigma=0.5)
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        grad = imaging.compute_image_gradient(mask)
+        assert grad.shape == (32, 32)
+
+    def test_socs_gradient_shape(self, mask):
+        """测试 SOCS 模式梯度形状"""
+        optics = OpticalSystem(tcc_mode=TCCMode.SOCS, socs_num_terms=5, pixel_size=5.0, sigma=0.5)
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        grad = imaging.compute_image_gradient(mask)
+        assert grad.shape == (32, 32)
+
+    def test_kernel_2d_gradient_shape(self, mask):
+        """测试 KERNEL_2D 模式梯度形状"""
+        optics = OpticalSystem(tcc_mode=TCCMode.KERNEL_2D, pixel_size=5.0, sigma=0.5)
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        grad = imaging.compute_image_gradient(mask)
+        assert grad.shape == (32, 32)
+
+    def test_full_tcc_gradient_finite(self, mask):
+        """测试 FULL_TCC 梯度为有限值"""
+        optics = OpticalSystem(tcc_mode=TCCMode.FULL_TCC, pixel_size=5.0, sigma=0.5)
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        grad = imaging.compute_image_gradient(mask)
+        assert np.all(np.isfinite(grad))
+
+    def test_socs_gradient_finite(self, mask):
+        """测试 SOCS 梯度为有限值"""
+        optics = OpticalSystem(tcc_mode=TCCMode.SOCS, socs_num_terms=5, pixel_size=5.0, sigma=0.5)
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        grad = imaging.compute_image_gradient(mask)
+        assert np.all(np.isfinite(grad))
+
+    def test_kernel_2d_gradient_finite(self, mask):
+        """测试 KERNEL_2D 梯度为有限值"""
+        optics = OpticalSystem(tcc_mode=TCCMode.KERNEL_2D, pixel_size=5.0, sigma=0.5)
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        grad = imaging.compute_image_gradient(mask)
+        assert np.all(np.isfinite(grad))
+
+    def test_source_gradient_full_tcc(self, mask):
+        """测试 FULL_TCC 模式光源梯度"""
+        optics = OpticalSystem(tcc_mode=TCCMode.FULL_TCC, pixel_size=5.0, sigma=0.5)
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        grad = imaging.compute_source_gradient(mask)
+        assert grad.shape == (32, 32)
+        assert np.all(grad >= 0)
+
+    def test_source_gradient_socs(self, mask):
+        """测试 SOCS 模式光源梯度"""
+        optics = OpticalSystem(tcc_mode=TCCMode.SOCS, socs_num_terms=5, pixel_size=5.0, sigma=0.5)
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        grad = imaging.compute_source_gradient(mask)
+        assert grad.shape == (32, 32)
+        assert np.all(grad >= 0)
+
+    def test_source_gradient_kernel_2d_zero(self, mask):
+        """测试 KERNEL_2D 模式光源梯度为零（近似模式不支持）"""
+        optics = OpticalSystem(tcc_mode=TCCMode.KERNEL_2D, pixel_size=5.0, sigma=0.5)
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        grad = imaging.compute_source_gradient(mask)
+        assert grad.shape == (32, 32)
+        assert np.all(grad == 0.0)
+
+
+class TestTCCModeUpdateSource:
+    """更新光源后重新计算传递函数测试"""
+
+    def test_update_source_full_tcc(self):
+        """测试 FULL_TCC 模式更新光源"""
+        optics = OpticalSystem(tcc_mode=TCCMode.FULL_TCC, pixel_size=5.0, sigma=0.5)
+        imaging = PartialCoherentImaging(optics, (32, 32))
+
+        new_source = np.random.random((32, 32))
+        new_source = new_source / np.sum(new_source)
+        imaging.update_source(new_source)
+
+        mask = np.random.random((32, 32))
+        aerial = imaging.compute_aerial_image(mask)
+        assert aerial.shape == (32, 32)
+
+    def test_update_source_socs(self):
+        """测试 SOCS 模式更新光源重新分解"""
+        optics = OpticalSystem(tcc_mode=TCCMode.SOCS, socs_num_terms=5, pixel_size=5.0, sigma=0.5)
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        old_eigenvalues = imaging.socs_eigenvalues.copy()
+
+        new_source = np.random.random((32, 32))
+        new_source = new_source / np.sum(new_source)
+        imaging.update_source(new_source)
+
+        assert imaging.socs_eigenvalues is not None
+        assert not np.array_equal(imaging.socs_eigenvalues, old_eigenvalues)
+
+    def test_update_source_kernel_2d(self):
+        """测试 KERNEL_2D 模式更新光源重新计算核"""
+        optics = OpticalSystem(tcc_mode=TCCMode.KERNEL_2D, pixel_size=5.0, sigma=0.5)
+        imaging = PartialCoherentImaging(optics, (32, 32))
+        old_kernel = imaging.tcc_kernel.copy()
+
+        new_source = np.random.random((32, 32))
+        new_source = new_source / np.sum(new_source)
+        imaging.update_source(new_source)
+
+        assert imaging.tcc_kernel is not None
+        assert not np.array_equal(imaging.tcc_kernel, old_kernel)
+
+
+class TestProcessConditionTCCMode:
+    """ProcessCondition 的 TCC 模式传递测试"""
+
+    def test_to_optical_system_preserves_tcc_mode(self):
+        """测试 to_optical_system 保留 tcc_mode"""
+        base = OpticalSystem(tcc_mode=TCCMode.KERNEL_2D, socs_num_terms=8)
+        cond = ProcessCondition(defocus=50.0)
+        opt = cond.to_optical_system(base_optics=base)
+        assert opt.tcc_mode == TCCMode.KERNEL_2D
+        assert opt.socs_num_terms == 8

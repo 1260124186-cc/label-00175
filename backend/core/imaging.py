@@ -77,6 +77,18 @@ class IlluminationType(Enum):
     CUSTOM = "custom"                 # 自定义照明
 
 
+class TCCMode(Enum):
+    """TCC 计算模式类型
+
+    - FULL_TCC: 完整 TCC 矩阵（光源积分法），精度最高，复杂度 O(M·N² log N)
+    - SOCS: SOCS (Sum of Coherent Systems) 低秩近似，复杂度 O(K·N² log N)
+    - KERNEL_2D: 二维 TCC 核对角近似，最快，复杂度 O(N² log N)，精度最低
+    """
+    FULL_TCC = "full_tcc"
+    SOCS = "socs"
+    KERNEL_2D = "kernel_2d"
+
+
 @dataclass
 class ProcessCondition:
     """
@@ -162,7 +174,7 @@ class ProcessCondition:
                 magnification=base_optics.magnification,
                 illumination_type=base_optics.illumination_type,
                 source_params=dict(base_optics.source_params),
-                use_socs=base_optics.use_socs,
+                tcc_mode=base_optics.tcc_mode,
                 socs_num_terms=base_optics.socs_num_terms,
                 custom_source=base_optics.custom_source,
                 zernike_coefficients=merged_zernike
@@ -379,8 +391,9 @@ class OpticalSystem:
             - dipole: {'sigma_inner': 0.5, 'sigma_outer': 0.8, 'angle': 0.0, 'opening_angle': 60.0}
             - annular: {'sigma_inner': 0.6, 'sigma_outer': 0.9}
             - quasar: {'sigma_inner': 0.5, 'sigma_outer': 0.8, 'angle': 45.0, 'opening_angle': 30.0}
-        use_socs: 是否使用SOCS低秩分解近似
-        socs_num_terms: SOCS分解项数
+        tcc_mode: TCC 计算模式 (full_tcc / socs / kernel_2d)
+        socs_num_terms: SOCS 分解项数（仅 SOCS 模式生效）
+        use_socs: [已弃用] 是否使用 SOCS 低秩分解近似，向后兼容
         custom_source: 自定义光源分布（当illumination_type=CUSTOM时使用）
     """
     wavelength: float = 193.0  # ArF光源波长
@@ -391,15 +404,30 @@ class OpticalSystem:
     magnification: float = 4.0  # 放大倍率
     illumination_type: IlluminationType = IlluminationType.CONVENTIONAL
     source_params: Dict[str, float] = field(default_factory=dict)
-    use_socs: bool = True
+    tcc_mode: Optional[TCCMode] = None
     socs_num_terms: int = 5
+    use_socs: Optional[bool] = None
     custom_source: Optional[np.ndarray] = None
     zernike_coefficients: Dict[int, float] = field(default_factory=dict)
 
     def __post_init__(self):
-        """初始化后处理，设置默认光源参数"""
+        """初始化后处理：设置默认光源参数，处理 use_socs 向后兼容
+
+        tcc_mode 优先级高于 use_socs：
+        - 若显式指定 tcc_mode，直接使用
+        - 否则若指定 use_socs，从 use_socs 推导
+        - 否则默认为 SOCS 模式
+        """
         if not self.source_params:
             self._set_default_source_params()
+        if self.tcc_mode is None:
+            if self.use_socs is not None:
+                if self.use_socs:
+                    self.tcc_mode = TCCMode.SOCS
+                else:
+                    self.tcc_mode = TCCMode.FULL_TCC
+            else:
+                self.tcc_mode = TCCMode.SOCS
 
     def _set_default_source_params(self):
         """设置默认光源参数"""
@@ -452,6 +480,19 @@ class OpticalSystem:
         except ValueError:
             illumination_type = IlluminationType.CONVENTIONAL
 
+        tcc_mode_str = optics_config.get('tcc_mode', None)
+        if tcc_mode_str is not None:
+            try:
+                tcc_mode = TCCMode(tcc_mode_str)
+            except ValueError:
+                tcc_mode = TCCMode.SOCS
+        else:
+            use_socs = optics_config.get('use_socs', None)
+            if use_socs is not None:
+                tcc_mode = TCCMode.SOCS if use_socs else TCCMode.FULL_TCC
+            else:
+                tcc_mode = TCCMode.SOCS
+
         source_params = optics_config.get('source_params', {})
 
         zernike_raw = optics_config.get('zernike_coefficients', {})
@@ -466,7 +507,7 @@ class OpticalSystem:
             magnification=optics_config.get('magnification', 4.0),
             illumination_type=illumination_type,
             source_params=source_params,
-            use_socs=optics_config.get('use_socs', True),
+            tcc_mode=tcc_mode,
             socs_num_terms=optics_config.get('socs_num_terms', 5),
             zernike_coefficients=zernike_coefficients
         )
@@ -497,7 +538,7 @@ class OpticalSystem:
             'magnification': self.magnification,
             'illumination_type': self.illumination_type.value,
             'source_params': self.source_params,
-            'use_socs': self.use_socs,
+            'tcc_mode': self.tcc_mode.value,
             'socs_num_terms': self.socs_num_terms,
             'zernike_coefficients': zernike_out if zernike_out else {}
         }
@@ -1360,32 +1401,41 @@ class PartialCoherentImaging:
         )
 
     def _compute_transfer_functions(self):
-        """计算传递函数（TCC或SOCS分解）"""
+        """计算传递函数（根据 tcc_mode 选择 FULL_TCC / SOCS / KERNEL_2D）"""
         cutoff = self.optics.cutoff_frequency
+        mode = self.optics.tcc_mode
 
-        if self.optics.use_socs:
+        self.tcc_kernel = compute_tcc_kernel_2d(
+            self.fx, self.fy,
+            self.pupil, self.source,
+            cutoff, self.dfx, self.dfy
+        )
+        self.tcc_full = None
+
+        if mode == TCCMode.SOCS:
             self.socs_eigenvalues, self.socs_eigenfunctions = socs_decomposition(
                 self.fx, self.fy,
                 self.pupil, self.source,
                 cutoff, self.dfx, self.dfy,
                 self.optics.socs_num_terms
             )
-            self.tcc = None
         else:
-            self.tcc = compute_tcc_kernel_2d(
-                self.fx, self.fy,
-                self.pupil, self.source,
-                cutoff, self.dfx, self.dfy
-            )
             self.socs_eigenvalues = None
             self.socs_eigenfunctions = None
+
+    @property
+    def tcc(self) -> Optional[np.ndarray]:
+        """向后兼容：返回 2D TCC 核对角近似"""
+        return self.tcc_kernel
 
     def compute_aerial_image(self, mask: np.ndarray) -> np.ndarray:
         """
         计算空间像（晶圆上的光强分布）
 
-        使用Hopkins公式: I = ∫ S(fs) * |FFT^{-1}[M(f) * P(f - fs)]|^2 dfs
-        或通过SOCS分解加速计算
+        支持三种 TCC 计算模式：
+        - FULL_TCC: 光源积分法（Hopkins公式），精度最高，复杂度 O(M·N² log N)
+        - SOCS: SOCS 低秩近似，复杂度 O(K·N² log N)
+        - KERNEL_2D: 二维 TCC 核对角近似，最快，复杂度 O(N² log N)
 
         如果初始化时指定了窗函数和/或零填充，会在FFT前对掩模
         做加窗和零填充处理，计算完成后裁剪回原始尺寸。
@@ -1399,17 +1449,24 @@ class PartialCoherentImaging:
         processed_mask = self._preprocess_mask(mask)
         mask_c = processed_mask.astype(np.complex128)
         ny_eff, nx_eff = processed_mask.shape
+        mode = self.optics.tcc_mode
 
-        if self.optics.use_socs and self.socs_eigenvalues is not None:
+        if mode == TCCMode.SOCS and self.socs_eigenvalues is not None:
             intensity = np.zeros((ny_eff, nx_eff), dtype=np.float64)
             mask_spectrum = np.fft.fft2(mask_c)
 
-            for i, (lam, phi) in enumerate(zip(self.socs_eigenvalues, self.socs_eigenfunctions)):
+            for lam, phi in zip(self.socs_eigenvalues, self.socs_eigenfunctions):
                 if lam < 1e-10:
                     continue
                 filtered = mask_spectrum * phi
                 field_i = np.fft.ifft2(filtered)
                 intensity += lam * np.abs(field_i)**2
+        elif mode == TCCMode.KERNEL_2D and self.tcc_kernel is not None:
+            mask_spectrum = np.fft.fft2(mask_c)
+            effective_pupil = np.sqrt(np.maximum(self.tcc_kernel, 0.0))
+            filtered = mask_spectrum * effective_pupil
+            field = np.fft.ifft2(filtered)
+            intensity = np.abs(field)**2
         else:
             intensity = np.zeros((ny_eff, nx_eff), dtype=np.float64)
             mask_spectrum = np.fft.fft2(mask_c)
@@ -1451,6 +1508,8 @@ class PartialCoherentImaging:
         """
         计算空间像对掩模的梯度（用于优化）
 
+        支持三种 TCC 计算模式。
+
         如果启用了窗函数，梯度会自动乘以窗函数以保持链式法则一致性。
 
         Args:
@@ -1465,8 +1524,9 @@ class PartialCoherentImaging:
         gradient = np.zeros((ny_eff, nx_eff), dtype=np.float64)
         mask_spectrum = np.fft.fft2(mask_c)
         cutoff = self.optics.cutoff_frequency
+        mode = self.optics.tcc_mode
 
-        if self.optics.use_socs and self.socs_eigenvalues is not None:
+        if mode == TCCMode.SOCS and self.socs_eigenvalues is not None:
             for lam, phi in zip(self.socs_eigenvalues, self.socs_eigenfunctions):
                 if lam < 1e-10:
                     continue
@@ -1474,6 +1534,12 @@ class PartialCoherentImaging:
                 field_i = np.fft.ifft2(filtered)
                 grad_field_i = np.fft.ifft2(phi)
                 gradient += 2 * lam * np.real(np.conj(field_i) * grad_field_i)
+        elif mode == TCCMode.KERNEL_2D and self.tcc_kernel is not None:
+            effective_pupil = np.sqrt(np.maximum(self.tcc_kernel, 0.0))
+            filtered = mask_spectrum * effective_pupil
+            field = np.fft.ifft2(filtered)
+            grad_field = np.fft.ifft2(effective_pupil)
+            gradient = 2.0 * np.real(np.conj(field) * grad_field)
         else:
             source_indices = np.where(self.source > 1e-10)
             source_values = self.source[source_indices]
@@ -1517,9 +1583,12 @@ class PartialCoherentImaging:
         return np.fft.fftshift(np.abs(self.pupil))
 
     def get_tcc_image(self) -> Optional[np.ndarray]:
-        """获取TCC核图像（fftshift后便于可视化）"""
-        if self.tcc is not None:
-            return np.fft.fftshift(self.tcc)
+        """获取TCC核图像（fftshift后便于可视化）
+
+        返回 2D TCC 核对角近似（fftshift 后）。所有模式下均可用。
+        """
+        if self.tcc_kernel is not None:
+            return np.fft.fftshift(self.tcc_kernel)
         return None
 
     def update_source(self, new_source: np.ndarray) -> None:
@@ -1554,6 +1623,8 @@ class PartialCoherentImaging:
         注意：返回的是每个光源点对空间像的梯度贡献，需要进一步
         与损失函数对空间像的梯度链式相乘。
 
+        KERNEL_2D 模式下不支持光源梯度计算（2D核对角近似下光源信息已被积分掉）。
+
         Args:
             mask: 掩模图案
 
@@ -1565,8 +1636,11 @@ class PartialCoherentImaging:
         gradient = np.zeros((ny, nx), dtype=np.float64)
         mask_spectrum = np.fft.fft2(mask_c)
         cutoff = self.optics.cutoff_frequency
+        mode = self.optics.tcc_mode
 
-        if self.optics.use_socs and self.socs_eigenvalues is not None:
+        if mode == TCCMode.KERNEL_2D:
+            return gradient.astype(np.float64)
+        elif mode == TCCMode.SOCS and self.socs_eigenvalues is not None:
             for lam, phi in zip(self.socs_eigenvalues, self.socs_eigenfunctions):
                 if lam < 1e-10:
                     continue
@@ -2126,7 +2200,7 @@ def load_aberration_scenarios(
             magnification=base_optics.magnification,
             illumination_type=base_optics.illumination_type,
             source_params=dict(base_optics.source_params),
-            use_socs=base_optics.use_socs,
+            tcc_mode=base_optics.tcc_mode,
             socs_num_terms=base_optics.socs_num_terms,
             zernike_coefficients=zernike_coefficients
         )
@@ -2183,7 +2257,7 @@ def create_aberration_sweep(
                 magnification=base_optics.magnification,
                 illumination_type=base_optics.illumination_type,
                 source_params=dict(base_optics.source_params),
-                use_socs=base_optics.use_socs,
+                tcc_mode=base_optics.tcc_mode,
                 socs_num_terms=base_optics.socs_num_terms,
                 zernike_coefficients=zernike
             )

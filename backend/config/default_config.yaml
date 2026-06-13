@@ -20,8 +20,13 @@ optical_system:
     # angle: 0.0           # 极角 (度)
     # opening_angle: 60.0  # 开口角 (度)
   # SOCS低秩分解配置
-  use_socs: true         # 是否使用SOCS加速
-  socs_num_terms: 5      # SOCS分解项数
+  # tcc_mode: TCC 计算模式: full_tcc, socs, kernel_2d
+  #   - full_tcc: 完整TCC（光源积分法），精度最高，速度最慢
+  #   - socs: SOCS 低秩近似，精度与速度平衡
+  #   - kernel_2d: 二维 TCC 核对角近似，速度最快，精度最低
+  tcc_mode: socs
+  socs_num_terms: 5      # SOCS分解项数（仅 socs 模式生效）
+  use_socs: true         # [已弃用] 旧版配置，向后兼容
   # Zernike像差系数（单位: 波长λ）
   # 支持名称和索引两种格式，名称对照:
   #   piston=0, tilt_x=1, tilt_y=2, defocus=3,
