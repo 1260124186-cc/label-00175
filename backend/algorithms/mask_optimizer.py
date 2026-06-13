@@ -20,6 +20,10 @@ from core.imaging import (
     downsample_mask, upsample_mask, build_pyramid_scales,
     split_tiles, merge_tiles_with_blend
 )
+from core.fft import (
+    create_bandlimit_mask, bandlimit_projection,
+    bandlimited_gradient_projection, BandlimitType
+)
 from core.metrics import (
     mse, mae, ssim, evaluate_all, MetricsResult,
     ssim_loss_gradient,
@@ -265,6 +269,21 @@ class OptimizationConfig:
     min_feature_alpha: float = 0.5  # 联合方法中形态学权重
     pixel_size: float = 1.0  # 像素尺寸
 
+    # 频域正则化（带限约束投影）配置
+    use_frequency_bandlimit: bool = False  # 是否启用频域带限投影
+    bandlimit_type: str = 'lowpass'  # 'lowpass', 'highpass', 'bandpass', 'bandstop', 'circular', 'rectangular', 'directional', 'custom'
+    bandlimit_inner_radius: float = 0.0  # 内半径（归一化0-1）
+    bandlimit_outer_radius: float = 0.5  # 外半径（归一化0-1）
+    bandlimit_fx_range: tuple = (0.0, 0.5)  # 矩形带通x方向频率范围
+    bandlimit_fy_range: tuple = (0.0, 0.5)  # 矩形带通y方向频率范围
+    bandlimit_angle_range: tuple = (0.0, 6.283185307179586)  # 方向带通角度范围（弧度）
+    bandlimit_smooth: bool = False  # 是否使用平滑过渡
+    bandlimit_order: int = 4  # 巴特沃斯阶数（smooth=True时）
+    bandlimit_preserve_dc: bool = True  # 是否保留直流分量
+    bandlimit_projection_freq: int = 1  # 投影频率（每N次迭代投影一次）
+    bandlimit_project_gradient: bool = False  # 是否对梯度也施加频域投影
+    bandlimit_custom_mask: Any = None  # 自定义频域掩模（bandlimit_type='custom'时使用）
+
     # 多尺度/分块大尺寸掩模优化配置
     use_multiscale: bool = False  # 是否启用金字塔多尺度优化
     multiscale_mode: str = 'pyramid'  # 'pyramid' 或 'tile'
@@ -496,6 +515,67 @@ class MaskOptimizer:
         self._callbacks: CallbackList = CallbackList(callbacks)
         self._history_callback: Optional[HistoryCallback] = None
         self._trainer_state: Optional[TrainerState] = None
+
+        self._bandlimit_mask: Optional[np.ndarray] = None
+
+    def _setup_bandlimit_mask(self, image_size: tuple):
+        """设置频域带限约束掩模"""
+        cfg = self.config
+        if not cfg.use_frequency_bandlimit:
+            self._bandlimit_mask = None
+            return
+
+        try:
+            custom_mask = cfg.bandlimit_custom_mask
+            if (cfg.bandlimit_type.lower() == 'custom'
+                and custom_mask is not None):
+                if custom_mask.shape != tuple(image_size):
+                    logger.warning(
+                        f"自定义频域掩模形状 {custom_mask.shape} "
+                        f"与图像形状 {image_size} 不匹配，调整大小"
+                    )
+                    from scipy.ndimage import zoom
+                    sy = image_size[0] / custom_mask.shape[0]
+                    sx = image_size[1] / custom_mask.shape[1]
+                    custom_mask = zoom(custom_mask, (sy, sx), order=1)
+
+            self._bandlimit_mask = create_bandlimit_mask(
+                shape=image_size,
+                bandlimit_type=cfg.bandlimit_type,
+                inner_radius=cfg.bandlimit_inner_radius,
+                outer_radius=cfg.bandlimit_outer_radius,
+                fx_range=cfg.bandlimit_fx_range,
+                fy_range=cfg.bandlimit_fy_range,
+                angle_range=cfg.bandlimit_angle_range,
+                smooth=cfg.bandlimit_smooth,
+                order=cfg.bandlimit_order,
+                custom_mask=custom_mask if cfg.bandlimit_type.lower() == 'custom' else None
+            )
+            logger.info(
+                f"频域带限投影已启用: 类型={cfg.bandlimit_type}, "
+                f"内半径={cfg.bandlimit_inner_radius}, "
+                f"外半径={cfg.bandlimit_outer_radius}"
+            )
+        except Exception as e:
+            logger.warning(f"创建频域带限掩模失败，跳过频域约束: {e}")
+            self._bandlimit_mask = None
+
+    def _apply_bandlimit_projection(self, mask: np.ndarray) -> np.ndarray:
+        """应用频域带限投影"""
+        if self._bandlimit_mask is None:
+            return mask
+        return bandlimit_projection(
+            mask,
+            self._bandlimit_mask,
+            preserve_dc=self.config.bandlimit_preserve_dc
+        )
+
+    def _apply_gradient_bandlimit(self, gradient: np.ndarray) -> np.ndarray:
+        """对梯度应用频域带限投影"""
+        if (self._bandlimit_mask is None
+            or not self.config.bandlimit_project_gradient):
+            return gradient
+        return bandlimited_gradient_projection(gradient, self._bandlimit_mask)
 
     def _setup_imaging_model(self, image_size: tuple):
         """设置成像模型"""
@@ -756,6 +836,8 @@ class MaskOptimizer:
             grad = self._compute_gradient(x)
             nfev += 1
 
+            grad = self._apply_gradient_bandlimit(grad)
+
             if opt_type == 'gradient_descent':
                 x_flat = x.flatten()
                 grad_flat = grad.flatten()
@@ -812,6 +894,12 @@ class MaskOptimizer:
                 x_new = x - lr * grad
 
             x_new = self._clip_to_bounds(x_new)
+
+            proj_freq = max(1, self.config.bandlimit_projection_freq)
+            if epoch % proj_freq == 0:
+                x_new = self._apply_bandlimit_projection(x_new)
+                x_new = self._clip_to_bounds(x_new)
+
             f_new = self._compute_loss(x_new)
             nfev += 1
 
@@ -1711,6 +1799,7 @@ class MaskOptimizer:
         self._target_image = target_image.astype(np.float64)
 
         self._setup_imaging_model(initial_mask.shape)
+        self._setup_bandlimit_mask(initial_mask.shape)
 
         use_step_training = self._supports_step_training() and self.config.use_callbacks
 
@@ -1775,20 +1864,62 @@ class MaskOptimizer:
         if use_step_training:
             result = self._step_train(starting_mask, old_callback=callback)
         elif isinstance(self._optimizer, BaseHeuristicOptimizer):
-            result = self._optimizer.optimize(
-                objective=self._compute_loss,
-                x0=starting_mask,
-                bounds=self.config.bounds
-            )
+            if self._bandlimit_mask is not None:
+                def wrapped_obj(x):
+                    x_proj = self._apply_bandlimit_projection(
+                        x.reshape(starting_mask.shape)
+                    )
+                    x_proj = self._clip_to_bounds(x_proj)
+                    return self._compute_loss(x_proj)
+                starting_mask = self._apply_bandlimit_projection(starting_mask)
+                starting_mask = self._clip_to_bounds(starting_mask)
+                result = self._optimizer.optimize(
+                    objective=wrapped_obj,
+                    x0=starting_mask,
+                    bounds=self.config.bounds
+                )
+            else:
+                result = self._optimizer.optimize(
+                    objective=self._compute_loss,
+                    x0=starting_mask,
+                    bounds=self.config.bounds
+                )
         else:
-            result = self._optimizer.optimize(
-                objective=self._compute_loss,
-                x0=starting_mask,
-                gradient=self._compute_gradient,
-                bounds=self.config.bounds
-            )
+            if self._bandlimit_mask is not None:
+                def wrapped_obj(x):
+                    x_proj = self._apply_bandlimit_projection(
+                        x.reshape(starting_mask.shape)
+                    )
+                    x_proj = self._clip_to_bounds(x_proj)
+                    return self._compute_loss(x_proj)
+                def wrapped_grad(x):
+                    x_proj = self._apply_bandlimit_projection(
+                        x.reshape(starting_mask.shape)
+                    )
+                    x_proj = self._clip_to_bounds(x_proj)
+                    g = self._compute_gradient(x_proj)
+                    g = self._apply_gradient_bandlimit(g)
+                    return g.flatten()
+                starting_mask = self._apply_bandlimit_projection(starting_mask)
+                starting_mask = self._clip_to_bounds(starting_mask)
+                result = self._optimizer.optimize(
+                    objective=wrapped_obj,
+                    x0=starting_mask,
+                    gradient=wrapped_grad,
+                    bounds=self.config.bounds
+                )
+            else:
+                result = self._optimizer.optimize(
+                    objective=self._compute_loss,
+                    x0=starting_mask,
+                    gradient=self._compute_gradient,
+                    bounds=self.config.bounds
+                )
 
         optimized_mask = result.x
+        if self._bandlimit_mask is not None:
+            optimized_mask = self._apply_bandlimit_projection(optimized_mask)
+            optimized_mask = self._clip_to_bounds(optimized_mask)
         final_wafer = self._imaging_model.compute_aerial_image(optimized_mask)
         final_metrics = evaluate_all(final_wafer, target_image)
 
