@@ -35,6 +35,7 @@ from .algorithms import (
 
 from .utils import (
     load_image,
+    load_gds_layer,
     save_image,
     load_config,
     setup_logger
@@ -57,6 +58,7 @@ __all__ = [
     'OptimizationConfig',
     # Utils
     'load_image',
+    'load_gds_layer',
     'save_image',
     'load_config',
     'setup_logger'

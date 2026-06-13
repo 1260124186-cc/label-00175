@@ -24,3 +24,6 @@ pytest-cov>=2.12.0
 
 # 日志
 colorlog>=5.0.0
+
+# 版图文件解析（GDS/OASIS导入，二者安装其一即可）
+gdstk>=0.9.0
