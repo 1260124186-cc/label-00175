@@ -35,6 +35,16 @@ from core.fft import (
     apply_window_and_padding, crop_to_original
 )
 from core.metrics import mse, mae, ssim, normalized_correlation, batch_evaluate
+from core.metrics import (
+    HistoryEvaluationRow,
+    batch_evaluate_history,
+    export_evaluation_csv,
+    compute_pareto_front,
+    evaluate_and_export_pareto,
+    total_variation,
+    total_variation_isotropic,
+    manhattan_distance_penalty,
+)
 
 __all__ = [
     'OpticalSystem',
@@ -79,5 +89,13 @@ __all__ = [
     'mae',
     'ssim',
     'normalized_correlation',
-    'batch_evaluate'
+    'batch_evaluate',
+    'HistoryEvaluationRow',
+    'batch_evaluate_history',
+    'export_evaluation_csv',
+    'compute_pareto_front',
+    'evaluate_and_export_pareto',
+    'total_variation',
+    'total_variation_isotropic',
+    'manhattan_distance_penalty',
 ]

@@ -32,6 +32,7 @@ class TrainerState:
         best_mask: 历史最优掩模
         loss_history: 损失历史
         lr_history: 学习率历史
+        mask_history: 中间掩模历史（可选，用于批量评估）
         stop_training: 是否停止训练
         logs: 其他日志信息
     """
@@ -43,6 +44,7 @@ class TrainerState:
     best_mask: Optional[np.ndarray] = None
     loss_history: List[float] = field(default_factory=list)
     lr_history: List[float] = field(default_factory=list)
+    mask_history: List[np.ndarray] = field(default_factory=list)
     stop_training: bool = False
     logs: Dict[str, Any] = field(default_factory=dict)
 
@@ -720,11 +722,19 @@ class HistoryCallback(Callback):
     记录所有训练历史数据。
     """
 
-    def __init__(self):
+    def __init__(self, save_masks: bool = False):
+        """
+        初始化历史记录回调
+
+        Args:
+            save_masks: 是否保存每一步的中间掩模（内存开销较大，按需开启）
+        """
         super().__init__()
+        self.save_masks = save_masks
         self.epoch_history: List[int] = []
         self.loss_history: List[float] = []
         self.lr_history: List[float] = []
+        self.mask_history: List[np.ndarray] = []
         self.logs_history: List[Dict[str, Any]] = []
 
     def on_epoch_end(self, epoch, logs=None):
@@ -736,15 +746,21 @@ class HistoryCallback(Callback):
 
         if self.state is not None:
             self.lr_history.append(self.state.learning_rate)
+            if self.save_masks and self.state.mask is not None:
+                self.mask_history.append(self.state.mask.copy())
+                self.state.mask_history.append(self.state.mask.copy())
 
         if logs:
             self.logs_history.append(dict(logs))
 
     def get_history(self) -> Dict[str, Any]:
         """获取历史记录"""
-        return {
+        result = {
             'epochs': self.epoch_history,
             'loss': self.loss_history,
             'learning_rate': self.lr_history,
-            'logs': self.logs_history
+            'logs': self.logs_history,
         }
+        if self.save_masks:
+            result['masks'] = self.mask_history
+        return result

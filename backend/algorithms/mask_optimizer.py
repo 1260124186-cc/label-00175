@@ -346,6 +346,9 @@ class OptimizationConfig:
     plot_lr: bool = True  # 是否同时绘制学习率曲线
     plot_live_update: bool = False  # 是否实时更新显示
 
+    # 中间掩模历史记录配置（用于批量评估与Pareto前沿分析）
+    save_mask_history: bool = False  # 是否在内存中保存每一步的中间掩模
+
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'OptimizationConfig':
         if d is None:
@@ -495,6 +498,7 @@ class MaskOptimizationResult:
     multi_process_result: Optional[MultiProcessSimulationResult] = None
     per_condition_losses: Optional[List[float]] = None
     process_conditions: Optional[List[ProcessCondition]] = None
+    mask_history: Optional[List[np.ndarray]] = None
 
 
 class MaskOptimizer:
@@ -719,7 +723,7 @@ class MaskOptimizer:
             'optimizer_type': cfg.optimizer_type,
         })
 
-        self._history_callback = HistoryCallback()
+        self._history_callback = HistoryCallback(save_masks=cfg.save_mask_history)
         callbacks.append(self._history_callback)
 
         if cfg.use_callbacks:
@@ -1999,6 +2003,15 @@ class MaskOptimizer:
             per_condition_losses = getattr(self, '_last_per_condition_losses', None)
             process_conditions = self._multi_conditions
 
+        mask_history = None
+        if (self._history_callback is not None
+                and self._history_callback.save_masks
+                and self._history_callback.mask_history):
+            mask_history = self._history_callback.mask_history
+        elif (self._trainer_state is not None
+              and self._trainer_state.mask_history):
+            mask_history = self._trainer_state.mask_history
+
         logger.info(f"优化完成，最终MSE: {final_metrics.mse:.6e}，"
                    f"耗时: {total_time:.2f}秒")
 
@@ -2017,7 +2030,8 @@ class MaskOptimizer:
             message=result.message,
             multi_process_result=multi_process_result,
             per_condition_losses=per_condition_losses,
-            process_conditions=process_conditions
+            process_conditions=process_conditions,
+            mask_history=mask_history
         )
 
     def _optimize_pyramid(self,

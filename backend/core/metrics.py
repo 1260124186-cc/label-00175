@@ -11,8 +11,10 @@
 
 import numpy as np
 from numba import jit, prange
-from typing import Dict, List, Tuple, Optional, Union
-from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Union, Any
+from dataclasses import dataclass, field
+from pathlib import Path
+import logging
 
 
 @jit(nopython=True, cache=True)
@@ -427,7 +429,9 @@ def batch_evaluate(images: List[np.ndarray],
         images: 待评估图像列表
         target: 目标图像
         metrics: 要计算的指标列表，None则计算全部
-                 可选: ['mse', 'mae', 'ssim', 'ncc', 'psnr']
+                 可选: ['mse', 'mae', 'ssim', 'ncc', 'psnr',
+                        'mask_complexity', 'tv', 'tv_isotropic',
+                        'binary_penalty', 'l0_norm']
 
     Returns:
         评估结果列表，每个元素为指标字典
@@ -440,7 +444,12 @@ def batch_evaluate(images: List[np.ndarray],
         'mae': mae,
         'ssim': ssim,
         'ncc': normalized_correlation,
-        'psnr': psnr
+        'psnr': psnr,
+        'mask_complexity': lambda img, _tgt: total_variation(img),
+        'tv': lambda img, _tgt: total_variation(img),
+        'tv_isotropic': lambda img, _tgt: total_variation_isotropic(img),
+        'binary_penalty': lambda img, _tgt: manhattan_distance_penalty(img),
+        'l0_norm': lambda img, _tgt: float(np.sum(np.abs(img - 0.5) > 1e-6)),
     }
 
     results = []
@@ -452,6 +461,278 @@ def batch_evaluate(images: List[np.ndarray],
         results.append(result)
 
     return results
+
+
+@dataclass
+class HistoryEvaluationRow:
+    """优化历史中单步评估结果（用于Pareto前沿分析）"""
+    step: int
+    loss: float
+    mse: float
+    mae: float
+    ssim: float
+    ncc: float
+    psnr: float
+    mask_complexity: float
+    tv: float
+    binary_penalty: float
+    wafer_image: Optional[np.ndarray] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = {
+            'step': self.step,
+            'loss': self.loss,
+            'mse': self.mse,
+            'mae': self.mae,
+            'ssim': self.ssim,
+            'ncc': self.ncc,
+            'psnr': self.psnr,
+            'mask_complexity': self.mask_complexity,
+            'tv': self.tv,
+            'binary_penalty': self.binary_penalty,
+        }
+        return d
+
+
+def _simulate_wafer(mask: np.ndarray,
+                    optical_system: Optional[Any] = None,
+                    imaging_model: Optional[Any] = None) -> np.ndarray:
+    """将掩模通过光学成像模拟转换为晶圆图像"""
+    if imaging_model is not None:
+        return imaging_model.compute_aerial_image(mask)
+    if optical_system is not None:
+        from core.imaging import PartialCoherentImaging
+        model = PartialCoherentImaging(optical_system, mask.shape)
+        return model.compute_aerial_image(mask)
+    return mask.astype(np.float64)
+
+
+def batch_evaluate_history(
+    masks: List[np.ndarray],
+    target: np.ndarray,
+    loss_history: Optional[List[float]] = None,
+    optical_system: Optional[Any] = None,
+    imaging_model: Optional[Any] = None,
+    include_wafer_images: bool = False,
+    extra_metrics: Optional[List[str]] = None,
+) -> List[HistoryEvaluationRow]:
+    """
+    批量评估优化历史中每一步的中间掩模
+
+    对每个中间掩模执行：掩模 → 光学成像 → 精度评估(MSE/MAE/SSIM/NCC/PSNR)
+                         → 掩模复杂度评估(TV/二值化惩罚)
+
+    结果可直接用于绘制 Pareto 前沿（精度 vs 掩模复杂度）。
+
+    Args:
+        masks: 每一步的中间掩模列表
+        target: 目标图像
+        loss_history: 可选的损失值历史，与 masks 一一对应
+        optical_system: 光学系统参数（用于将掩模投影为晶圆图像）
+        imaging_model: 已构建的成像模型实例，优先级高于 optical_system
+        include_wafer_images: 是否在结果中保存模拟的晶圆图像（内存开销大）
+        extra_metrics: 额外需要计算的精度指标列表
+
+    Returns:
+        HistoryEvaluationRow 列表，包含每一步的精度与复杂度指标
+    """
+    results: List[HistoryEvaluationRow] = []
+
+    for i, mask in enumerate(masks):
+        wafer = _simulate_wafer(mask, optical_system, imaging_model)
+
+        prec = evaluate_all(wafer, target)
+        mask_complexity = total_variation(mask)
+        tv_iso = total_variation_isotropic(mask)
+        bin_pen = manhattan_distance_penalty(mask)
+
+        loss_val = loss_history[i] if (loss_history and i < len(loss_history)) else float('nan')
+
+        row = HistoryEvaluationRow(
+            step=i,
+            loss=loss_val,
+            mse=prec.mse,
+            mae=prec.mae,
+            ssim=prec.ssim,
+            ncc=prec.ncc,
+            psnr=prec.psnr,
+            mask_complexity=mask_complexity,
+            tv=tv_iso,
+            binary_penalty=bin_pen,
+            wafer_image=wafer if include_wafer_images else None,
+        )
+        results.append(row)
+
+    return results
+
+
+def export_evaluation_csv(
+    rows: List[HistoryEvaluationRow],
+    csv_path: Union[str, Path],
+    extra_columns: Optional[Dict[str, List[Any]]] = None,
+    include_wafer_images: bool = False,
+) -> str:
+    """
+    将批量评估结果导出为 CSV 文件，便于绘制 Pareto 前沿
+
+    导出字段包括：step, loss, mse, mae, ssim, ncc, psnr,
+                 mask_complexity, tv, binary_penalty
+
+    Args:
+        rows: batch_evaluate_history 的输出
+        csv_path: 输出 CSV 文件路径
+        extra_columns: 额外需要写入的列，{列名: 与 rows 等长的值列表}
+        include_wafer_images: 是否保存晶圆图像路径（暂不支持内嵌图像，仅预留接口）
+
+    Returns:
+        实际写入的文件绝对路径
+    """
+    import csv
+    from pathlib import Path
+
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    base_fields = [
+        'step', 'loss', 'mse', 'mae', 'ssim', 'ncc', 'psnr',
+        'mask_complexity', 'tv', 'binary_penalty',
+    ]
+
+    all_fields = list(base_fields)
+    if extra_columns:
+        for col in extra_columns.keys():
+            if col not in all_fields:
+                all_fields.append(col)
+
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=all_fields)
+        writer.writeheader()
+        for i, row in enumerate(rows):
+            line = row.to_dict()
+            if extra_columns:
+                for col, values in extra_columns.items():
+                    if i < len(values):
+                        line[col] = values[i]
+            writer.writerow(line)
+
+    logger = logging.getLogger(__name__)
+    logger.info(f"评估结果已导出到 CSV: {csv_path.resolve()}")
+    return str(csv_path.resolve())
+
+
+def compute_pareto_front(
+    rows: List[HistoryEvaluationRow],
+    objective_x: str = 'mask_complexity',
+    objective_y: str = 'mse',
+    minimize_x: bool = True,
+    minimize_y: bool = True,
+) -> List[HistoryEvaluationRow]:
+    """
+    计算 Pareto 前沿（非支配解集）
+
+    Pareto 最优：在不降低至少一个目标的前提下，无法改进另一个目标。
+
+    Args:
+        rows: 批量评估结果
+        objective_x: X 轴目标字段名（如 'mask_complexity', 'tv', 'binary_penalty'）
+        objective_y: Y 轴目标字段名（如 'mse', 'mae', '1-ssim' 等）
+        minimize_x: X 轴目标是否越小越好
+        minimize_y: Y 轴目标是否越小越好
+
+    Returns:
+        Pareto 前沿上的评估点列表（按 X 升序排列）
+    """
+    def _better_x(a: float, b: float) -> bool:
+        return (a < b) if minimize_x else (a > b)
+
+    def _better_y(a: float, b: float) -> bool:
+        return (a < b) if minimize_y else (a > b)
+
+    def _dominates(r1: HistoryEvaluationRow, r2: HistoryEvaluationRow) -> bool:
+        x1 = getattr(r1, objective_x)
+        y1 = getattr(r1, objective_y)
+        x2 = getattr(r2, objective_x)
+        y2 = getattr(r2, objective_y)
+        no_worse = ((not _better_x(x2, x1)) and (not _better_y(y2, y1)))
+        strictly_better = _better_x(x1, x2) or _better_y(y1, y2)
+        return no_worse and strictly_better
+
+    front: List[HistoryEvaluationRow] = []
+    for r in rows:
+        dominated = False
+        for other in rows:
+            if other is r:
+                continue
+            if _dominates(other, r):
+                dominated = True
+                break
+        if not dominated:
+            front.append(r)
+
+    front.sort(key=lambda r: getattr(r, objective_x))
+    return front
+
+
+def evaluate_and_export_pareto(
+    masks: List[np.ndarray],
+    target: np.ndarray,
+    csv_path: Union[str, Path],
+    loss_history: Optional[List[float]] = None,
+    optical_system: Optional[Any] = None,
+    imaging_model: Optional[Any] = None,
+    objective_x: str = 'mask_complexity',
+    objective_y: str = 'mse',
+    minimize_x: bool = True,
+    minimize_y: bool = True,
+    pareto_csv_path: Optional[Union[str, Path]] = None,
+) -> Tuple[List[HistoryEvaluationRow], List[HistoryEvaluationRow]]:
+    """
+    一站式：批量评估优化历史 → 导出全量 CSV → 计算 Pareto 前沿 → 导出前沿 CSV
+
+    这是绘制 Pareto 前沿（精度 vs 掩模复杂度）的便捷入口。
+
+    Args:
+        masks: 中间掩模列表
+        target: 目标图像
+        csv_path: 全量评估结果输出 CSV 路径
+        loss_history: 可选损失历史
+        optical_system: 光学系统参数
+        imaging_model: 成像模型实例
+        objective_x: Pareto X 轴目标字段
+        objective_y: Pareto Y 轴目标字段
+        minimize_x: X 轴是否越小越好
+        minimize_y: Y 轴是否越小越好
+        pareto_csv_path: Pareto 前沿单独输出路径，None 时自动命名
+
+    Returns:
+        (所有评估结果, Pareto 前沿结果)
+    """
+    rows = batch_evaluate_history(
+        masks=masks,
+        target=target,
+        loss_history=loss_history,
+        optical_system=optical_system,
+        imaging_model=imaging_model,
+    )
+
+    export_evaluation_csv(rows, csv_path)
+
+    pareto = compute_pareto_front(
+        rows,
+        objective_x=objective_x,
+        objective_y=objective_y,
+        minimize_x=minimize_x,
+        minimize_y=minimize_y,
+    )
+
+    if pareto_csv_path is None:
+        from pathlib import Path
+        p = Path(csv_path)
+        pareto_csv_path = p.parent / f"{p.stem}_pareto{p.suffix}"
+
+    export_evaluation_csv(pareto, pareto_csv_path)
+
+    return rows, pareto
 
 
 def compute_error_map(image1: np.ndarray,
