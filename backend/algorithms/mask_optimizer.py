@@ -42,7 +42,10 @@ from core.metrics import (
     soft_min_feature_size_morphology, soft_min_feature_size_morphology_gradient,
     min_feature_size_frequency_gradient,
     min_feature_size_combined, min_feature_size_combined_gradient,
-    CompositeLossComponents
+    CompositeLossComponents,
+    SpatialWeightConfig, generate_spatial_weight_mask,
+    weighted_mse, weighted_mae,
+    weighted_mse_gradient, weighted_mae_gradient
 )
 from algorithms.optimizer import (
     BaseOptimizer, GradientDescentOptimizer, BFGSOptimizer,
@@ -88,6 +91,7 @@ class LossWeights:
     loss = w_mse * MSE + w_ssim * (1-SSIM) + w_pvb * PVB + w_mask_complexity * mask_complexity
            + w_binary * binary_penalty + w_tv_smooth * TV_smooth
            + w_epe * EPE + w_min_feature * min_feature_size
+           + w_weighted_mse * WMSE + w_weighted_mae * WMAE
 
     Attributes:
         mse: MSE（均方误差）权重
@@ -98,6 +102,8 @@ class LossWeights:
         tv_smooth: 各向同性TV平滑权重
         epe: 边缘放置误差（EPE）权重
         min_feature: 最小特征尺寸约束权重
+        weighted_mse: 空间加权MSE权重（热点区域更受关注）
+        weighted_mae: 空间加权MAE权重
     """
     mse: float = 1.0
     ssim: float = 0.0
@@ -107,6 +113,8 @@ class LossWeights:
     tv_smooth: float = 0.0
     epe: float = 0.0
     min_feature: float = 0.0
+    weighted_mse: float = 0.0
+    weighted_mae: float = 0.0
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, float]]) -> 'LossWeights':
@@ -115,7 +123,8 @@ class LossWeights:
             return cls()
         defaults = {
             'mse': 1.0, 'ssim': 0.0, 'pvb': 0.0, 'mask_complexity': 0.0,
-            'binary_penalty': 0.0, 'tv_smooth': 0.0, 'epe': 0.0, 'min_feature': 0.0
+            'binary_penalty': 0.0, 'tv_smooth': 0.0, 'epe': 0.0, 'min_feature': 0.0,
+            'weighted_mse': 0.0, 'weighted_mae': 0.0
         }
         defaults.update(d)
         return cls(**defaults)
@@ -129,12 +138,15 @@ class LossWeights:
             'binary_penalty': self.binary_penalty,
             'tv_smooth': self.tv_smooth,
             'epe': self.epe,
-            'min_feature': self.min_feature
+            'min_feature': self.min_feature,
+            'weighted_mse': self.weighted_mse,
+            'weighted_mae': self.weighted_mae
         }
 
     def total_weight(self) -> float:
         return (self.mse + self.ssim + self.pvb + self.mask_complexity +
-                self.binary_penalty + self.tv_smooth + self.epe + self.min_feature)
+                self.binary_penalty + self.tv_smooth + self.epe + self.min_feature +
+                self.weighted_mse + self.weighted_mae)
 
 
 @dataclass
@@ -308,6 +320,9 @@ class OptimizationConfig:
     lr_scheduler_factor: float = 0.5  # ReduceLROnPlateau 衰减因子
     lr_min: float = 1e-7  # 最小学习率
 
+    # 空间加权误差配置（热点区域更关注）
+    spatial_weight: SpatialWeightConfig = field(default_factory=SpatialWeightConfig)
+
     # Checkpoint 配置
     checkpoint_enable: bool = False  # 是否启用 checkpoint 保存
     checkpoint_dir: str = './checkpoints'  # checkpoint 保存目录
@@ -343,6 +358,8 @@ class OptimizationConfig:
                     cfg.loss_weights = LossWeights.from_dict(value)
                 elif key == 'regularization':
                     cfg.regularization = RegularizationConfig.from_dict(value)
+                elif key == 'spatial_weight':
+                    cfg.spatial_weight = SpatialWeightConfig.from_dict(value)
                 elif key == 'process_conditions' and value is not None:
                     cfg.process_conditions = [
                         ProcessCondition(**pc) if isinstance(pc, dict) else pc
@@ -359,6 +376,8 @@ class OptimizationConfig:
             if f.name == 'loss_weights':
                 result[f.name] = val.to_dict()
             elif f.name == 'regularization':
+                result[f.name] = val.to_dict()
+            elif f.name == 'spatial_weight':
                 result[f.name] = val.to_dict()
             elif f.name == 'process_conditions' and val is not None:
                 result[f.name] = [pc.to_dict() if hasattr(pc, 'to_dict') else pc for pc in val]
@@ -507,6 +526,7 @@ class MaskOptimizer:
         self._optimizer: Optional[Union[BaseOptimizer, BaseHeuristicOptimizer]] = None
         self._lr_scheduler: Optional[LearningRateScheduler] = None
         self._early_stopping: Optional[EarlyStopping] = None
+        self._spatial_weight_mask: Optional[np.ndarray] = None
 
         self._multi_imaging_models: Optional[List[PartialCoherentImaging]] = None
         self._multi_conditions: Optional[List[ProcessCondition]] = None
@@ -1194,14 +1214,14 @@ class MaskOptimizer:
     def _compute_image_loss_components(self, image: np.ndarray,
                                        target: np.ndarray) -> CompositeLossComponents:
         """
-        针对单幅图像计算 MSE、(1-SSIM) 等逐像素损失分量（不含 PVB/正则化）
+        针对单幅图像计算 MSE、(1-SSIM)、加权MSE/MAE 等逐像素损失分量（不含 PVB/正则化）
 
         Args:
             image: 处理后的成像结果
             target: 目标图像
 
         Returns:
-            CompositeLossComponents（仅填充 mse、ssim 字段）
+            CompositeLossComponents（填充 mse、ssim、weighted_mse、weighted_mae 字段）
         """
         comp = CompositeLossComponents()
         lw = self.config.loss_weights
@@ -1210,6 +1230,14 @@ class MaskOptimizer:
             comp.mse = lw.mse * mse(image, target)
         if lw.ssim > 0:
             comp.ssim = lw.ssim * (1.0 - ssim(image, target))
+        if lw.weighted_mse > 0 and self._spatial_weight_mask is not None:
+            comp.weighted_mse = lw.weighted_mse * weighted_mse(
+                image, target, self._spatial_weight_mask
+            )
+        if lw.weighted_mae > 0 and self._spatial_weight_mask is not None:
+            comp.weighted_mae = lw.weighted_mae * weighted_mae(
+                image, target, self._spatial_weight_mask
+            )
 
         return comp
 
@@ -1330,7 +1358,7 @@ class MaskOptimizer:
         aerial = imaging_model.compute_aerial_image(mask)
         image = self._prepare_image(aerial, dose)
         components = self._compute_image_loss_components(image, self._target_image)
-        loss = components.mse + components.ssim
+        loss = components.mse + components.ssim + components.weighted_mse + components.weighted_mae
         return loss, image, components
 
     def _compute_single_condition_loss(self, mask: np.ndarray,
@@ -1507,6 +1535,16 @@ class MaskOptimizer:
                 if lw.ssim > 0:
                     error_grad += lw.ssim * ssim_loss_gradient(image, self._target_image)
 
+                if lw.weighted_mse > 0 and self._spatial_weight_mask is not None:
+                    error_grad += lw.weighted_mse * weighted_mse_gradient(
+                        image, self._target_image, self._spatial_weight_mask
+                    )
+
+                if lw.weighted_mae > 0 and self._spatial_weight_mask is not None:
+                    error_grad += lw.weighted_mae * weighted_mae_gradient(
+                        image, self._target_image, self._spatial_weight_mask
+                    )
+
                 imaging_grad = model.compute_image_gradient(mask)
 
                 if cond.dose != 1.0:
@@ -1549,6 +1587,14 @@ class MaskOptimizer:
                         error_grad += lw.mse * (2.0 * (image - self._target_image) / mask.size)
                     if lw.ssim > 0:
                         error_grad += lw.ssim * ssim_loss_gradient(image, self._target_image)
+                    if lw.weighted_mse > 0 and self._spatial_weight_mask is not None:
+                        error_grad += lw.weighted_mse * weighted_mse_gradient(
+                            image, self._target_image, self._spatial_weight_mask
+                        )
+                    if lw.weighted_mae > 0 and self._spatial_weight_mask is not None:
+                        error_grad += lw.weighted_mae * weighted_mae_gradient(
+                            image, self._target_image, self._spatial_weight_mask
+                        )
                     imaging_grad = model.compute_image_gradient(mask)
                     if cond.dose != 1.0:
                         error_grad = error_grad * cond.dose
@@ -1715,6 +1761,16 @@ class MaskOptimizer:
             if lw.ssim > 0:
                 error_grad += lw.ssim * ssim_loss_gradient(image, self._target_image)
 
+            if lw.weighted_mse > 0 and self._spatial_weight_mask is not None:
+                error_grad += lw.weighted_mse * weighted_mse_gradient(
+                    image, self._target_image, self._spatial_weight_mask
+                )
+
+            if lw.weighted_mae > 0 and self._spatial_weight_mask is not None:
+                error_grad += lw.weighted_mae * weighted_mae_gradient(
+                    image, self._target_image, self._spatial_weight_mask
+                )
+
             if cfg.use_wafer_image_loss:
                 threshold_grad = (aerial >= cfg.threshold).astype(np.float64)
                 error_grad = error_grad * threshold_grad
@@ -1797,6 +1853,9 @@ class MaskOptimizer:
         start_time = time.time()
 
         self._target_image = target_image.astype(np.float64)
+        self._spatial_weight_mask = generate_spatial_weight_mask(
+            self._target_image, self.config.spatial_weight
+        )
 
         self._setup_imaging_model(initial_mask.shape)
         self._setup_bandlimit_mask(initial_mask.shape)

@@ -55,11 +55,28 @@ optimization:
 
   # 复合损失各分量权重
   # loss = w_mse*MSE + w_ssim*(1-SSIM) + w_pvb*PVB + w_mask_complexity*TV(mask)
+  #        + w_weighted_mse*WMSE + w_weighted_mae*WMAE
   loss_weights:
     mse: 1.0                        # MSE 权重
     ssim: 0.0                       # (1-SSIM) 权重
     pvb: 0.0                        # PVB (工艺变化带宽) 权重，仅多工艺优化时有效
     mask_complexity: 0.0            # 掩模复杂度(总变差TV)权重
+    weighted_mse: 0.0               # 空间加权MSE权重（热点区域更关注）
+    weighted_mae: 0.0               # 空间加权MAE权重
+
+  # 空间加权误差配置（在关键区域如线端、拐角设置更高权重）
+  spatial_weight:
+    enable: false                   # 是否启用空间加权
+    edge_weight: 2.0                # 边缘区域权重倍率
+    corner_weight: 5.0              # 拐角区域权重倍率
+    line_end_weight: 4.0            # 线端区域权重倍率
+    base_weight: 1.0                # 基础区域权重
+    edge_sigma: 1.0                 # 边缘检测的高斯平滑sigma（像素）
+    corner_threshold: 0.3           # 拐角检测阈值（0-1，越大越严格）
+    line_end_threshold: 0.5         # 线端检测阈值
+    weight_erosion: true            # 是否对权重做形态学腐蚀以避免边界伪影
+    smooth_sigma: 0.5               # 权重mask的高斯平滑sigma
+    normalize: true                 # 是否将权重归一化到均值为1
 
   # 正则化配置
   regularization:

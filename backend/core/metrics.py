@@ -1353,6 +1353,380 @@ def min_feature_size_combined_gradient(mask: np.ndarray,
 
 
 @dataclass
+class SpatialWeightConfig:
+    """
+    空间权重mask配置
+
+    用于在关键区域（如线端、拐角）设置更高权重，使优化更关注热点区域。
+
+    Attributes:
+        enable: 是否启用空间加权
+        edge_weight: 边缘区域权重倍率
+        corner_weight: 拐角区域权重倍率
+        line_end_weight: 线端区域权重倍率
+        base_weight: 基础区域权重
+        edge_sigma: 边缘检测的高斯平滑sigma（像素）
+        corner_threshold: 拐角检测阈值（0-1，越大越严格）
+        line_end_threshold: 线端检测阈值
+        weight_erosion: 是否对权重做形态学腐蚀以避免边界伪影
+        smooth_sigma: 权重mask的高斯平滑sigma（使权重过渡更平滑）
+        normalize: 是否将权重归一化到均值为1
+    """
+    enable: bool = False
+    edge_weight: float = 2.0
+    corner_weight: float = 5.0
+    line_end_weight: float = 4.0
+    base_weight: float = 1.0
+    edge_sigma: float = 1.0
+    corner_threshold: float = 0.3
+    line_end_threshold: float = 0.5
+    weight_erosion: bool = True
+    smooth_sigma: float = 0.5
+    normalize: bool = True
+
+    @classmethod
+    def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'SpatialWeightConfig':
+        if d is None:
+            return cls()
+        cfg = cls()
+        for key, value in d.items():
+            if hasattr(cfg, key):
+                setattr(cfg, key, value)
+        return cfg
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'enable': self.enable,
+            'edge_weight': self.edge_weight,
+            'corner_weight': self.corner_weight,
+            'line_end_weight': self.line_end_weight,
+            'base_weight': self.base_weight,
+            'edge_sigma': self.edge_sigma,
+            'corner_threshold': self.corner_threshold,
+            'line_end_threshold': self.line_end_threshold,
+            'weight_erosion': self.weight_erosion,
+            'smooth_sigma': self.smooth_sigma,
+            'normalize': self.normalize
+        }
+
+
+def _detect_edges(image: np.ndarray, sigma: float = 1.0) -> np.ndarray:
+    """
+    使用Sobel算子检测边缘（连续值版本，可微）
+
+    Args:
+        image: 输入图像（2D数组）
+        sigma: 高斯预平滑sigma
+
+    Returns:
+        边缘强度图（0-1之间）
+    """
+    from scipy.ndimage import gaussian_filter
+    img = image.astype(np.float64)
+    if sigma > 0:
+        img = gaussian_filter(img, sigma=sigma)
+
+    sobel_y = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float64) / 8.0
+    sobel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float64) / 8.0
+
+    from scipy.signal import convolve2d
+    grad_y = convolve2d(img, sobel_y, mode='same', boundary='symm')
+    grad_x = convolve2d(img, sobel_x, mode='same', boundary='symm')
+    grad_mag = np.sqrt(grad_y**2 + grad_x**2)
+
+    grad_max = grad_mag.max()
+    if grad_max > 0:
+        grad_mag = grad_mag / grad_max
+    return grad_mag
+
+
+def _detect_corners(image: np.ndarray,
+                    sigma: float = 1.0,
+                    threshold: float = 0.3) -> np.ndarray:
+    """
+    使用Harris角点检测的简化可微版本检测拐角
+
+    Args:
+        image: 输入图像
+        sigma: 高斯平滑sigma
+        threshold: 拐角阈值（0-1）
+
+    Returns:
+        拐角强度图（0-1之间）
+    """
+    from scipy.ndimage import gaussian_filter
+    img = image.astype(np.float64)
+    if sigma > 0:
+        img = gaussian_filter(img, sigma=sigma)
+
+    sobel_y = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float64) / 8.0
+    sobel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float64) / 8.0
+
+    from scipy.signal import convolve2d
+    Iy = convolve2d(img, sobel_y, mode='same', boundary='symm')
+    Ix = convolve2d(img, sobel_x, mode='same', boundary='symm')
+
+    Ixx = Ix * Ix
+    Iyy = Iy * Iy
+    Ixy = Ix * Iy
+
+    window = np.ones((3, 3), dtype=np.float64)
+    Sxx = convolve2d(Ixx, window, mode='same', boundary='symm')
+    Syy = convolve2d(Iyy, window, mode='same', boundary='symm')
+    Sxy = convolve2d(Ixy, window, mode='same', boundary='symm')
+
+    det = Sxx * Syy - Sxy * Sxy
+    trace = Sxx + Syy + 1e-12
+    k = 0.04
+    harris = det - k * trace * trace
+
+    h_max = harris.max()
+    if h_max > 0:
+        harris_norm = np.clip(harris / h_max, 0.0, 1.0)
+    else:
+        harris_norm = np.zeros_like(harris)
+
+    corner_map = np.where(harris_norm > threshold, harris_norm, 0.0)
+    if sigma > 0:
+        corner_map = gaussian_filter(corner_map, sigma=sigma)
+        c_max = corner_map.max()
+        if c_max > 0:
+            corner_map = corner_map / c_max
+
+    return corner_map
+
+
+def _detect_line_ends(image: np.ndarray,
+                      threshold: float = 0.5,
+                      sigma: float = 1.0) -> np.ndarray:
+    """
+    检测线端区域
+
+    通过分析局部邻域内亮像素的数量和分布来识别线端：
+    - 线端是亮像素的"末端"，一侧有亮像素，另一侧没有
+    - 使用形态学方法：端点 = (原图 - 原图腐蚀后膨胀) 与边缘的交集
+
+    Args:
+        image: 输入图像（二值或接近二值）
+        threshold: 二值化阈值
+        sigma: 平滑sigma
+
+    Returns:
+        线端强度图（0-1之间）
+    """
+    from scipy.ndimage import gaussian_filter, binary_erosion, binary_dilation
+
+    img = image.astype(np.float64)
+    binary = (img >= threshold).astype(np.float64)
+
+    struct_3x3 = np.ones((3, 3), dtype=bool)
+    struct_plus = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+
+    eroded = binary_erosion(binary > 0.5, structure=struct_3x3, iterations=1).astype(np.float64)
+    dilated_eroded = binary_dilation(eroded > 0.5, structure=struct_plus, iterations=1).astype(np.float64)
+
+    endpoints_raw = binary - dilated_eroded
+    endpoints_raw = np.clip(endpoints_raw, 0.0, 1.0)
+
+    from scipy.signal import convolve2d
+    neighbor_count = convolve2d(binary, struct_plus.astype(np.float64), mode='same', boundary='symm')
+    is_endpoint_candidate = (binary > 0.5) & (neighbor_count >= 2) & (neighbor_count <= 4)
+
+    line_end_map = endpoints_raw * is_endpoint_candidate.astype(np.float64)
+
+    if sigma > 0:
+        line_end_map = gaussian_filter(line_end_map, sigma=sigma)
+        le_max = line_end_map.max()
+        if le_max > 0:
+            line_end_map = line_end_map / le_max
+
+    return line_end_map
+
+
+def generate_spatial_weight_mask(target_image: np.ndarray,
+                                 config: Optional[SpatialWeightConfig] = None) -> np.ndarray:
+    """
+    生成空间权重mask
+
+    在关键区域（边缘、拐角、线端）分配更高权重，使优化更关注这些热点区域。
+
+    权重计算公式:
+        W(x,y) = base_weight
+               + edge_weight * edge_map(x,y)
+               + corner_weight * corner_map(x,y)
+               + line_end_weight * line_end_map(x,y)
+
+    然后可选做平滑和归一化。
+
+    Args:
+        target_image: 目标图像（用于分析关键区域）
+        config: 空间权重配置，None则使用默认配置
+
+    Returns:
+        权重mask数组，与target_image形状相同
+    """
+    if config is None:
+        config = SpatialWeightConfig()
+
+    if not config.enable:
+        return np.ones_like(target_image, dtype=np.float64)
+
+    img = target_image.astype(np.float64)
+    ny, nx = img.shape
+
+    edge_map = _detect_edges(img, sigma=config.edge_sigma)
+    corner_map = _detect_corners(img, sigma=config.edge_sigma, threshold=config.corner_threshold)
+    line_end_map = _detect_line_ends(img, threshold=config.line_end_threshold, sigma=config.edge_sigma)
+
+    weights = (config.base_weight
+               + config.edge_weight * edge_map
+               + config.corner_weight * corner_map
+               + config.line_end_weight * line_end_map)
+
+    if config.weight_erosion:
+        from scipy.ndimage import minimum_filter
+        weights = minimum_filter(weights, size=3)
+
+    if config.smooth_sigma > 0:
+        from scipy.ndimage import gaussian_filter
+        weights = gaussian_filter(weights, sigma=config.smooth_sigma)
+
+    if config.normalize:
+        mean_w = weights.mean()
+        if mean_w > 0:
+            weights = weights / mean_w
+
+    weights = np.maximum(weights, config.base_weight)
+    return weights
+
+
+def weighted_mse(image1: np.ndarray,
+                 image2: np.ndarray,
+                 weight_mask: np.ndarray) -> float:
+    """
+    计算加权均方误差 (Weighted Mean Squared Error)
+
+    WMSE = (Σ W[i,j] * (I1[i,j] - I2[i,j])²) / (Σ W[i,j])
+
+    其中权重已归一化到总和为像素数，保证量级与普通MSE一致。
+
+    Args:
+        image1: 第一幅图像
+        image2: 第二幅图像（目标图像）
+        weight_mask: 权重mask（与图像形状相同）
+
+    Returns:
+        加权MSE值
+    """
+    img1 = image1.astype(np.float64)
+    img2 = image2.astype(np.float64)
+    w = weight_mask.astype(np.float64)
+
+    diff_sq = (img1 - img2) ** 2
+    total_w = w.sum()
+    if total_w <= 0:
+        return float(np.mean(diff_sq))
+
+    w_normalized = w * (img1.size / total_w)
+    return float(np.sum(w_normalized * diff_sq) / img1.size)
+
+
+def weighted_mae(image1: np.ndarray,
+                 image2: np.ndarray,
+                 weight_mask: np.ndarray) -> float:
+    """
+    计算加权平均绝对误差 (Weighted Mean Absolute Error)
+
+    WMAE = (Σ W[i,j] * |I1[i,j] - I2[i,j]|) / (Σ W[i,j])
+
+    Args:
+        image1: 第一幅图像
+        image2: 第二幅图像（目标图像）
+        weight_mask: 权重mask
+
+    Returns:
+        加权MAE值
+    """
+    img1 = image1.astype(np.float64)
+    img2 = image2.astype(np.float64)
+    w = weight_mask.astype(np.float64)
+
+    diff_abs = np.abs(img1 - img2)
+    total_w = w.sum()
+    if total_w <= 0:
+        return float(np.mean(diff_abs))
+
+    w_normalized = w * (img1.size / total_w)
+    return float(np.sum(w_normalized * diff_abs) / img1.size)
+
+
+def weighted_mse_gradient(image1: np.ndarray,
+                          image2: np.ndarray,
+                          weight_mask: np.ndarray) -> np.ndarray:
+    """
+    计算加权MSE对image1像素的解析梯度
+
+    d(WMSE)/dI1[i,j] = 2 * W[i,j] * (I1[i,j] - I2[i,j]) / (Σ W[k,l])
+                      * N  （N为像素总数，保持量级与普通MSE梯度一致）
+
+    Args:
+        image1: 第一幅图像（变量，求梯度的对象）
+        image2: 第二幅图像（目标图像，视为常数）
+        weight_mask: 权重mask
+
+    Returns:
+        梯度数组，形状与image1相同
+    """
+    img1 = image1.astype(np.float64)
+    img2 = image2.astype(np.float64)
+    w = weight_mask.astype(np.float64)
+
+    n = img1.size
+    total_w = w.sum()
+    if total_w <= 0:
+        w_normalized = np.ones_like(w)
+    else:
+        w_normalized = w * (n / total_w)
+
+    return 2.0 * w_normalized * (img1 - img2) / n
+
+
+def weighted_mae_gradient(image1: np.ndarray,
+                          image2: np.ndarray,
+                          weight_mask: np.ndarray) -> np.ndarray:
+    """
+    计算加权MAE对image1像素的解析梯度
+
+    d(WMAE)/dI1[i,j] = W[i,j] * sign(I1[i,j] - I2[i,j]) / (Σ W[k,l])
+                      * N  （归一化）
+
+    Args:
+        image1: 第一幅图像（变量）
+        image2: 第二幅图像（目标）
+        weight_mask: 权重mask
+
+    Returns:
+        梯度数组
+    """
+    img1 = image1.astype(np.float64)
+    img2 = image2.astype(np.float64)
+    w = weight_mask.astype(np.float64)
+
+    n = img1.size
+    total_w = w.sum()
+    if total_w <= 0:
+        w_normalized = np.ones_like(w)
+    else:
+        w_normalized = w * (n / total_w)
+
+    diff = img1 - img2
+    sign_diff = np.sign(diff)
+    sign_diff[np.abs(diff) < 1e-12] = 0.0
+
+    return w_normalized * sign_diff / n
+
+
+@dataclass
 class CompositeLossComponents:
     """
     复合损失函数各分量值，用于日志和调试
@@ -1366,6 +1740,8 @@ class CompositeLossComponents:
     tv_smooth: float = 0.0
     epe: float = 0.0
     min_feature: float = 0.0
+    weighted_mse: float = 0.0
+    weighted_mae: float = 0.0
     total: float = 0.0
 
     def to_dict(self) -> Dict[str, float]:
@@ -1379,5 +1755,7 @@ class CompositeLossComponents:
             'tv_smooth': self.tv_smooth,
             'epe': self.epe,
             'min_feature': self.min_feature,
+            'weighted_mse': self.weighted_mse,
+            'weighted_mae': self.weighted_mae,
             'total': self.total
         }
