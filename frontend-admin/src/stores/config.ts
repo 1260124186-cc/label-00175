@@ -1,4 +1,5 @@
 import { defineStore } from 'pinia'
+import { shallowRef, nextTick } from 'vue'
 import type { SimulationConfig } from '@/types/config'
 import { configApi } from '@/api'
 
@@ -86,12 +87,16 @@ function createDefaultConfig(): SimulationConfig {
 
 export const useConfigStore = defineStore('config', {
   state: () => ({
-    config: createDefaultConfig() as SimulationConfig,
+    config: shallowRef<SimulationConfig>(createDefaultConfig()),
     loading: false,
     savedFiles: [] as any[]
   }),
 
   actions: {
+    _setConfig(newConfig: SimulationConfig): void {
+      const cloned = JSON.parse(JSON.stringify(newConfig))
+      this.config.value = cloned
+    },
     async _fetchDefaultConfig(): Promise<SimulationConfig> {
       try {
         const res: any = await configApi.getDefault()
@@ -108,7 +113,7 @@ export const useConfigStore = defineStore('config', {
       this.loading = true
       try {
         const config = await this._fetchDefaultConfig()
-        this.config = config
+        this._setConfig(config)
       } finally {
         this.loading = false
       }
@@ -119,7 +124,7 @@ export const useConfigStore = defineStore('config', {
       try {
         const res: any = await configApi.getSaved(filename)
         if (res.success && res.config) {
-          this.config = res.config as SimulationConfig
+          this._setConfig(res.config as SimulationConfig)
         }
       } catch (e) {
         console.error('加载保存配置失败:', e)
@@ -153,9 +158,8 @@ export const useConfigStore = defineStore('config', {
         const config = await this._fetchDefaultConfig()
         await this.fetchSavedList()
 
-        setTimeout(() => {
-          this.config = config
-        }, 0)
+        await nextTick()
+        this._setConfig(config)
 
       } catch (e) {
         console.error('加载初始数据失败:', e)
@@ -166,11 +170,11 @@ export const useConfigStore = defineStore('config', {
     },
 
     updateConfig(newConfig: SimulationConfig) {
-      this.config = JSON.parse(JSON.stringify(newConfig))
+      this._setConfig(newConfig)
     },
 
     resetToDefault() {
-      this.config = createDefaultConfig()
+      this._setConfig(createDefaultConfig())
     }
   }
 })
