@@ -4,6 +4,7 @@
 
 本模块提供完整的光刻优化工作流，包括：
 1. OPC (Optical Proximity Correction) - 光学邻近校正工作流
+2. SMO (Source-Mask Optimization) - 光源掩模协同优化工作流
 """
 
 from workflows.opc import (
@@ -21,6 +22,22 @@ from workflows.opc import (
     run_opc_workflow,
 )
 
+from workflows.smo import (
+    SMOptimizationStrategy,
+    SourceInitializationType,
+    SourceConstraintsConfig,
+    SMOConfig,
+    SMOIterationResult,
+    SMOWorkflowResult,
+    PixelatedSource,
+    SMOImagingModel,
+    SourceOptimizer,
+    MaskOptimizerForSMO,
+    JointGradientOptimizer,
+    SMOWorkflow,
+    run_smo_workflow,
+)
+
 __all__ = [
     'OPCConfig',
     'HotspotDetector',
@@ -34,4 +51,17 @@ __all__ = [
     'OPCIterationResult',
     'OPCWorkflowResult',
     'run_opc_workflow',
+    'SMOptimizationStrategy',
+    'SourceInitializationType',
+    'SourceConstraintsConfig',
+    'SMOConfig',
+    'SMOIterationResult',
+    'SMOWorkflowResult',
+    'PixelatedSource',
+    'SMOImagingModel',
+    'SourceOptimizer',
+    'MaskOptimizerForSMO',
+    'JointGradientOptimizer',
+    'SMOWorkflow',
+    'run_smo_workflow',
 ]

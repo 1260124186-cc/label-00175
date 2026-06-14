@@ -1,0 +1,198 @@
+# ============================================================================
+# SMO (Source-Mask Optimization) 默认配置文件
+# ============================================================================
+# 本配置文件定义了 SMO 光源-掩模协同优化的所有可调参数。
+# SMO 同时优化照明光源分布与掩模透过率，最大化工艺窗口或最小化成像误差。
+
+# ============================================================================
+# SMO 工作流核心参数
+# ============================================================================
+smo:
+  # ---------- 优化策略 ----------
+  # 可选值: alternating, joint_gradient, source_first
+  #   alternating:   交替优化（固定 source 优化 mask → 固定 mask 优化 source）
+  #   joint_gradient: 联合梯度下降（同时更新 source 和 mask）
+  #   source_first:  先单独优化 source 若干轮，再固定 source 优化 mask
+  strategy: alternating
+
+  # ---------- 迭代控制 ----------
+  # 外层交替优化最大迭代次数
+  max_outer_iterations: 20
+
+  # 每轮光源优化最大迭代次数
+  source_max_iter: 50
+
+  # 每轮掩模优化最大迭代次数
+  mask_max_iter: 100
+
+  # 联合梯度下降最大迭代次数（仅 joint_gradient 策略生效）
+  joint_max_iter: 200
+
+  # ---------- 学习率 ----------
+  # 光源优化学习率
+  source_learning_rate: 0.005
+
+  # 掩模优化学习率
+  mask_learning_rate: 0.01
+
+  # 联合优化时光源学习率
+  joint_learning_rate_source: 0.003
+
+  # 联合优化时掩模学习率
+  joint_learning_rate_mask: 0.008
+
+  # ---------- 收敛控制 ----------
+  # 收敛容差（损失改善低于此值视为无改善）
+  tol: 1.0e-5
+
+  # 收敛耐心值（连续 N 轮无改善则提前终止）
+  convergence_patience: 5
+
+  # ---------- 像素化光源参数 ----------
+  # 光源网格尺寸 (ny, nx)，null 表示与掩模同尺寸
+  source_grid_size: null
+
+  # 光源初始化类型: conventional, annular, dipole, quasar, uniform_disk, random, custom
+  source_init_type: conventional
+
+  # 光源初始化额外参数（根据 init_type 不同而异）
+  source_init_params: {}
+
+  # ---------- 光源约束 ----------
+  source_constraints:
+    # 是否启用总能量守恒约束（归一化到 energy_target）
+    energy_conservation: true
+
+    # 目标总能量
+    energy_target: 1.0
+
+    # 目标等效 sigma 值，null 则不强制约束
+    sigma_target: null
+
+    # sigma 约束容差
+    sigma_tolerance: 0.02
+
+    # 平滑正则化权重（0 则禁用平滑）
+    smoothness_weight: 0.01
+
+    # 平滑类型: tv（全变差） 或 gaussian
+    smoothness_type: tv
+
+    # 高斯平滑 sigma（像素单位），仅 smoothness_type=gaussian 时生效
+    gaussian_sigma: 1.5
+
+    # 是否强制光源强度非负
+    non_negative: true
+
+    # 光源最大支持半径（归一化 sigma 单位），null 不限制
+    support_radius: null
+
+    # 光源最小内半径（归一化 sigma 单位），用于环形约束，null 不限制
+    support_radius_inner: null
+
+  # ---------- 成像参数 ----------
+  # 晶圆成像二值化阈值
+  wafer_threshold: 0.3
+
+  # 像素尺寸 (nm)
+  pixel_size: 1.0
+
+  # 是否使用 wafer 图像计算损失（sigmoid 近似阈值）
+  use_wafer_image_loss: true
+
+  # ---------- 损失权重 ----------
+  # 掩模侧复合损失权重
+  mask_loss_weights:
+    mse: 1.0
+    ssim: 0.0
+    pvb: 0.0
+    mask_complexity: 0.0
+    binary_penalty: 0.0
+    tv_smooth: 0.0
+    epe: 0.5
+    min_feature: 0.0
+    weighted_mse: 0.0
+    weighted_mae: 0.0
+
+  # 光源侧损失权重
+  source_loss_weights:
+    mse: 1.0
+    epe: 0.5
+
+  # ---------- 多工艺条件（工艺窗口优化）----------
+  # 工艺条件列表，每项为 {defocus: nm, dose: 相对剂量, weight: 权重}
+  # null 则仅使用标称条件
+  process_conditions: null
+  # 示例（取消注释启用）:
+  # process_conditions:
+  #   - {defocus: -50.0, dose: 0.95, weight: 1.0}
+  #   - {defocus: 0.0,   dose: 1.0,  weight: 2.0}
+  #   - {defocus: 50.0,  dose: 1.05, weight: 1.0}
+
+  # 工艺变化带宽（PVB）损失权重，仅 process_conditions 非空时有效
+  pvb_weight: 0.0
+
+  # ---------- 输出控制 ----------
+  # 光源快照保存频率（每 N 次外层迭代保存一次）
+  source_snapshot_freq: 1
+
+  # 是否输出详细日志
+  verbose: true
+
+# ============================================================================
+# 光学系统参数
+# ============================================================================
+optical_system:
+  # 光源波长 (nm), ArF 光源
+  wavelength: 193.0
+
+  # 数值孔径 (Numerical Aperture)
+  na: 1.35
+
+  # 部分相干因子 (0~1)
+  sigma: 0.75
+
+  # 像素尺寸 (nm)
+  pixel_size: 1.0
+
+  # 离焦量 (nm)
+  defocus: 0.0
+
+  # 放大倍率
+  magnification: 4.0
+
+  # 照明模式: conventional, annular, dipole, quasar, custom
+  illumination_type: conventional
+
+  # 光源形状参数
+  source_params:
+    sigma_inner: 0.0
+    sigma_outer: 0.75
+
+  # TCC 计算模式: full_tcc, socs, kernel_2d
+  tcc_mode: socs
+
+  # SOCS 分解项数
+  socs_num_terms: 8
+
+  # Zernike 像差系数（单位: 波长λ）
+  zernike_coefficients: {}
+
+# ============================================================================
+# 测试图案配置（示例使用）
+# ============================================================================
+test_pattern:
+  # 图案类型: line_space, contact_hole, l_shaped_corner, t_junction
+  type: line_space
+
+  # 网格尺寸 (ny, nx)
+  grid_size: [64, 64]
+
+  # 关键尺寸 (nm)
+  cd: 45.0
+
+  # 间距 (nm)
+  pitch: 90.0
+
+  # 线方向: horizontal, vertical
+  orientation: horizontal
