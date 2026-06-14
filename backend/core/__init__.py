@@ -78,6 +78,21 @@ from core.litho_metrics import (
     ProcessWindowScanResult,
     extract_process_window_scan,
 )
+from core.rigorous_sim import (
+    SimulationBackend,
+    Polarization,
+    RCWAConfig,
+    FDTDConfig,
+    SimulationResult,
+    RCWASolver1D,
+    simulate,
+    simulate_multi_process_unified,
+    BackendComparisonReport,
+    compare_backends,
+    batch_compare_backends,
+    export_comparison_csv,
+    make_simulate_fn_for_optimizer,
+)
 
 __all__ = [
     'OpticalSystem',
@@ -160,4 +175,17 @@ __all__ = [
     'evaluate_litho_metrics',
     'ProcessWindowScanResult',
     'extract_process_window_scan',
+    'SimulationBackend',
+    'Polarization',
+    'RCWAConfig',
+    'FDTDConfig',
+    'SimulationResult',
+    'RCWASolver1D',
+    'simulate',
+    'simulate_multi_process_unified',
+    'BackendComparisonReport',
+    'compare_backends',
+    'batch_compare_backends',
+    'export_comparison_csv',
+    'make_simulate_fn_for_optimizer',
 ]

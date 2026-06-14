@@ -20,6 +20,13 @@ from core.imaging import (
     downsample_mask, upsample_mask, build_pyramid_scales,
     split_tiles, merge_tiles_with_blend
 )
+from core.rigorous_sim import (
+    SimulationBackend,
+    RCWAConfig,
+    FDTDConfig,
+    simulate as unified_simulate,
+    simulate_multi_process_unified,
+)
 from core.fft import (
     create_bandlimit_mask, bandlimit_projection,
     bandlimited_gradient_projection, BandlimitType
@@ -375,6 +382,13 @@ class OptimizationConfig:
     log_experiment_config: bool = True  # 是否记录配置
     log_metrics_freq: int = 1  # 记录指标的频率
 
+    # 严格电磁仿真后端配置（与标量 Hopkins 并行）
+    simulation_backend: str = 'hopkins'  # 'hopkins' (标量) | 'rcwa' (矢量) | 'fdtd' (严格)
+    rcwa_config: Optional[RCWAConfig] = None   # RCWA 求解器细粒度参数
+    fdtd_config: Optional[FDTDConfig] = None   # FDTD 求解器细粒度参数
+    # 评估阶段切换为矢量后端（用于高精度最终评估）
+    use_vector_backend_for_evaluation: bool = False
+
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'OptimizationConfig':
         if d is None:
@@ -394,6 +408,10 @@ class OptimizationConfig:
                         ProcessCondition(**pc) if isinstance(pc, dict) else pc
                         for pc in value
                     ]
+                elif key == 'rcwa_config' and value is not None:
+                    cfg.rcwa_config = RCWAConfig(**value) if isinstance(value, dict) else value
+                elif key == 'fdtd_config' and value is not None:
+                    cfg.fdtd_config = FDTDConfig(**value) if isinstance(value, dict) else value
                 else:
                     setattr(cfg, key, value)
         return cfg
@@ -410,6 +428,14 @@ class OptimizationConfig:
                 result[f.name] = val.to_dict()
             elif f.name == 'process_conditions' and val is not None:
                 result[f.name] = [pc.to_dict() if hasattr(pc, 'to_dict') else pc for pc in val]
+            elif f.name in ('rcwa_config', 'fdtd_config') and val is not None:
+                d = {}
+                for k, v in val.__dict__.items():
+                    if isinstance(v, (np.ndarray, complex)):
+                        d[k] = str(v)
+                    else:
+                        d[k] = v
+                result[f.name] = d
             else:
                 result[f.name] = val
         return result
@@ -628,10 +654,80 @@ class MaskOptimizer:
         return bandlimited_gradient_projection(gradient, self._bandlimit_mask)
 
     def _setup_imaging_model(self, image_size: tuple):
-        """设置成像模型"""
+        """设置成像模型（标量 Hopkins 模型，始终初始化以用于梯度回退）"""
         self._imaging_model = PartialCoherentImaging(
             self.optical_system, image_size
         )
+        self._image_size = tuple(image_size)
+        if self.config.verbose:
+            logger.info(
+                f"仿真后端配置: "
+                f"训练={self.config.simulation_backend}, "
+                f"评估={'矢量' if self.config.use_vector_backend_for_evaluation else '标量Hopkins'}"
+            )
+
+    # ------------------------------------------------------------------
+    # 统一仿真后端集成接口
+    # ------------------------------------------------------------------
+    def _effective_backend(self, for_evaluation: bool = False) -> str:
+        """根据阶段（训练/评估）返回实际生效的仿真后端"""
+        if for_evaluation and self.config.use_vector_backend_for_evaluation:
+            # 评估阶段强制使用更精确的后端（若用户配置了 RCWA/FDTD）
+            cfg_backend = str(self.config.simulation_backend).lower()
+            if cfg_backend in ("rcwa", "fdtd"):
+                return cfg_backend
+            return "rcwa"  # 默认评估阶段回退到 RCWA
+        return str(self.config.simulation_backend).lower()
+
+    def _simulate_aerial(self, mask: np.ndarray, for_evaluation: bool = False):
+        """
+        统一空间像仿真入口：根据配置选择 Hopkins/RCWA/FDTD 后端。
+
+        对于需要梯度的训练阶段：
+        - 若后端为 Hopkins，直接返回 PartialCoherentImaging 的空间像；
+        - 若后端为 RCWA/FDTD，返回矢量修正后的空间像（数值上与 Hopkins 接近，
+          梯度可近似使用 _imaging_model.compute_image_gradient()）。
+        """
+        backend = self._effective_backend(for_evaluation=for_evaluation)
+        if backend == SimulationBackend.HOPKINS.value:
+            return self._imaging_model.compute_aerial_image(mask)
+
+        # RCWA / FDTD 路径：走 unified_simulate
+        sim_res = unified_simulate(
+            mask=mask,
+            backend=backend,
+            optical_system=self.optical_system,
+            threshold=self.config.threshold,
+            apply_resist=False,
+            pixel_size_nm=self.optical_system.pixel_size,
+            rcwa_config=self.config.rcwa_config,
+            fdtd_config=self.config.fdtd_config,
+        )
+        return sim_res.aerial_image
+
+    def _simulate_wafer(self, mask: np.ndarray, for_evaluation: bool = False):
+        """
+        统一晶圆图仿真入口（含阈值/光刻胶模型）。
+        """
+        backend = self._effective_backend(for_evaluation=for_evaluation)
+        if backend == SimulationBackend.HOPKINS.value:
+            # 沿用 Hopkins 原生路径
+            aerial = self._imaging_model.compute_aerial_image(mask)
+            if self.config.use_wafer_image_loss:
+                return _apply_threshold_for_loss(aerial, self.config.threshold)
+            return aerial
+
+        sim_res = unified_simulate(
+            mask=mask,
+            backend=backend,
+            optical_system=self.optical_system,
+            threshold=self.config.threshold,
+            apply_resist=self.config.use_wafer_image_loss,
+            pixel_size_nm=self.optical_system.pixel_size,
+            rcwa_config=self.config.rcwa_config,
+            fdtd_config=self.config.fdtd_config,
+        )
+        return sim_res.wafer_image if self.config.use_wafer_image_loss else sim_res.aerial_image
 
     def _setup_optimizer(self):
         """设置优化器"""
