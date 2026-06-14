@@ -16,7 +16,11 @@ WORKDIR /app
 
 # 先复制 package.json，利用 docker 缓存
 COPY package.json package-lock.json* /app/
-RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+# 解决 esbuild ETXTBSY 错误：禁用脚本后手动安装 esbuild
+RUN npm config set ignore-scripts true \
+    && npm install \
+    && npm config set ignore-scripts false \
+    && npm rebuild esbuild 2>/dev/null || npm install esbuild --force
 
 # 复制源码并构建
 COPY . /app/

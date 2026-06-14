@@ -9,6 +9,16 @@ import App from './App.vue'
 import router from './router'
 import './styles/index.scss'
 
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.getRegistrations()
+    .then(registrations => {
+      return Promise.all(registrations.map(reg => reg.unregister()))
+    })
+    .catch(err => {
+      console.error('Service Worker cleanup error:', err)
+    })
+}
+
 const app = createApp(App)
 
 for (const [key, component] of Object.entries(ElementPlusIconsVue)) {

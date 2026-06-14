@@ -140,9 +140,21 @@ export const useConfigStore = defineStore('config', {
 
     async loadInitialData() {
       this.loading = true
+
+      const safetyTimer = setTimeout(() => {
+        if (this.loading) {
+          console.warn('Loading timeout: forcing loading=false after 8s')
+          this.loading = false
+        }
+      }, 8000)
+
       try {
-        await Promise.all([this._fetchDefaultConfig(), this.fetchSavedList()])
+        await this._fetchDefaultConfig()
+        await this.fetchSavedList()
+      } catch (e) {
+        console.error('加载初始数据失败:', e)
       } finally {
+        clearTimeout(safetyTimer)
         this.loading = false
       }
     },

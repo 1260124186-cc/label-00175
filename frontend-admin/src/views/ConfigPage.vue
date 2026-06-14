@@ -108,7 +108,11 @@ const saveDialogVisible = ref(false)
 const saveForm = ref({ filename: '' })
 
 onMounted(async () => {
-  await configStore.loadInitialData()
+  try {
+    await configStore.loadInitialData()
+  } catch (e) {
+    console.error('加载初始数据失败:', e)
+  }
 })
 
 function handleLoadDefault() {

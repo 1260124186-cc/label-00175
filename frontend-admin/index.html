@@ -5,6 +5,21 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>光刻仿真工作台</title>
+    <script>
+      (function() {
+        if ('serviceWorker' in navigator) {
+          navigator.serviceWorker.getRegistrations()
+            .then(function(registrations) {
+              return Promise.all(registrations.map(function(reg) {
+                return reg.unregister();
+              }));
+            })
+            .catch(function(err) {
+              console.error('Service Worker cleanup error:', err);
+            });
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>
