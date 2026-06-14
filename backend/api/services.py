@@ -128,51 +128,122 @@ def _execute_simulation(task_id: str):
     try:
         add_backend_to_path()
         task["status"] = "running"
-        task["progress"] = 10
+        task["progress"] = 5
 
-        import numpy as np
-        from utils.data_io import create_test_pattern
-        from core.imaging import OpticalSystem, PartialCoherentImaging
-        from core.metrics import evaluate_all, mse
+        # ============================================================
+        # 0. 参数准备与兜底（避免 NameError / TypeError）
+        # ============================================================
+        config = task["config"] or {}
+        opt_sys_cfg = config.get("optical_system") or {}
+        pattern_type = task.get("pattern_type") or "rectangle"
+        pattern_params = task.get("pattern_params") or {}
 
-        opt_sys_cfg = task["config"]["optical_system"]
-        opt_cfg = task["config"].get("optimization", {})
+        raw_size = pattern_params.get("size", [64, 64])
+        if not isinstance(raw_size, (list, tuple)) or len(raw_size) < 2:
+            raw_size = [64, 64]
+        try:
+            size_h = max(8, int(raw_size[0]))
+            size_w = max(8, int(raw_size[1]))
+        except (TypeError, ValueError):
+            size_h, size_w = 64, 64
+        size = (size_h, size_w)
 
-        task["status"] = "running"
-        task["progress"] = 20
+        # 兜底：如果 x_end 超出图像尺寸，则 clip 以避免 create_test_pattern 内部异常
+        def _int_or_none(v, max_val):
+            if v is None:
+                return None
+            try:
+                iv = int(v)
+                return max(0, min(iv, max_val))
+            except (TypeError, ValueError):
+                return None
+
+        x_start = _int_or_none(pattern_params.get("x_start"), size_w)
+        x_end = _int_or_none(pattern_params.get("x_end"), size_w)
+        y_start = _int_or_none(pattern_params.get("y_start"), size_h)
+        y_end = _int_or_none(pattern_params.get("y_end"), size_h)
+
+        task["progress"] = 15
+
+        # ============================================================
+        # 1. 导入核心模块（缺少 numpy/scipy 时会抛 ImportError）
+        # ============================================================
+        try:
+            import numpy as np  # noqa: F401
+            from utils.data_io import create_test_pattern
+            from core.imaging import OpticalSystem, PartialCoherentImaging
+            from core.metrics import evaluate_all
+        except (ImportError, ModuleNotFoundError) as e:
+            raise RuntimeError(f"缺少依赖或后端模块导入失败: {e}") from e
+
+        task["progress"] = 30
+
+        # ============================================================
+        # 2. 构造光学系统
+        # ============================================================
+        def _f(cfg, key, default):
+            v = cfg.get(key, default)
+            try:
+                return float(v) if v is not None else default
+            except (TypeError, ValueError):
+                return default
 
         optical_system = OpticalSystem(
-            wavelength=opt_sys_cfg["wavelength"],
-            na=opt_sys_cfg["na"],
-            sigma=opt_sys_cfg["sigma"],
-            pixel_size=opt_sys_cfg.get("pixel_size", 1.0),
-            defocus=opt_sys_cfg.get("defocus", 0.0)
+            wavelength=_f(opt_sys_cfg, "wavelength", 193.0),
+            na=_f(opt_sys_cfg, "na", 1.35),
+            sigma=_f(opt_sys_cfg, "sigma", 0.75),
+            pixel_size=_f(opt_sys_cfg, "pixel_size", 1.0),
+            defocus=_f(opt_sys_cfg, "defocus", 0.0)
         )
 
-        task["progress"] = 35
-        size = tuple(pattern_params.get("size", [64, 64]))
+        task["progress"] = 45
+
+        # ============================================================
+        # 3. 生成测试图案
+        # ============================================================
         target_pattern = create_test_pattern(
             pattern_type,
             size=size,
-            x_start=pattern_params.get("x_start"),
-            x_end=pattern_params.get("x_end"),
-            y_start=pattern_params.get("y_start"),
-            y_end=pattern_params.get("y_end")
+            x_start=x_start,
+            x_end=x_end,
+            y_start=y_start,
+            y_end=y_end
         )
+        # 兜底：任何异常都返回 0 数组
+        if target_pattern is None or not hasattr(target_pattern, "shape"):
+            import numpy as np
+            target_pattern = np.zeros(size, dtype=np.float32)
 
-        task["progress"] = 50
+        task["progress"] = 60
+
+        # ============================================================
+        # 4. 成像模拟
+        # ============================================================
         imaging_model = PartialCoherentImaging(optical_system, size)
         initial_wafer_image = imaging_model.compute_aerial_image(target_pattern)
         initial_metrics = evaluate_all(initial_wafer_image, target_pattern)
 
-        task["progress"] = 80
+        task["progress"] = 85
+
+        # ============================================================
+        # 5. 组装结果
+        # ============================================================
+        def _metric(name, default=None):
+            try:
+                v = getattr(initial_metrics, name, default)
+                return float(v) if v is not None else default
+            except (TypeError, ValueError):
+                return default
 
         result = {
             "task_id": task_id,
+            "pattern_type": pattern_type,
+            "pattern_size": [size_h, size_w],
             "initial_metrics": {
-                "mse": float(initial_metrics.mse),
-                "ssim": float(initial_metrics.ssim),
-                "mae": float(initial_metrics.mae) if hasattr(initial_metrics, 'mae') else None,
+                "mse": _metric("mse", 0.0),
+                "ssim": _metric("ssim", 0.0),
+                "mae": _metric("mae"),
+                "psnr": _metric("psnr"),
             },
             "target_pattern_shape": list(target_pattern.shape),
             "wafer_image_shape": list(initial_wafer_image.shape),
@@ -184,9 +255,10 @@ def _execute_simulation(task_id: str):
 
     except Exception as e:
         logger.exception(f"仿真任务失败: {task_id}")
-        task["status"] = "failed"
-        task["error"] = str(e)
-        task["progress"] = 0
+        if task is not None:
+            task["status"] = "failed"
+            task["error"] = f"{type(e).__name__}: {e}"
+            task["progress"] = 0
 
 
 def get_task_status(task_id: str) -> Dict[str, Any]:

@@ -1,12 +1,78 @@
 # 计算光刻仿真框架 Docker Compose 配置
+#
+# 一键部署（前后端 Web 工作台）:
+#   docker compose up -d --build
+#   然后访问: http://localhost:8080
+#
+# 仅命令行使用（原 backend CLI 服务）:
+#   docker compose run --rm backend python -m examples.run_optimization
+#
 
 services:
-  # 后端仿真服务
+  # ============================================================
+  # [默认启动] 后端 API 服务（FastAPI）
+  # ============================================================
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.api
+    container_name: litho-api
+    restart: unless-stopped
+    volumes:
+      - ./results:/app/results
+      - ./backend/api/saved_configs:/app/api/saved_configs
+      - ./backend/config:/app/config:ro
+    environment:
+      - PYTHONPATH=/app
+      - NUMBA_CACHE_DIR=/tmp/numba_cache
+      - TZ=Asia/Shanghai
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).read()"]
+      interval: 15s
+      timeout: 5s
+      start_period: 40s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '4.0'
+        reservations:
+          memory: 1G
+
+  # ============================================================
+  # [默认启动] 前端 admin（Vue3 + Nginx 反代 /api）
+  # ============================================================
+  web:
+    build: ./frontend-admin
+    container_name: litho-web
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      - TZ=Asia/Shanghai
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:80/"]
+      interval: 15s
+      timeout: 3s
+      start_period: 5s
+      retries: 5
+
+  # ============================================================
+  # 后端 CLI 服务（命令行运行示例；默认不启动）
+  # ============================================================
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: litho-sim-backend
+    profiles: ["cli"]
     volumes:
       # 挂载结果输出目录
       - ./results:/app/results

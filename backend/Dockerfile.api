@@ -1,0 +1,47 @@
+# 后端 API 服务 Dockerfile
+# 基于原有的 python:3.11-slim 构建，继承原项目的 numpy/scipy/opencv 等
+FROM python:3.11-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/app
+
+# 系统依赖（opencv 运行需要）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 1) 先装原项目基础依赖（numpy/scipy 等）
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# 2) 再装 API 依赖（fastapi/uvicorn/pydantic 等）
+COPY api/requirements.txt /app/api_requirements.txt
+RUN pip install --no-cache-dir -r /app/api_requirements.txt
+
+# 3) 复制全部后端代码（包括 core/algorithms/config 等）
+COPY . /app/
+
+# 4) 创建持久化目录（保存用户上传的配置）
+RUN mkdir -p /app/api/saved_configs /app/results
+
+# 健康检查：uvicorn 启动后 /api/health 可访问
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
+    CMD python -c "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).read()" || exit 1
+
+EXPOSE 8000
+
+# 注意：这里从 /app 目录启动，把 /app 加入 PYTHONPATH（已在 ENV 设置）
+# uvicorn 以模块形式加载 backend.api.main，确保 backend/ 被视为包
+CMD ["uvicorn", "api.main:app", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--log-level", "info"]

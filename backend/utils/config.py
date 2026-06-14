@@ -353,7 +353,10 @@ def validate_config(config: Dict[str, Any]) -> bool:
     # 验证复合损失权重
     loss_weights = opt.get('loss_weights', {})
     if isinstance(loss_weights, dict):
-        valid_loss_keys = {'mse', 'ssim', 'pvb', 'mask_complexity'}
+        valid_loss_keys = {
+            'mse', 'ssim', 'pvb', 'mask_complexity',
+            'weighted_mse', 'weighted_mae'
+        }
         for key in loss_weights:
             if key not in valid_loss_keys:
                 logger.error(f"未知的损失权重键: {key}，有效键: {valid_loss_keys}")
