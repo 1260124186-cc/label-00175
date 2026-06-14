@@ -1,5 +1,14 @@
 # 后端 API 服务 Dockerfile
-# 基于原有的 python:3.11-slim 构建，继承原项目的 numpy/scipy/opencv 等
+# 基于原有的 python:3.11-slim 构建
+#
+# 关键策略：
+#   - 不再依赖 backend/requirements.txt（其中 gdstk/psutil/colorlog/h5py/gdspy 等
+#     要么需要 C 编译环境，要么仅 CLI 使用），改为直接安装 api/requirements.txt
+#     中声明的最小闭包依赖；
+#   - opencv 使用 opencv-python-headless（无需 GUI 依赖，体积小 50%+）；
+#   - numpy < 2，确保与 numba/scipy/matplotlib 完全兼容；
+#   - numba 从 0.58 起支持 Python 3.11，显式指定。
+
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -10,7 +19,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONPATH=/app
 
-# 系统依赖（opencv 运行需要）
+# 系统依赖（opencv-headless 运行仍需要 libgl1 等；numba 需要 libgomp）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
@@ -20,18 +29,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# 1) 先装原项目基础依赖（numpy/scipy 等）
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+# 1) 升级 pip / setuptools / wheel，避免老 pip 解析失败
+RUN pip install --upgrade pip setuptools wheel
 
-# 2) 再装 API 依赖（fastapi/uvicorn/pydantic 等）
+# 2) 安装 API 专用依赖（最小闭包，稳定可复现）
 COPY api/requirements.txt /app/api_requirements.txt
 RUN pip install --no-cache-dir -r /app/api_requirements.txt
 
 # 3) 复制全部后端代码（包括 core/algorithms/config 等）
 COPY . /app/
 
-# 4) 创建持久化目录（保存用户上传的配置）
+# 4) 创建持久化目录（保存用户上传的配置、仿真结果）
 RUN mkdir -p /app/api/saved_configs /app/results
 
 # 健康检查：uvicorn 启动后 /api/health 可访问
@@ -40,8 +48,8 @@ HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
 
 EXPOSE 8000
 
-# 注意：这里从 /app 目录启动，把 /app 加入 PYTHONPATH（已在 ENV 设置）
-# uvicorn 以模块形式加载 backend.api.main，确保 backend/ 被视为包
+# 注意：这里从 /app 目录启动，/app 已在 PYTHONPATH 中
+# 以模块形式加载 api.main，确保绝对导入（from routers.xxx / from services）可用
 CMD ["uvicorn", "api.main:app", \
      "--host", "0.0.0.0", "--port", "8000", \
      "--log-level", "info"]
