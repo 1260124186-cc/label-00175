@@ -78,3 +78,25 @@ Thumbs.db
 *.tmp
 *.temp
 *.bak
+
+# ============================================================
+# Node.js / 前端
+# ============================================================
+node_modules/
+.npm/
+.yarn/
+.pnpm/
+pnpm-lock.yaml
+yarn.lock
+
+# 构建产物
+frontend-admin/dist/
+frontend-admin/.vite/
+*.tsbuildinfo
+
+# ============================================================
+# Docker 持久化数据
+# ============================================================
+redis_data/
+backend/api/saved_configs/*
+!backend/api/saved_configs/.gitkeep
