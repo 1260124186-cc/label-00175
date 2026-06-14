@@ -92,13 +92,22 @@ export const useConfigStore = defineStore('config', {
   }),
 
   actions: {
-    async loadDefault() {
-      this.loading = true
+    async _fetchDefaultConfig() {
       try {
         const res: any = await configApi.getDefault()
         if (res.success && res.config) {
           this.config = res.config as SimulationConfig
         }
+      } catch (e) {
+        console.error('加载默认配置失败:', e)
+        this.config = createDefaultConfig()
+      }
+    },
+
+    async loadDefault() {
+      this.loading = true
+      try {
+        await this._fetchDefaultConfig()
       } finally {
         this.loading = false
       }
@@ -111,6 +120,9 @@ export const useConfigStore = defineStore('config', {
         if (res.success && res.config) {
           this.config = res.config as SimulationConfig
         }
+      } catch (e) {
+        console.error('加载保存配置失败:', e)
+        throw e
       } finally {
         this.loading = false
       }
@@ -121,7 +133,17 @@ export const useConfigStore = defineStore('config', {
         const res: any = await configApi.listSaved()
         this.savedFiles = res.files || []
       } catch (e) {
+        console.error('加载保存列表失败:', e)
         this.savedFiles = []
+      }
+    },
+
+    async loadInitialData() {
+      this.loading = true
+      try {
+        await Promise.all([this._fetchDefaultConfig(), this.fetchSavedList()])
+      } finally {
+        this.loading = false
       }
     },
 

@@ -108,7 +108,7 @@ const saveDialogVisible = ref(false)
 const saveForm = ref({ filename: '' })
 
 onMounted(async () => {
-  await Promise.all([configStore.loadDefault(), configStore.fetchSavedList()])
+  await configStore.loadInitialData()
 })
 
 function handleLoadDefault() {
