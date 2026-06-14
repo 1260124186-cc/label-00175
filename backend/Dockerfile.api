@@ -9,7 +9,15 @@
 #   - numpy < 2，确保与 numba/scipy/matplotlib 完全兼容；
 #   - numba 从 0.58 起支持 Python 3.11，显式指定。
 
-FROM python:3.11-slim
+# 镜像仓库前缀：官方镜像位于 library/ 命名空间下，需使用完整路径
+#   默认值: docker.io/        （直连 Docker Hub，绕过 daemon.json 中失效的镜像）
+#   DaoCloud: docker.m.daocloud.io/
+#   网易: hub-mirror.c.163.com/
+# 用法:
+#   docker build --build-arg IMAGE_REGISTRY=docker.m.daocloud.io/ .
+ARG IMAGE_REGISTRY=docker.io/
+
+FROM ${IMAGE_REGISTRY}library/python:3.11-slim
 
 WORKDIR /app
 

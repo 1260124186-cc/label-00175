@@ -1,6 +1,16 @@
 # 前端 admin Dockerfile（多阶段构建）
+#
+# 镜像仓库前缀：官方镜像位于 library/ 命名空间下，需使用完整路径
+#   默认值: docker.io/        （直连 Docker Hub，绕过 daemon.json 中失效的镜像）
+#   DaoCloud: docker.m.daocloud.io/
+#   网易: hub-mirror.c.163.com/
+# 用法:
+#   docker build --build-arg IMAGE_REGISTRY=docker.m.daocloud.io/ .
+#   IMAGE_REGISTRY=docker.m.daocloud.io/ docker compose build
+ARG IMAGE_REGISTRY=docker.io/
+
 # Stage 1: Node 构建
-FROM node:20-alpine AS builder
+FROM ${IMAGE_REGISTRY}library/node:20-alpine AS builder
 
 WORKDIR /app
 
@@ -15,7 +25,7 @@ RUN npm run build
 # ============================================================
 # Stage 2: Nginx 托管 + 反代 /api → 后端
 # ============================================================
-FROM nginx:1.27-alpine AS runner
+FROM ${IMAGE_REGISTRY}library/nginx:1.27-alpine AS runner
 
 LABEL maintainer="litho-sim-admin"
 

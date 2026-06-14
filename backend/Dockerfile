@@ -1,8 +1,19 @@
 # 计算光刻仿真框架 Dockerfile
 # 支持 ARM64 和 AMD64 架构
+#
+# 镜像仓库前缀：官方镜像位于 library/ 命名空间下，需使用完整路径
+#   默认值: docker.io/        （直连 Docker Hub，绕过 daemon.json 中失效的镜像）
+#   DaoCloud: docker.m.daocloud.io/
+#   网易: hub-mirror.c.163.com/
+#   阿里云: 需换成个人专属地址，参考阿里云容器服务文档
+# 用法:
+#   docker build --build-arg IMAGE_REGISTRY=docker.m.daocloud.io/ .
+#   IMAGE_REGISTRY=docker.m.daocloud.io/ docker compose build
+
+ARG IMAGE_REGISTRY=docker.io/
 
 # 使用官方Python镜像，支持多架构
-FROM python:3.11-slim
+FROM ${IMAGE_REGISTRY}library/python:3.11-slim
 
 # 设置工作目录
 WORKDIR /app
