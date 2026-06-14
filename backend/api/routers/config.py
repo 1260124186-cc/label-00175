@@ -31,7 +31,8 @@ async def get_default_config():
 
 @router.get("/saved", summary="列出已保存的配置文件")
 async def list_configs():
-    return list_saved_configs()
+    result = list_saved_configs()
+    return {"success": True, "count": result["count"], "files": result["files"], "message": "配置列表加载成功"}
 
 
 @router.get("/saved/{filename}", summary="加载指定的已保存配置")

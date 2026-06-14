@@ -92,22 +92,23 @@ export const useConfigStore = defineStore('config', {
   }),
 
   actions: {
-    async _fetchDefaultConfig() {
+    async _fetchDefaultConfig(): Promise<SimulationConfig> {
       try {
         const res: any = await configApi.getDefault()
         if (res.success && res.config) {
-          this.config = res.config as SimulationConfig
+          return JSON.parse(JSON.stringify(res.config)) as SimulationConfig
         }
       } catch (e) {
         console.error('加载默认配置失败:', e)
-        this.config = createDefaultConfig()
       }
+      return createDefaultConfig()
     },
 
     async loadDefault() {
       this.loading = true
       try {
-        await this._fetchDefaultConfig()
+        const config = await this._fetchDefaultConfig()
+        this.config = config
       } finally {
         this.loading = false
       }
@@ -149,8 +150,13 @@ export const useConfigStore = defineStore('config', {
       }, 8000)
 
       try {
-        await this._fetchDefaultConfig()
+        const config = await this._fetchDefaultConfig()
         await this.fetchSavedList()
+
+        setTimeout(() => {
+          this.config = config
+        }, 0)
+
       } catch (e) {
         console.error('加载初始数据失败:', e)
       } finally {
