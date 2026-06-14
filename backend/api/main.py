@@ -1,10 +1,20 @@
+import sys
+import os
 import logging
+
+_API_DIR = os.path.dirname(os.path.abspath(__file__))
+_BACKEND_ROOT = os.path.dirname(_API_DIR)
+if _BACKEND_ROOT not in sys.path:
+    sys.path.insert(0, _BACKEND_ROOT)
+if _API_DIR not in sys.path:
+    sys.path.insert(0, _API_DIR)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 
-from .routers.config import router as config_router
-from .routers.simulation import router as simulation_router
+from routers.config import router as config_router
+from routers.simulation import router as simulation_router
 
 logging.basicConfig(
     level=logging.INFO,

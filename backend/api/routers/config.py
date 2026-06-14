@@ -3,18 +3,19 @@ from typing import Optional
 
 from fastapi import APIRouter, Query
 
-from ..schemas import (
+from schemas import (
     SimulationConfig,
     ConfigResponse,
     SaveConfigRequest,
     SaveConfigResponse,
 )
-from ..services import (
+from services import (
     load_default_config,
     save_config_to_file,
     list_saved_configs,
     load_saved_config,
     delete_saved_config,
+    add_backend_to_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,6 @@ async def remove_config(filename: str):
 async def validate_config(config: SimulationConfig):
     try:
         config_dict = config.model_dump()
-        from ..services import add_backend_to_path
         add_backend_to_path()
         from utils.config import validate_config as vc
         is_valid = vc(config_dict)
