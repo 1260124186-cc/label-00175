@@ -319,6 +319,20 @@ class SMOIterationResult:
 
 
 @dataclass
+class ProcessConditionEvaluation:
+    """单工艺条件评估结果"""
+    index: int
+    defocus: float
+    dose: float
+    weight: float
+    aerial: np.ndarray
+    wafer_continuous: np.ndarray
+    wafer_binary: np.ndarray
+    epe: Dict[str, float]
+    mse: float
+
+
+@dataclass
 class SMOWorkflowResult:
     """
     SMO 工作流最终结果
@@ -328,10 +342,20 @@ class SMOWorkflowResult:
         initial_source: 初始光源
         optimal_mask: 最优掩模
         optimal_source: 最优光源
-        initial_wafer: 初始晶圆成像
-        optimal_wafer: 最优晶圆成像
-        initial_epe: 初始 EPE 统计
-        final_epe: 最终 EPE 统计
+        initial_wafer: 初始晶圆成像（标称条件）
+        optimal_wafer: 最优晶圆成像（标称条件）
+        initial_epe: 初始 EPE 统计（标称条件）
+        final_epe: 最终 EPE 统计（标称条件）
+        initial_per_condition: 初始各工艺条件评估
+        final_per_condition: 最终各工艺条件评估
+        initial_weighted_mse: 初始加权 MSE
+        final_weighted_mse: 最终加权 MSE
+        initial_pvb_hard: 初始 PVB（硬 max-min）
+        final_pvb_hard: 最终 PVB（硬 max-min）
+        initial_pvb_soft: 初始 PVB（soft 近似，与优化损失一致）
+        final_pvb_soft: 最终 PVB（soft 近似，与优化损失一致）
+        initial_total_loss: 初始总损失（与优化口径一致）
+        final_total_loss: 最终总损失（与优化口径一致）
         iterations: 所有迭代结果列表
         source_history: 光源演化历史（快照）
         mask_history: 掩模演化历史（快照）
@@ -348,6 +372,16 @@ class SMOWorkflowResult:
     optimal_wafer: np.ndarray
     initial_epe: Dict[str, float]
     final_epe: Dict[str, float]
+    initial_per_condition: List[ProcessConditionEvaluation] = field(default_factory=list)
+    final_per_condition: List[ProcessConditionEvaluation] = field(default_factory=list)
+    initial_weighted_mse: float = 0.0
+    final_weighted_mse: float = 0.0
+    initial_pvb_hard: float = 0.0
+    final_pvb_hard: float = 0.0
+    initial_pvb_soft: float = 0.0
+    final_pvb_soft: float = 0.0
+    initial_total_loss: float = 0.0
+    final_total_loss: float = 0.0
     iterations: List[SMOIterationResult] = field(default_factory=list)
     source_history: List[np.ndarray] = field(default_factory=list)
     mask_history: List[np.ndarray] = field(default_factory=list)
@@ -357,8 +391,8 @@ class SMOWorkflowResult:
     total_time: float = 0.0
 
     @property
-    def num_iterations(self) -> int:
-        return len(self.iterations)
+    def num_process_conditions(self) -> int:
+        return len(self.final_per_condition)
 
     @property
     def total_epe_improvement(self) -> float:
@@ -371,18 +405,49 @@ class SMOWorkflowResult:
             return self.total_epe_improvement / init
         return 0.0
 
+    @property
+    def total_loss_improvement(self) -> float:
+        return self.initial_total_loss - self.final_total_loss
+
+    @property
+    def total_loss_improvement_ratio(self) -> float:
+        if abs(self.initial_total_loss) > 1e-12:
+            return self.total_loss_improvement / abs(self.initial_total_loss)
+        return 0.0
+
     def summary(self) -> Dict[str, Any]:
         return {
             'initial_epe': self.initial_epe,
             'final_epe': self.final_epe,
             'total_epe_improvement': self.total_epe_improvement,
             'total_epe_improvement_ratio': self.total_epe_improvement_ratio,
+            'initial_weighted_mse': self.initial_weighted_mse,
+            'final_weighted_mse': self.final_weighted_mse,
+            'initial_pvb_hard': self.initial_pvb_hard,
+            'final_pvb_hard': self.final_pvb_hard,
+            'initial_pvb_soft': self.initial_pvb_soft,
+            'final_pvb_soft': self.final_pvb_soft,
+            'initial_total_loss': self.initial_total_loss,
+            'final_total_loss': self.final_total_loss,
+            'total_loss_improvement': self.total_loss_improvement,
+            'total_loss_improvement_ratio': self.total_loss_improvement_ratio,
+            'num_process_conditions': self.num_process_conditions,
+            'per_condition_initial': [
+                {'index': pc.index, 'defocus': pc.defocus, 'dose': pc.dose,
+                 'weight': pc.weight, 'mse': pc.mse,
+                 'epe_mean': pc.epe.get('epe_mean', 0.0)}
+                for pc in self.initial_per_condition
+            ],
+            'per_condition_final': [
+                {'index': pc.index, 'defocus': pc.defocus, 'dose': pc.dose,
+                 'weight': pc.weight, 'mse': pc.mse,
+                 'epe_mean': pc.epe.get('epe_mean', 0.0)}
+                for pc in self.final_per_condition
+            ],
             'num_iterations': self.num_iterations,
             'converged': self.converged,
             'reason': self.reason,
             'total_time': self.total_time,
-            'final_loss': self.loss_history[-1] if self.loss_history else None,
-            'initial_loss': self.loss_history[0] if self.loss_history else None,
         }
 
 
@@ -1823,6 +1888,125 @@ class SMOWorkflow:
         self._joint_optimizer: Optional[JointGradientOptimizer] = None
         self._imaging: Optional[SMOImagingModel] = None
 
+    def _evaluate_all_conditions(self,
+                                 mask: np.ndarray,
+                                 target: np.ndarray,
+                                 pixelated_source: PixelatedSource):
+        """
+        完整评估全部工艺条件。
+
+        Returns:
+            (per_cond_list, weighted_mse, pvb_hard, pvb_soft, total_loss, components)
+        """
+        cfg = self.config
+        H, W = mask.shape
+        threshold = cfg.wafer_threshold
+        k = 50.0
+        w_mse = cfg.mask_loss_weights.mse
+        pvb_w = float(cfg.pvb_weight)
+        N_pix = H * W
+
+        multi_enabled = (hasattr(self._imaging, '_process_imagers')
+                         and self._imaging._process_imagers)
+
+        if multi_enabled:
+            self._imaging.update_source_all_conditions(pixelated_source)
+            imagers_defs = self._imaging._process_imagers
+            weights = [float(w) for _, _, _, w in imagers_defs]
+            W_sum = sum(weights) or 1.0
+            norm_w = [w / W_sum for w in weights]
+            N_c = len(imagers_defs)
+
+            per_cond_list = []
+            wafers = []
+            per_mse = []
+
+            for i, (imager, df, dose, raw_w) in enumerate(imagers_defs):
+                aerial_i = imager.compute_aerial_image(mask)
+                a_d = np.clip(aerial_i * dose, 0.0, None)
+                if cfg.use_wafer_image_loss:
+                    w_cont_i = 1.0 / (1.0 + np.exp(-k * (a_d - threshold)))
+                else:
+                    w_cont_i = a_d
+                w_bin_i = (w_cont_i >= threshold).astype(np.float64)
+                mse_i = float(np.mean((w_cont_i - target) ** 2))
+                epe_i = compute_epe(w_bin_i, target, pixel_size=cfg.pixel_size)
+                per_cond_list.append(ProcessConditionEvaluation(
+                    index=i, defocus=float(df), dose=float(dose), weight=float(norm_w[i]),
+                    aerial=aerial_i, wafer_continuous=w_cont_i, wafer_binary=w_bin_i,
+                    epe=epe_i, mse=mse_i,
+                ))
+                wafers.append(w_cont_i)
+                per_mse.append(mse_i)
+
+            L_mse = 0.0
+            for i in range(N_c):
+                L_mse += norm_w[i] * per_mse[i]
+            total_loss = w_mse * L_mse
+
+            pvb_hard = 0.0
+            pvb_soft = 0.0
+            if pvb_w > 0 and N_c >= 2:
+                wafer_stack = np.stack(wafers, axis=0)
+                hard_bw = np.max(wafer_stack, axis=0) - np.min(wafer_stack, axis=0)
+                pvb_hard = float(np.mean(hard_bw ** 2))
+                s_max, s_min, _, _ = _soft_max_min(wafer_stack, temperature=0.05)
+                soft_bw = s_max - s_min
+                pvb_soft = float(np.mean(soft_bw ** 2))
+                total_loss += pvb_w * pvb_soft
+
+            components = {
+                'weighted_mse': L_mse, 'mse_per_cond': per_mse,
+                'pvb_hard_L2': pvb_hard, 'pvb_soft_L2': pvb_soft,
+                'source_sigma': pixelated_source.compute_effective_sigma(),
+            }
+            if cfg.mask_loss_weights.epe > 0:
+                weighted_epe = 0.0
+                for i in range(N_c):
+                    weighted_epe += norm_w[i] * per_cond_list[i].epe.get('epe_mean', 0.0)
+                total_loss += cfg.mask_loss_weights.epe * weighted_epe
+                components['epe_mean_weighted'] = weighted_epe
+            nominal_epe = per_cond_list[0].epe if per_cond_list else {}
+            components['epe_mean'] = nominal_epe.get('epe_mean', 0.0)
+
+        else:
+            self._imaging.update_source(pixelated_source)
+            aerial = self._imaging.compute_aerial_image(mask)
+            if cfg.use_wafer_image_loss:
+                wafer_cont = 1.0 / (1.0 + np.exp(-k * (aerial - threshold)))
+            else:
+                wafer_cont = aerial
+            wafer_binary = (wafer_cont >= threshold).astype(np.float64)
+            diff = wafer_cont - target
+            mse_val = float(np.mean(diff ** 2))
+            epe_stats = compute_epe(wafer_binary, target, pixel_size=cfg.pixel_size)
+            per_cond_list = [ProcessConditionEvaluation(
+                index=0, defocus=float(getattr(self._imaging._current_optics, 'defocus', 0.0)),
+                dose=1.0, weight=1.0,
+                aerial=aerial, wafer_continuous=wafer_cont, wafer_binary=wafer_binary,
+                epe=epe_stats, mse=mse_val,
+            )]
+            L_mse = mse_val
+            pvb_hard = 0.0
+            pvb_soft = 0.0
+            total_loss = w_mse * mse_val
+            components = {
+                'mse': mse_val,
+                'source_sigma': pixelated_source.compute_effective_sigma(),
+                'epe_mean': epe_stats.get('epe_mean', 0.0),
+            }
+            if cfg.mask_loss_weights.epe > 0:
+                total_loss += cfg.mask_loss_weights.epe * epe_stats.get('epe_mean', 0.0)
+
+        sm_cfg = pixelated_source.constraints
+        if sm_cfg.smoothness_weight > 0:
+            tv_val = pixelated_source.compute_smoothness_penalty()
+            tv_w = float(sm_cfg.smoothness_weight)
+            total_loss += tv_w * tv_val
+            components['source_tv'] = tv_val
+
+        return per_cond_list, L_mse, pvb_hard, pvb_soft, total_loss, components
+
     def _evaluate_state(self,
                         mask: np.ndarray,
                         target: np.ndarray,
@@ -1836,101 +2020,22 @@ class SMOWorkflow:
 
         所有分量均使用与 SourceOptimizer/JointGradientOptimizer 完全相同的
         前向链路和数值，保证“评估 ↔ 优化”闭环的一致性。
+
+        内部委托给 _evaluate_all_conditions()，提取标称条件（索引 0）的
+        wafer/aerial/EPE 作为快捷返回值。
         """
-        cfg = self.config
-        H, W = mask.shape
-        N_pix = H * W
-        threshold = cfg.wafer_threshold
-        k = 50.0
-        w_mse = cfg.mask_loss_weights.mse
-        pvb_w = float(cfg.pvb_weight)
+        per_cond_list, weighted_mse, pvb_hard, pvb_soft, total_loss, components = \
+            self._evaluate_all_conditions(mask, target, pixelated_source)
 
-        multi_enabled = (hasattr(self._imaging, '_process_imagers')
-                         and self._imaging._process_imagers)
-
-        if multi_enabled:
-            # —— 更新光源到所有条件 ——
-            self._imaging.update_source_all_conditions(pixelated_source)
-
-            imagers_defs = self._imaging._process_imagers
-            weights = [float(w) for _, _, _, w in imagers_defs]
-            W_sum = sum(weights) or 1.0
-            norm_w = [w / W_sum for w in weights]
-            N_c = len(imagers_defs)
-
-            wafers, aerial_list, per_mse = [], [], []
-            for imager, df, dose, _ in imagers_defs:
-                aerial_i = imager.compute_aerial_image(mask)
-                a_d = np.clip(aerial_i * dose, 0.0, None)
-                aerial_list.append(aerial_i)
-                if cfg.use_wafer_image_loss:
-                    w_i = 1.0 / (1.0 + np.exp(-k * (a_d - threshold)))
-                else:
-                    w_i = a_d
-                wafers.append(w_i)
-                per_mse.append(float(np.mean((w_i - target) ** 2)))
-
-            # 标称条件 wafer（用于 EPE 和显示）
-            aerial = aerial_list[0]
-            wafer_cont = wafers[0]
-            wafer_binary = (wafer_cont >= threshold).astype(np.float64)
-
-            # MSE（加权平均）
-            L_mse = 0.0
-            for i in range(N_c):
-                L_mse += norm_w[i] * per_mse[i]
-            total_loss = w_mse * L_mse
-
-            # PVB（硬值用于指标报告）
-            pvb_hard = 0.0
-            pvb_soft = 0.0
-            if pvb_w > 0 and N_c >= 2:
-                wafer_stack = np.stack(wafers, axis=0)
-                hard_bw = np.max(wafer_stack, axis=0) - np.min(wafer_stack, axis=0)
-                pvb_hard = float(np.mean(hard_bw ** 2))
-                # 优化时使用的 soft PVB（也做一次评估，便于日志对比）
-                s_max, s_min, _, _ = _soft_max_min(wafer_stack, temperature=0.05)
-                soft_bw = s_max - s_min
-                pvb_soft = float(np.mean(soft_bw ** 2))
-                total_loss += pvb_w * pvb_soft
-
-            components = {
-                'weighted_mse': L_mse,
-                'mse_per_cond': per_mse,
-                'pvb_hard_L2': pvb_hard,
-                'pvb_soft_L2': pvb_soft,
-                'source_sigma': pixelated_source.compute_effective_sigma(),
-            }
-
+        nominal = per_cond_list[0] if per_cond_list else None
+        if nominal is not None:
+            aerial = nominal.aerial
+            wafer_binary = nominal.wafer_binary
+            epe_stats = nominal.epe
         else:
-            # —— 回退：单标称条件 ——
-            self._imaging.update_source(pixelated_source)
-            aerial = self._imaging.compute_aerial_image(mask)
-            if cfg.use_wafer_image_loss:
-                wafer_cont = 1.0 / (1.0 + np.exp(-k * (aerial - threshold)))
-            else:
-                wafer_cont = aerial
-            wafer_binary = (wafer_cont >= threshold).astype(np.float64)
-            diff = wafer_cont - target
-            mse_val = float(np.mean(diff ** 2))
-            total_loss = w_mse * mse_val
-            components = {
-                'mse': mse_val,
-                'source_sigma': pixelated_source.compute_effective_sigma(),
-            }
-
-        # EPE（硬阈值，指标）
-        epe_stats = compute_epe(wafer_binary, target, pixel_size=cfg.pixel_size)
-        if cfg.mask_loss_weights.epe > 0:
-            total_loss += cfg.mask_loss_weights.epe * epe_stats.get('epe_mean', 0.0)
-            components['epe_mean'] = epe_stats.get('epe_mean', 0.0)
-
-        # Source TV（与优化器一致）
-        sm_cfg = pixelated_source.constraints
-        if sm_cfg.smoothness_weight > 0:
-            tv_val = pixelated_source.compute_smoothness_penalty()
-            total_loss += sm_cfg.smoothness_weight * tv_val
-            components['source_tv'] = tv_val
+            aerial = np.zeros_like(mask)
+            wafer_binary = np.zeros_like(mask)
+            epe_stats = {}
 
         return total_loss, components, aerial, wafer_binary, epe_stats
 
@@ -2202,24 +2307,23 @@ class SMOWorkflow:
             reason = f"达到最大外层迭代次数 {self.config.max_outer_iterations}"
 
         pixelated_source.set_intensity(best_source_intensity, auto_project=True)
-        # ★ 更新到 SMOImagingModel 的所有工艺条件，而不仅仅是标称
-        if self._multi_cond_enabled:
-            self._imaging.update_source_all_conditions(pixelated_source)
-        else:
-            self._imaging.update_source(pixelated_source)
 
-        # ★ 使用优化后的像素化光源 + 标称工艺条件 重算 aerial & wafer
-        # （最终评估使用标称条件，但必须基于优化后的 custom source，不能回退到默认照明）
-        final_aerial = self._imaging.compute_aerial_image(best_mask)
-        k_resist = 50.0
-        threshold = self.config.wafer_threshold
-        a_scaled = np.clip(final_aerial, 0.0, None)
-        if self.config.use_wafer_image_loss:
-            final_wafer_cont = 1.0 / (1.0 + np.exp(-k_resist * (a_scaled - threshold)))
-        else:
-            final_wafer_cont = a_scaled
-        final_wafer = (final_wafer_cont >= threshold).astype(np.float64)
-        final_epe = compute_epe(final_wafer, target, pixel_size=self.config.pixel_size)
+        # ★ 最终完整评估：基于优化后的 pixelated source 对全部工艺条件重算
+        final_per_cond, final_weighted_mse, final_pvb_hard, final_pvb_soft, final_total_loss, final_comps = \
+            self._evaluate_all_conditions(best_mask, target, pixelated_source)
+
+        final_nominal = final_per_cond[0] if final_per_cond else None
+        final_wafer = final_nominal.wafer_binary if final_nominal else np.zeros_like(best_mask)
+        final_epe = final_nominal.epe if final_nominal else {}
+
+        # ★ 初始完整评估（与最终评估同口径）
+        pixelated_source.set_intensity(initial_source_arr, auto_project=True)
+        init_per_cond, init_weighted_mse, init_pvb_hard, init_pvb_soft, init_total_loss, init_comps = \
+            self._evaluate_all_conditions(initial_mask_arr, target, pixelated_source)
+
+        init_nominal = init_per_cond[0] if init_per_cond else None
+        init_wafer = init_nominal.wafer_binary if init_nominal else np.zeros_like(initial_mask_arr)
+        init_epe = init_nominal.epe if init_nominal else {}
 
         total_time = time.time() - start_time
 
@@ -2232,6 +2336,16 @@ class SMOWorkflow:
             optimal_wafer=final_wafer,
             initial_epe=init_epe,
             final_epe=final_epe,
+            initial_per_condition=init_per_cond,
+            final_per_condition=final_per_cond,
+            initial_weighted_mse=init_weighted_mse,
+            final_weighted_mse=final_weighted_mse,
+            initial_pvb_hard=init_pvb_hard,
+            final_pvb_hard=final_pvb_hard,
+            initial_pvb_soft=init_pvb_soft,
+            final_pvb_soft=final_pvb_soft,
+            initial_total_loss=init_total_loss,
+            final_total_loss=final_total_loss,
             iterations=iterations,
             source_history=source_history,
             mask_history=mask_history,
@@ -2247,12 +2361,18 @@ class SMOWorkflow:
             logger.info(f"{'='*70}")
             logger.info(f"  收敛: {'是' if converged else '否'} — {reason}")
             logger.info(f"  总耗时: {total_time:.2f} 秒")
-            logger.info(f"  外层迭代: {len([it for it in iterations if it.phase in ('alternating_outer','joint','source')])}")
-            logger.info(f"  初始 EPE: {init_epe.get('epe_mean', 0):.3f} nm → "
-                       f"最终 EPE: {final_epe.get('epe_mean', 0):.3f} nm")
+            logger.info(f"  工艺条件数: {len(final_per_cond)}")
+            logger.info(f"  初始加权 MSE: {init_weighted_mse:.6f} → 最终: {final_weighted_mse:.6f}")
+            logger.info(f"  初始 PVB(soft): {init_pvb_soft:.6f} → 最终: {final_pvb_soft:.6f}")
+            logger.info(f"  初始总损失: {init_total_loss:.6f} → 最终: {final_total_loss:.6f}")
+            logger.info(f"  初始 EPE(标称): {init_epe.get('epe_mean', 0):.3f} nm → "
+                       f"最终: {final_epe.get('epe_mean', 0):.3f} nm")
             logger.info(f"  EPE 改善: {result.total_epe_improvement:.3f} nm "
                        f"({result.total_epe_improvement_ratio*100:.1f}%)")
-            logger.info(f"  初始损失: {loss_history[0]:.6f} → 最终损失: {best_loss:.6f}")
+            for i, pc in enumerate(final_per_cond):
+                logger.info(f"  cond[{i}] df={pc.defocus:+.0f}nm dose={pc.dose:.2f} "
+                           f"w={pc.weight:.3f} MSE={pc.mse:.6f} "
+                           f"EPE={pc.epe.get('epe_mean', 0):.2f}nm")
 
         return result
 
