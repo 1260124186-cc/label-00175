@@ -1,0 +1,69 @@
+# ============================================================================
+# 实验: OPC 工作流 - EPE 收敛回归
+# ============================================================================
+# 验证 OPC 工作流在线/空间图案上的 EPE 改善行为
+
+experiment:
+  name: opc_epe_regression
+  description: "验证 OPC 工作流的 EPE 改善，确保热点校正与 SRAF 插入有效"
+  tags: [regression, opc, epe]
+  workflow: opc
+
+pattern:
+  type: line_space
+  grid_size: [64, 64]
+  pixel_size: 1.0
+  cd: 45.0
+  pitch: 90.0
+  orientation: horizontal
+
+optical:
+  wavelength: 193.0
+  na: 1.35
+  sigma: 0.75
+  pixel_size: 1.0
+  defocus: 0.0
+  magnification: 4.0
+  illumination_type: conventional
+  source_params:
+    sigma_inner: 0.0
+    sigma_outer: 0.75
+  tcc_mode: socs
+  socs_num_terms: 5
+  zernike_coefficients: {}
+
+optimizer:
+  type: gradient_descent
+  max_iter: 50
+  learning_rate: 0.05
+  early_stop_patience: 5
+  random_seed: 42
+
+opc:
+  epe_threshold: 3.0
+  epe_convergence_threshold: 2.0
+  max_iterations: 3
+  min_hotspot_area: 4
+  sraf_enable: true
+  sraf_min_distance: 2.0
+  sraf_max_distance: 5.0
+  sraf_width: 1.0
+  sraf_length: 4.0
+  optimizer_enable: false
+  pixel_size: 1.0
+  wafer_threshold: 0.3
+  verbose: false
+
+assertions:
+  - type: mse_threshold
+    threshold: 0.1
+    description: "OPC 后 MSE 应低于 0.1"
+
+  - type: epe_threshold
+    threshold: 5.0
+    description: "最终 EPE 应低于 5.0nm"
+
+  - type: golden_deviation
+    golden_path: golden.json
+    tolerance: 0.10
+    description: "与 golden 结果偏差不超过 10%"

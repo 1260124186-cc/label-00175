@@ -1,0 +1,58 @@
+# ============================================================================
+# 实验: Line/Space 掩模优化 - MSE 收敛回归
+# ============================================================================
+# 验证 MaskOptimizer 在标准线/空间图案上的 MSE 收敛行为
+
+experiment:
+  name: line_space_mse_convergence
+  description: "验证梯度下降优化器在线/空间图案上的 MSE 收敛，确保算法改动不导致结果漂移"
+  tags: [regression, mask_optimization, line_space]
+  workflow: mask_optimization
+
+pattern:
+  type: line_space
+  grid_size: [64, 64]
+  pixel_size: 1.0
+  cd: 45.0
+  pitch: 90.0
+  corner_rounding: 0.0
+  orientation: horizontal
+
+optical:
+  wavelength: 193.0
+  na: 1.35
+  sigma: 0.75
+  pixel_size: 1.0
+  defocus: 0.0
+  magnification: 4.0
+  illumination_type: conventional
+  source_params:
+    sigma_inner: 0.0
+    sigma_outer: 0.75
+  tcc_mode: socs
+  socs_num_terms: 5
+  zernike_coefficients: {}
+
+optimizer:
+  type: gradient_descent
+  max_iter: 100
+  learning_rate: 0.01
+  tol: 1.0e-6
+  early_stop_patience: 10
+  random_seed: 42
+  loss_weights:
+    mse: 1.0
+
+assertions:
+  - type: mse_threshold
+    threshold: 0.01
+    description: "最终 MSE 应低于 0.01"
+
+  - type: convergence_steps
+    max_steps: 100
+    description: "100 步内应收敛"
+
+  - type: golden_deviation
+    golden_path: golden.json
+    tolerance: 0.05
+    description: "与 golden 结果偏差不超过 5%"

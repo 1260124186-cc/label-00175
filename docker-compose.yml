@@ -273,6 +273,37 @@ services:
     profiles:
       - test
 
+  # ------------------------------------------------------------------
+  # 回归测试服务（配置驱动的实验编排与 CI 回归）
+  #   用法：
+  #     docker compose run --rm regression
+  #     docker compose run --rm regression pytest experiments/ -v -k mask_optimization
+  #     docker compose run --rm regression python -m experiments.run_experiments experiments/ --generate-golden
+  # ------------------------------------------------------------------
+  regression:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      <<: *common-build
+    container_name: litho-regression
+    volumes:
+      - ./backend:/app
+      - ./experiment_results:/app/experiment_results
+    environment:
+      - PYTHONPATH=/app
+      - NUMBA_CACHE_DIR=/tmp/numba_cache
+    command: pytest experiments/ -v --tb=short
+    profiles:
+      - regression
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+          cpus: '4.0'
+        reservations:
+          memory: 2G
+          cpus: '1.0'
+
 # ----------------------------------------------------------------------
 # 挂载卷
 # ----------------------------------------------------------------------

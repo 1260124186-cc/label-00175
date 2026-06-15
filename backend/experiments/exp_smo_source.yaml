@@ -1,0 +1,72 @@
+# ============================================================================
+# 实验: SMO 工作流 - 损失改善回归
+# ============================================================================
+# 验证 SMO 光源-掩模协同优化的损失改善行为
+
+experiment:
+  name: smo_loss_improvement
+  description: "验证 SMO 交替优化策略的损失改善，确保光源与掩模联合优化有效"
+  tags: [regression, smo, source_mask]
+  workflow: smo
+
+pattern:
+  type: line_space
+  grid_size: [64, 64]
+  pixel_size: 1.0
+  cd: 45.0
+  pitch: 90.0
+  orientation: horizontal
+
+optical:
+  wavelength: 193.0
+  na: 1.35
+  sigma: 0.75
+  pixel_size: 1.0
+  defocus: 0.0
+  magnification: 4.0
+  illumination_type: conventional
+  source_params:
+    sigma_inner: 0.0
+    sigma_outer: 0.75
+  tcc_mode: socs
+  socs_num_terms: 5
+  zernike_coefficients: {}
+
+optimizer:
+  type: gradient_descent
+  max_iter: 50
+  learning_rate: 0.01
+  random_seed: 42
+
+smo:
+  strategy: alternating
+  max_outer_iterations: 3
+  source_max_iter: 10
+  mask_max_iter: 20
+  source_learning_rate: 0.005
+  mask_learning_rate: 0.01
+  tol: 1.0e-4
+  convergence_patience: 3
+  source_init_type: conventional
+  wafer_threshold: 0.3
+  pixel_size: 1.0
+  use_wafer_image_loss: true
+  mask_loss_weights:
+    mse: 1.0
+  source_loss_weights:
+    mse: 1.0
+  verbose: false
+
+assertions:
+  - type: mse_threshold
+    threshold: 0.1
+    description: "SMO 后 MSE 应低于 0.1"
+
+  - type: loss_improvement
+    threshold: 0.0
+    description: "损失应有改善（改善比例 >= 0）"
+
+  - type: golden_deviation
+    golden_path: golden.json
+    tolerance: 0.10
+    description: "与 golden 结果偏差不超过 10%"
