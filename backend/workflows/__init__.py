@@ -5,6 +5,7 @@
 本模块提供完整的光刻优化工作流，包括：
 1. OPC (Optical Proximity Correction) - 光学邻近校正工作流
 2. SMO (Source-Mask Optimization) - 光源掩模协同优化工作流
+3. ILT (Inverse Lithography Technology) - 反演光刻工作流
 """
 
 from workflows.opc import (
@@ -38,6 +39,22 @@ from workflows.smo import (
     run_smo_workflow,
 )
 
+from workflows.ilt import (
+    TransmissionLevel,
+    ILTOptimizerType,
+    ILTLossComponent,
+    ILTComplexityConfig,
+    ILTConfig,
+    ILTIterationResult,
+    ILTWorkflowResult,
+    DifferentiableImagingChain,
+    GradientProjector,
+    MaskComplexityPenalty,
+    MultiObjectiveILT,
+    ILTWorkflow,
+    run_ilt_workflow,
+)
+
 __all__ = [
     'OPCConfig',
     'HotspotDetector',
@@ -64,4 +81,17 @@ __all__ = [
     'JointGradientOptimizer',
     'SMOWorkflow',
     'run_smo_workflow',
+    'TransmissionLevel',
+    'ILTOptimizerType',
+    'ILTLossComponent',
+    'ILTComplexityConfig',
+    'ILTConfig',
+    'ILTIterationResult',
+    'ILTWorkflowResult',
+    'DifferentiableImagingChain',
+    'GradientProjector',
+    'MaskComplexityPenalty',
+    'MultiObjectiveILT',
+    'ILTWorkflow',
+    'run_ilt_workflow',
 ]
