@@ -1063,8 +1063,9 @@ class SMOImagingModel:
             dA = dTotal_dAerial_list[i]
 
             # —— dI/dMask (Hopkins gradient 已考虑 source) ——
-            dm = imager.compute_image_gradient(mask)
-            dTotal_dMask += dfa * dm
+            dm = imager.compute_image_gradient(mask)  # 物理梯度 ∂I/∂M
+            # ★ 链式法则：dL/dM_i = dL/dI_i ⊙ ∂I_i/∂M  （逐像素相乘）
+            dTotal_dMask += dfa * (dA * dm)
 
             # —— dI/dSource ——
             ds = imager.compute_source_gradient(mask, dA)
@@ -1562,9 +1563,9 @@ class MaskOptimizerForSMO:
                 loss_val = w_mse * mse_val
                 dLdW = 2.0 * w_mse * diff / N_pix
                 dLdA = dLdW * dWdA
-                dL_dMask = self.imaging.compute_mask_gradient(mask)
-                corr = 1.0 + 10.0 * np.mean(np.abs(dLdA))
-                dL_dMask = dL_dMask * corr
+                # ★ 链式法则：dL/dM = (∂I/∂M) ⊙ dL/dI
+                physical_grad = self.imaging.compute_mask_gradient(mask)  # ∂I/∂M
+                dL_dMask = physical_grad * dLdA
 
             loss_history.append(loss_val)
 
@@ -1707,14 +1708,9 @@ class JointGradientOptimizer:
             dLdW = 2.0 * w_mse * diff / N_pix
             dLdA = dLdW * dWdA
 
-            dL_dMask = self.imaging.compute_mask_gradient(mask)
-            # —— Hopkins 梯度未乘上 dL/dA 的局部值，这里做空间加权关联 ——
-            # compute_image_gradient 已经是 dI/dM 在各像素处的值，我们还需要与 dL/dI 做卷积关联
-            # 简化：根据链式法则 dL/dM = Σ_x dL/dI(x) · dI(x)/dM
-            # 所以需要反向投影；但 Hopkins 梯度是对总光强的导数，不是逐像素。
-            # 这里用近似：空间逐像素乘 + 空间平均修正
-            dL_dMask_corr = dL_dMask * (1.0 + 10.0 * np.mean(np.abs(dLdA)))
-            dL_dMask = dL_dMask_corr
+            # ★ 链式法则：dL/dM = (∂I/∂M) ⊙ dL/dI  （逐像素相乘）
+            physical_grad = self.imaging.compute_mask_gradient(mask)  # ∂I/∂M
+            dL_dMask = physical_grad * dLdA
 
             dL_dSource_raw = self.imaging.compute_source_gradient(mask, dLdA)
             if dL_dSource_raw.shape != pixelated_source.grid_size:
@@ -2206,16 +2202,23 @@ class SMOWorkflow:
             reason = f"达到最大外层迭代次数 {self.config.max_outer_iterations}"
 
         pixelated_source.set_intensity(best_source_intensity, auto_project=True)
-        self._imaging.update_source(pixelated_source)
+        # ★ 更新到 SMOImagingModel 的所有工艺条件，而不仅仅是标称
+        if self._multi_cond_enabled:
+            self._imaging.update_source_all_conditions(pixelated_source)
+        else:
+            self._imaging.update_source(pixelated_source)
 
+        # ★ 使用优化后的像素化光源 + 标称工艺条件 重算 aerial & wafer
+        # （最终评估使用标称条件，但必须基于优化后的 custom source，不能回退到默认照明）
         final_aerial = self._imaging.compute_aerial_image(best_mask)
-        final_wafer_cont = simulate_wafer_image(
-            best_mask,
-            optical_system=self._imaging._current_optics,
-            threshold=self.config.wafer_threshold,
-            apply_resist=True
-        )
-        final_wafer = (final_wafer_cont >= self.config.wafer_threshold).astype(np.float64)
+        k_resist = 50.0
+        threshold = self.config.wafer_threshold
+        a_scaled = np.clip(final_aerial, 0.0, None)
+        if self.config.use_wafer_image_loss:
+            final_wafer_cont = 1.0 / (1.0 + np.exp(-k_resist * (a_scaled - threshold)))
+        else:
+            final_wafer_cont = a_scaled
+        final_wafer = (final_wafer_cont >= threshold).astype(np.float64)
         final_epe = compute_epe(final_wafer, target, pixel_size=self.config.pixel_size)
 
         total_time = time.time() - start_time
