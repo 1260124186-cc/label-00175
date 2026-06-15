@@ -164,7 +164,9 @@ class RCWASolver1D:
         theta_deg: float = 0.0,
     ) -> Dict[str, np.ndarray]:
         """
-        求解远场衍射级次
+        求解远场衍射级次（标准 RAT 增强透射矩阵法）
+
+        参考: Moharam & Gaylord, J. Opt. Soc. Am. A 12, 1068 (1995)
 
         Args:
             wavelength_nm: 真空波长 (nm)
@@ -177,7 +179,7 @@ class RCWASolver1D:
                 orders:       级次编号数组 shape=(2M+1,)
                 r_TE/t_TE:    TE 反射/透射复振幅 (2M+1,)
                 r_TM/t_TM:    TM 反射/透射复振幅 (2M+1,)
-                eff_reflect_TE/TM: 各级反射衍射效率 Σ|r|²=1 校验
+                eff_reflect_TE/TM: 各级反射衍射效率
                 eff_trans_TE/TM:   各级透射衍射效率
         """
         k0 = 2.0 * np.pi / wavelength_nm
@@ -185,118 +187,175 @@ class RCWASolver1D:
         n1 = complex(self.cfg.n_superstrate)
         n2 = complex(self.cfg.n_substrate)
         na = complex(self.cfg.n_grating_line)
-        nb = n2  # 空间区默认与衬底一致（透过掩模到石英）
+        nb = n2
         fill = float(np.clip(duty_cycle, 1e-4, 1 - 1e-4))
+
+        eps1 = n1 * n1
+        eps2 = n2 * n2
+        eps_a = na * na
+        eps_b = nb * nb
 
         M = int(self.cfg.n_orders)
         orders = np.arange(-M, M + 1)
-        N_orders = 2 * M + 1
+        N = 2 * M + 1
 
         theta_rad = np.deg2rad(theta_deg)
         kx_inc = k0 * n1 * np.sin(theta_rad)
-
-        # 第 m 级 x 向波矢分量 kx_m = kx_inc + 2πm/Λ
-        kx_m = kx_inc + 2.0 * np.pi * orders / period_nm  # (2M+1,)
+        kx_m = kx_inc + 2.0 * np.pi * orders / period_nm
 
         result: Dict[str, np.ndarray] = {"orders": orders}
+        inc_idx = M
 
         for pol in ("TE", "TM"):
             if pol == "TE":
-                # TE: E_y 为主分量，使用介电傅里叶矩阵
-                eps_fourier = _toeplitz_epsilon_1d(na, nb, fill, 2 * M + 1)
+                # --------------------------------------------------------
+                # TE 偏振: E_y 为主分量
+                #   连续边界条件: E_y, H_x ∝ ∂E_y/∂z
+                #   均匀层导纳: Y_m = kz_m / (ωμ₀) = kz_m / k0 (η₀归一化)
+                # --------------------------------------------------------
+                E_mat = _toeplitz_epsilon_1d(eps_a, eps_b, fill, N)
+                Kx = np.diag(kx_m / k0)
                 kz1 = _safe_kz(kx_m, k0 * n1)
                 kz2 = _safe_kz(kx_m, k0 * n2)
 
-                # 构建光栅层本征矩阵 Kx² - K² + E = 0 的本征值
-                Kx = np.diag(kx_m / k0)
-                E_mat = eps_fourier
-                eigvals, eigvecs = np.linalg.eig(Kx @ Kx + E_mat)
-                # 波导模式 z 向波矢 β = k0 * sqrt(eigvals)，取 Im(β)>=0 分支
-                beta = k0 * np.lib.scimath.sqrt(np.atleast_1d(eigvals).astype(complex))
-                beta = np.where(np.imag(beta) < 0, -beta, beta)
+                eigvals, W = np.linalg.eig(Kx @ Kx + E_mat)
+                beta_raw = k0 * np.lib.scimath.sqrt(
+                    np.atleast_1d(eigvals).astype(complex)
+                )
+                beta = np.where(np.imag(beta_raw) < 0, -beta_raw, beta_raw)
 
-                # 透射矩阵：superstrate → grating → substrate
-                W = eigvecs
-                Lam = np.diag(np.exp(-1j * beta * d))
-                Yi = eigvecs @ np.diag(beta / (k0))
-                # 边界匹配：增强透射矩阵 RAT 方案
-                A = np.block([
-                    [np.eye(N_orders), np.zeros((N_orders, N_orders))],
-                    [np.zeros((N_orders, N_orders)), np.diag(kz1 / k0)],
-                ]) if n1.real != 0 else np.eye(2 * N_orders)
-                _ = A
-                B1 = np.vstack([W, Yi])
-                B2 = np.vstack([W @ Lam, Yi @ Lam])
-                C = np.block([
-                    [np.eye(N_orders), np.eye(N_orders)],
-                    [np.diag(kz2 / k0), -np.diag(kz2 / k0)],
-                ])
-                # [B1, -B2] @ [c1, c2]^T = A @ [δ_m0, r_m]^T
-                lhs = np.hstack([B1, -B2])
-                # 仅入射 +1 级输入：入射侧透射 δ_0
-                rhs = np.zeros(2 * N_orders, dtype=complex)
-                rhs[:N_orders] = np.eye(N_orders)[:, M]  # 正入射第0级入射
+                Lam_diag = np.exp(-1j * beta * d)
+                Lam = np.diag(Lam_diag)
+                Lam_inv = np.diag(1.0 / Lam_diag)
+
+                # V = W · diag(β/k0): 与 ∂E_y/∂z 成比例的量
+                V = W @ np.diag(beta / k0)
+
+                # 区域1 (superstrate) 与区域2 (substrate) 的导纳矩阵
+                Y1 = np.diag(kz1 / k0)
+                Y2 = np.diag(kz2 / k0)
+
+                # --- 构建 RAT 全局矩阵 ---
+                # 边界 z=0:  [W,   W  ] [c+]   = [I,   I ] [δ]
+                #            [V,  -V  ] [c-]     [Y1, -Y1] [r]
+                # 边界 z=d:  [WΛ, WΛ⁻¹] [c+]   = [I,   I ] [t]
+                #            [VΛ,-VΛ⁻¹] [c-]     [Y2, -Y2] [0]
+                A_bot = np.hstack([W, W])
+                A_top = np.hstack([V, -V])
+                B_bot = np.hstack([W @ Lam, W @ Lam_inv])
+                B_top = np.hstack([V @ Lam, -V @ Lam_inv])
+                T1_bot = np.hstack([np.eye(N), np.eye(N)])
+                T1_top = np.hstack([Y1, -Y1])
+                T2_bot = np.hstack([np.eye(N), np.eye(N)])
+                T2_top = np.hstack([Y2, -Y2])
+
+                # 消去光栅内部变量: [c+; c-]
+                # A_mat = [[A_bot],[A_top]]; B_mat = [[B_bot],[B_top]]
+                # A_mat·[c+;c-] = T1·[δ;r]  ==> [c+;c-] = A_mat^-1·T1·[δ;r]
+                # B_mat·[c+;c-] = T2·[t;0]  ==> [c+;c-] = B_mat^-1·T2·[t;0]
+                # ==>  S_mat = A_mat·B_mat^-1·T2  ;  T1·[δ;r] = S_mat·[t;0]
+                A_mat = np.vstack([A_bot, A_top])
+                B_mat = np.vstack([B_bot, B_top])
+                T1 = np.vstack([T1_bot, T1_top])
+                T2 = np.vstack([T2_bot, T2_top])
 
                 try:
-                    sol = np.linalg.solve(lhs, C @ rhs) if False else np.linalg.solve(lhs, rhs)
+                    S_mat = A_mat @ np.linalg.solve(B_mat, T2)
                 except np.linalg.LinAlgError:
-                    sol = np.linalg.lstsq(lhs, rhs, rcond=None)[0]
-                t_coeffs = sol[N_orders:2 * N_orders]
-                r_coeffs = np.zeros_like(t_coeffs)  # 此处做简化近似
-                _ = (B2, C)  # 占位
-                r_TE = r_coeffs
-                t_TE = t_coeffs
+                    S_mat = A_mat @ np.linalg.lstsq(B_mat, T2, rcond=None)[0]
 
-                # 总能量归一化（保证无吸收时 Σ|t|²+Σ|r|²≈1）
-                eff_t_TE = np.abs(t_TE) ** 2 * np.real(kz2 / (kz1[M] + 1e-30))
-                eff_r_TE = np.abs(r_TE) ** 2 * np.real(kz1 / (kz1[M] + 1e-30))
-                total = np.nansum(eff_t_TE) + np.nansum(eff_r_TE)
-                if total > 0:
-                    eff_t_TE = eff_t_TE / (total + 1e-30)
-                    eff_r_TE = eff_r_TE / (total + 1e-30)
+                # T1 · [δ; r] = S_mat · [t; 0]
+                # 分块 S_mat = [[S11, S12],[S21, S22]] (每块 N×N)
+                S11 = S_mat[:N, :N]
+                S21 = S_mat[N:, :N]
+
+                # 入射向量 (只有 0 级入射)
+                delta = np.zeros(N, dtype=complex)
+                delta[inc_idx] = 1.0 + 0.0j
+
+                # T1 = [[I, I],[Y1,-Y1]]
+                # => [I·δ + I·r] = [S11·t]
+                #    [Y1·δ - Y1·r]  [S21·t]
+                # 消去 r: 2·Y1·δ = (Y1·S11 + S21)·t
+                lhs_t = Y1 @ S11 + S21
+                try:
+                    t_TE = np.linalg.solve(lhs_t, 2.0 * (Y1 @ delta))
+                except np.linalg.LinAlgError:
+                    t_TE = np.linalg.lstsq(lhs_t, 2.0 * (Y1 @ delta), rcond=None)[0]
+                r_TE = S11 @ t_TE - delta
+
+                # 衍射效率 (Poynting 矢量 z 分量归一化)
+                kz1_inc = kz1[inc_idx]
+                eff_t_TE = np.abs(t_TE) ** 2 * np.real(kz2 / (kz1_inc + 1e-30))
+                eff_r_TE = np.abs(r_TE) ** 2 * np.real(kz1 / (kz1_inc + 1e-30))
                 result["t_TE"] = t_TE
                 result["r_TE"] = r_TE
                 result["eff_trans_TE"] = eff_t_TE
                 result["eff_reflect_TE"] = eff_r_TE
+
             else:
-                # TM: H_y 为主分量，使用逆介电傅里叶矩阵
-                inv_eps = _toeplitz_inverse_epsilon_1d(na, nb, fill, 2 * M + 1)
+                # --------------------------------------------------------
+                # TM 偏振: H_y 为主分量
+                #   连续边界条件: H_y, E_x ∝ (1/ε) ∂H_y/∂z
+                #   均匀层导纳: Y_m = ωε / kz_m = k0·ε_r / kz_m
+                # --------------------------------------------------------
+                inv_E_mat = _toeplitz_inverse_epsilon_1d(eps_a, eps_b, fill, N)
+                Kx = np.diag(kx_m / k0)
                 kz1 = _safe_kz(kx_m, k0 * n1)
                 kz2 = _safe_kz(kx_m, k0 * n2)
 
-                Kx = np.diag(kx_m / k0)
-                U_mat = inv_eps
-                eigvals, eigvecs = np.linalg.eig(
-                    Kx @ U_mat @ Kx + np.eye(N_orders)
+                eigvals, W = np.linalg.eig(Kx @ inv_E_mat @ Kx + np.eye(N))
+                beta_raw = k0 * np.lib.scimath.sqrt(
+                    np.atleast_1d(eigvals).astype(complex)
                 )
-                beta = k0 * np.lib.scimath.sqrt(np.atleast_1d(eigvals).astype(complex))
-                beta = np.where(np.imag(beta) < 0, -beta, beta)
+                beta = np.where(np.imag(beta_raw) < 0, -beta_raw, beta_raw)
 
-                W = eigvecs
-                Lam = np.diag(np.exp(-1j * beta * d))
-                V = U_mat @ (eigvecs @ np.diag(beta / k0))
+                Lam_diag = np.exp(-1j * beta * d)
+                Lam = np.diag(Lam_diag)
+                Lam_inv = np.diag(1.0 / Lam_diag)
 
-                lhs = np.vstack([
-                    np.hstack([W, -W @ Lam]),
-                    np.hstack([V, -V @ Lam]),
-                ])
-                # 入射边界（正入射，第 M 级）
-                rhs = np.zeros(2 * N_orders, dtype=complex)
-                rhs[:N_orders] = np.eye(N_orders)[:, M]
+                # V = inv_E · W · diag(β/k0): 与 (1/ε)∂H_y/∂z 成比例
+                V = inv_E_mat @ (W @ np.diag(beta / k0))
+
+                # TM 导纳: Y = diag(k0·ε_r / kz)
+                Y1 = np.diag(k0 * eps1 / (kz1 + 1e-30))
+                Y2 = np.diag(k0 * eps2 / (kz2 + 1e-30))
+
+                A_bot = np.hstack([W, W])
+                A_top = np.hstack([V, -V])
+                B_bot = np.hstack([W @ Lam, W @ Lam_inv])
+                B_top = np.hstack([V @ Lam, -V @ Lam_inv])
+                T1_bot = np.hstack([np.eye(N), np.eye(N)])
+                T1_top = np.hstack([Y1, -Y1])
+                T2_bot = np.hstack([np.eye(N), np.eye(N)])
+                T2_top = np.hstack([Y2, -Y2])
+
+                A_mat = np.vstack([A_bot, A_top])
+                B_mat = np.vstack([B_bot, B_top])
+                T1 = np.vstack([T1_bot, T1_top])
+                T2 = np.vstack([T2_bot, T2_top])
 
                 try:
-                    sol = np.linalg.solve(lhs, rhs)
+                    S_mat = A_mat @ np.linalg.solve(B_mat, T2)
                 except np.linalg.LinAlgError:
-                    sol = np.linalg.lstsq(lhs, rhs, rcond=None)[0]
-                r_TM = sol[:N_orders] - np.eye(N_orders)[:, M]
-                t_TM = sol[N_orders:2 * N_orders]
+                    S_mat = A_mat @ np.linalg.lstsq(B_mat, T2, rcond=None)[0]
 
-                eff_t_TM = np.abs(t_TM) ** 2 * np.real(kz2 / (kz1[M] + 1e-30))
-                eff_r_TM = np.abs(r_TM) ** 2 * np.real(kz1 / (kz1[M] + 1e-30))
-                total = np.nansum(eff_t_TM) + np.nansum(eff_r_TM)
-                if total > 0:
-                    eff_t_TM = eff_t_TM / (total + 1e-30)
-                    eff_r_TM = eff_r_TM / (total + 1e-30)
+                S11 = S_mat[:N, :N]
+                S21 = S_mat[N:, :N]
+
+                delta = np.zeros(N, dtype=complex)
+                delta[inc_idx] = 1.0 + 0.0j
+
+                lhs_t = Y1 @ S11 + S21
+                try:
+                    t_TM = np.linalg.solve(lhs_t, 2.0 * (Y1 @ delta))
+                except np.linalg.LinAlgError:
+                    t_TM = np.linalg.lstsq(lhs_t, 2.0 * (Y1 @ delta), rcond=None)[0]
+                r_TM = S11 @ t_TM - delta
+
+                kz1_inc = kz1[inc_idx]
+                eff_t_TM = np.abs(t_TM) ** 2 * np.real(kz2 / (kz1_inc + 1e-30))
+                eff_r_TM = np.abs(r_TM) ** 2 * np.real(kz1 / (kz1_inc + 1e-30))
                 result["t_TM"] = t_TM
                 result["r_TM"] = r_TM
                 result["eff_trans_TM"] = eff_t_TM

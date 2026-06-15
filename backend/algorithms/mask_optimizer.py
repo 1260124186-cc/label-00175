@@ -1534,19 +1534,37 @@ class MaskOptimizer:
 
     def _compute_composite_single_condition(self, mask: np.ndarray,
                                             imaging_model: PartialCoherentImaging,
-                                            dose: float = 1.0) -> Tuple[float, np.ndarray, CompositeLossComponents]:
+                                            dose: float = 1.0,
+                                            for_evaluation: bool = False) -> Tuple[float, np.ndarray, CompositeLossComponents]:
         """
         计算单工艺条件下的复合损失、成像结果及各分量（不含 PVB 和正则化）
 
+        支持统一仿真后端：若配置了 RCWA/FDTD 后端，则通过 unified_simulate 计算空间像。
+
         Args:
             mask: 掩模
-            imaging_model: 成像模型
+            imaging_model: 成像模型（其 optics 作为当前工艺条件的光学参数）
             dose: 曝光剂量
+            for_evaluation: 是否为评估阶段（可切换到矢量后端）
 
         Returns:
             (loss_value, processed_image, components)
         """
-        aerial = imaging_model.compute_aerial_image(mask)
+        backend = self._effective_backend(for_evaluation=for_evaluation)
+        if backend == SimulationBackend.HOPKINS.value:
+            aerial = imaging_model.compute_aerial_image(mask)
+        else:
+            sim_res = unified_simulate(
+                mask=mask,
+                backend=backend,
+                optical_system=imaging_model.optics,
+                threshold=self.config.threshold,
+                apply_resist=False,
+                pixel_size_nm=imaging_model.optics.pixel_size,
+                rcwa_config=self.config.rcwa_config,
+                fdtd_config=self.config.fdtd_config,
+            )
+            aerial = sim_res.aerial_image
         image = self._prepare_image(aerial, dose)
         components = self._compute_image_loss_components(image, self._target_image)
         loss = components.mse + components.ssim + components.weighted_mse + components.weighted_mae
@@ -1554,26 +1572,46 @@ class MaskOptimizer:
 
     def _compute_single_condition_loss(self, mask: np.ndarray,
                                        imaging_model: PartialCoherentImaging,
-                                       dose: float = 1.0) -> float:
+                                       dose: float = 1.0,
+                                       for_evaluation: bool = False) -> float:
         """
         计算单组工艺条件下的损失
 
         当 config.use_composite_loss=True 时，使用复合损失（MSE/SSIM 加权）；
         否则回退到旧的单一 metric 逻辑。
 
+        支持统一仿真后端：若配置了 RCWA/FDTD 后端，则通过 unified_simulate 计算空间像。
+
         Args:
             mask: 掩模图案
-            imaging_model: 成像模型
+            imaging_model: 成像模型（其 optics 作为当前工艺条件的光学参数）
             dose: 曝光相对剂量
+            for_evaluation: 是否为评估阶段（可切换到矢量后端）
 
         Returns:
             损失值
         """
         if self.config.use_composite_loss:
-            loss, _, _ = self._compute_composite_single_condition(mask, imaging_model, dose)
+            loss, _, _ = self._compute_composite_single_condition(
+                mask, imaging_model, dose, for_evaluation=for_evaluation
+            )
             return loss
 
-        aerial = imaging_model.compute_aerial_image(mask)
+        backend = self._effective_backend(for_evaluation=for_evaluation)
+        if backend == SimulationBackend.HOPKINS.value:
+            aerial = imaging_model.compute_aerial_image(mask)
+        else:
+            sim_res = unified_simulate(
+                mask=mask,
+                backend=backend,
+                optical_system=imaging_model.optics,
+                threshold=self.config.threshold,
+                apply_resist=False,
+                pixel_size_nm=imaging_model.optics.pixel_size,
+                rcwa_config=self.config.rcwa_config,
+                fdtd_config=self.config.fdtd_config,
+            )
+            aerial = sim_res.aerial_image
 
         if self.config.use_wafer_image_loss:
             if dose != 1.0:
@@ -1690,7 +1728,7 @@ class MaskOptimizer:
                  + dR(mask)/dmask
                  + λ_robust * dVar(L_i)/dmask
 
-        对于包含 PVB 的情况，退化为数值梯度。
+        对于包含 PVB 或使用矢量仿真后端 (RCWA/FDTD) 的情况，退化为数值梯度。
 
         Args:
             mask: 掩模图案
@@ -1699,6 +1737,10 @@ class MaskOptimizer:
             梯度数组
         """
         cfg = self.config
+        train_backend = self._effective_backend(for_evaluation=False)
+
+        if train_backend != SimulationBackend.HOPKINS.value:
+            return self._numerical_gradient(mask)
 
         if cfg.use_composite_loss:
             lw = cfg.loss_weights
