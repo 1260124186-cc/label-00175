@@ -765,6 +765,88 @@ def generate_test_structure(params: Union[TestStructureParams, dict]) -> np.ndar
     return generator.generate(params)
 
 
+def _upcast_params(params, target_cls):
+    """将 TestStructureParams 或 dict 上转为目标参数类"""
+    if isinstance(params, target_cls):
+        return params
+    if isinstance(params, TestStructureParams):
+        data = params.to_dict()
+        return target_cls(**data)
+    if isinstance(params, dict):
+        return target_cls(**params)
+    raise TypeError(f"期望 {target_cls.__name__}、TestStructureParams 或 dict，实际 {type(params).__name__}")
+
+
+def create_line_space(params: Union[LineSpaceParams, TestStructureParams, dict]) -> np.ndarray:
+    """
+    创建 Line/Space 测试结构的便捷函数。
+
+    Args:
+        params: LineSpaceParams、TestStructureParams 实例或参数字典
+
+    Returns:
+        二元掩模数组
+    """
+    params = _upcast_params(params, LineSpaceParams)
+    return LineSpaceGenerator.generate(params)
+
+
+def create_contact_hole(params: Union[ContactHoleParams, TestStructureParams, dict]) -> np.ndarray:
+    """
+    创建 Contact Hole 测试结构的便捷函数。
+
+    Args:
+        params: ContactHoleParams、TestStructureParams 实例或参数字典
+
+    Returns:
+        二元掩模数组
+    """
+    params = _upcast_params(params, ContactHoleParams)
+    return ContactHoleGenerator.generate(params)
+
+
+def create_l_shaped_corner(params: Union[LShapedCornerParams, TestStructureParams, dict]) -> np.ndarray:
+    """
+    创建 L-shaped Corner 测试结构的便捷函数。
+
+    Args:
+        params: LShapedCornerParams、TestStructureParams 实例或参数字典
+
+    Returns:
+        二元掩模数组
+    """
+    params = _upcast_params(params, LShapedCornerParams)
+    return LShapedCornerGenerator.generate(params)
+
+
+def create_t_junction(params: Union[TJunctionParams, TestStructureParams, dict]) -> np.ndarray:
+    """
+    创建 T-junction 测试结构的便捷函数。
+
+    Args:
+        params: TJunctionParams、TestStructureParams 实例或参数字典
+
+    Returns:
+        二元掩模数组
+    """
+    params = _upcast_params(params, TJunctionParams)
+    return TJunctionGenerator.generate(params)
+
+
+def create_sram_bitcell(params: Union[SRAMBitcellParams, TestStructureParams, dict]) -> np.ndarray:
+    """
+    创建 SRAM Bitcell 测试结构的便捷函数。
+
+    Args:
+        params: SRAMBitcellParams、TestStructureParams 实例或参数字典
+
+    Returns:
+        二元掩模数组
+    """
+    params = _upcast_params(params, SRAMBitcellParams)
+    return SRAMBitcellGenerator.generate(params)
+
+
 __all__ = [
     'TestStructureType',
     'LineOrientation',
@@ -782,4 +864,9 @@ __all__ = [
     'TJunctionGenerator',
     'SRAMBitcellGenerator',
     'generate_test_structure',
+    'create_line_space',
+    'create_contact_hole',
+    'create_l_shaped_corner',
+    'create_t_junction',
+    'create_sram_bitcell',
 ]
