@@ -1611,72 +1611,81 @@ class PartialCoherentImaging:
         self.source = new_source.astype(np.float64)
         self._compute_transfer_functions()
 
-    def compute_source_gradient(self, mask: np.ndarray) -> np.ndarray:
+    def compute_source_gradient(self, mask: np.ndarray,
+                                dLoss_dAerial: Optional[np.ndarray] = None) -> np.ndarray:
         """
-        计算空间像对光源分布的梯度
+        计算损失对光源分布的梯度 dLoss/dS。
 
         根据 Hopkins 公式:
-        I = ∫ S(fs) * |FFT^{-1}[M(f) * P(f - fs)]|^2 dfs
+            I(x, y) = ∫ S(fs) · |FFT^{-1}[M(f) · P(f - fs)]|^2 dfs
 
-        因此 dI/dS(fs_i) = |FFT^{-1}[M(f) * P(f - fs_i)]|^2
+        链式法则：
+            dLoss/dS(fs_i) = Σ_{x,y} dLoss/dI(x,y) · dI/dS(fs_i)(x,y)
+            其中 dI/dS(fs_i)(x,y) = |FFT^{-1}[M(f) · P(f - fs_i)]|^2
 
-        注意：返回的是每个光源点对空间像的梯度贡献，需要进一步
-        与损失函数对空间像的梯度链式相乘。
+        若不提供 dLoss_dAerial，则默认 dLoss/dI = 1（返回每个光源点贡献
+        的空间像总能量，主要用于调试或用户自己实现链式相乘）。
 
-        KERNEL_2D 模式下不支持光源梯度计算（2D核对角近似下光源信息已被积分掉）。
+        KERNEL_2D 模式下不支持光源梯度计算（2D核对角近似下光源信息已被积分掉），
+        将返回全零数组。
 
         Args:
-            mask: 掩模图案
+            mask: 掩模图案 (H, W)
+            dLoss_dAerial: 损失对空间像的梯度 (H, W)，可选
 
         Returns:
-            梯度数组，形状与光源相同
+            梯度数组，形状与 self.source 相同（频率网格尺寸）
         """
-        mask_c = mask.astype(np.complex128)
-        ny, nx = mask.shape
-        gradient = np.zeros((ny, nx), dtype=np.float64)
+        processed_mask = self._preprocess_mask(mask)
+        mask_c = processed_mask.astype(np.complex128)
         mask_spectrum = np.fft.fft2(mask_c)
+        ny_eff, nx_eff = mask_spectrum.shape
         cutoff = self.optics.cutoff_frequency
         mode = self.optics.tcc_mode
 
+        gradient = np.zeros_like(self.source, dtype=np.float64)
+
         if mode == TCCMode.KERNEL_2D:
-            return gradient.astype(np.float64)
-        elif mode == TCCMode.SOCS and self.socs_eigenvalues is not None:
-            for lam, phi in zip(self.socs_eigenvalues, self.socs_eigenfunctions):
-                if lam < 1e-10:
-                    continue
-                filtered = mask_spectrum * phi
-                field_i = np.fft.ifft2(filtered)
-                intensity_i = np.abs(field_i) ** 2
+            return gradient
 
-                source_indices = np.where(self.source > 1e-10)
-                for idx in range(len(source_indices[0])):
-                    sy, sx = source_indices[0][idx], source_indices[1][idx]
-                    fs_x = self.fx[sy, sx]
-                    fs_y = self.fy[sy, sx]
-                    if np.sqrt(fs_x ** 2 + fs_y ** 2) > cutoff:
-                        continue
-
-                    pupil_shifted = _shift_pupil(
-                        self.pupil, fs_x, fs_y, self.dfx, self.dfy
-                    )
-                    filtered_s = mask_spectrum * pupil_shifted
-                    field_s = np.fft.ifft2(filtered_s)
-                    intensity_s = np.abs(field_s) ** 2
-
-                    gradient[sy, sx] += np.sum(intensity_i * intensity_s) / (ny * nx)
+        if dLoss_dAerial is None:
+            dLoss_dI = np.ones(self.image_size, dtype=np.float64)
         else:
-            source_indices = np.where(self.source > 1e-10)
-            source_values = self.source[source_indices]
+            dLoss_dI = np.asarray(dLoss_dAerial, dtype=np.float64)
+            if dLoss_dI.shape != self.image_size:
+                raise ValueError(
+                    f"dLoss_dAerial 形状 {dLoss_dI.shape} 与 image_size {self.image_size} 不匹配"
+                )
 
-            for idx in range(len(source_indices[0])):
-                sy, sx = source_indices[0][idx], source_indices[1][idx]
-                src_val = source_values[idx]
-                if src_val <= 0:
-                    continue
+        if self.pad_width is not None:
+            if isinstance(self.pad_width, int):
+                py, px = self.pad_width, self.pad_width
+            else:
+                py, px = self.pad_width
+            dLoss_dI_padded = np.zeros((ny_eff, nx_eff), dtype=np.float64)
+            dLoss_dI_padded[py:py + self.image_size[0], px:px + self.image_size[1]] = dLoss_dI
+            dLoss_dI = dLoss_dI_padded
+
+        source_indices = np.where(self.source > 1e-12)
+        num_points = len(source_indices[0])
+        if num_points == 0:
+            return gradient
+
+        max_points_per_batch = 64
+        for batch_start in range(0, num_points, max_points_per_batch):
+            batch_end = min(batch_start + max_points_per_batch, num_points)
+            batch_idx = slice(batch_start, batch_end)
+
+            sy_batch = source_indices[0][batch_idx]
+            sx_batch = source_indices[1][batch_idx]
+
+            for bi in range(len(sy_batch)):
+                sy = int(sy_batch[bi])
+                sx = int(sx_batch[bi])
 
                 fs_x = self.fx[sy, sx]
                 fs_y = self.fy[sy, sx]
-                if np.sqrt(fs_x ** 2 + fs_y ** 2) > cutoff:
+                if cutoff is not None and np.sqrt(fs_x ** 2 + fs_y ** 2) > cutoff:
                     continue
 
                 pupil_shifted = _shift_pupil(
@@ -1686,7 +1695,7 @@ class PartialCoherentImaging:
                 field_i = np.fft.ifft2(filtered)
                 intensity_i = np.abs(field_i) ** 2
 
-                gradient[sy, sx] = np.sum(intensity_i) / (ny * nx)
+                gradient[sy, sx] = float(np.sum(dLoss_dI * intensity_i))
 
         return gradient.astype(np.float64)
 

@@ -811,21 +811,23 @@ class SMOImagingModel:
         """
         return self._imaging.compute_image_gradient(mask)
 
-    def compute_source_gradient(self, mask: np.ndarray) -> np.ndarray:
+    def compute_source_gradient(self,
+                                mask: np.ndarray,
+                                dLoss_dAerial: Optional[np.ndarray] = None) -> np.ndarray:
         """
-        计算空间像对光源的梯度
+        计算损失对光源分布的梯度 dLoss/dS。
 
-        根据 Hopkins 公式，dI/dS(fs_i) = |FFT^{-1}[M(f) * P(f - fs_i)]|^2
-
-        梯度会进一步与损失对空间像的梯度链式相乘（由调用方处理）。
+        根据 Hopkins 公式和链式法则：
+            dLoss/dS(fs_i) = Σ_{x,y} dLoss/dI(x,y) · |FFT^{-1}[M(f) · P(f - fs_i)]|^2
 
         Args:
             mask: 掩模图案
+            dLoss_dAerial: 损失对空间像的梯度 (H, W)，可选；None 时默认全1
 
         Returns:
             光源梯度数组，形状与光源相同
         """
-        return self._imaging.compute_source_gradient(mask)
+        return self._imaging.compute_source_gradient(mask, dLoss_dAerial)
 
     def get_source(self) -> np.ndarray:
         """获取当前光源分布"""
@@ -955,19 +957,13 @@ class SourceOptimizer:
                         logger.info(f"  光源优化在第 {it+1} 次迭代提前收敛（耐心值耗尽）")
                     break
 
-            raw_source_grad = self.imaging.compute_source_gradient(mask)
-
-            active_mask = raw_source_grad > 0
-            num_active = np.sum(active_mask)
-            if num_active > 0:
-                scaling = dLoss_dAerial.sum() / dLoss_dAerial.size
-                source_grad = np.where(active_mask, raw_source_grad * scaling, 0.0)
-            else:
-                source_grad = raw_source_grad
+            source_grad_raw = self.imaging.compute_source_gradient(mask, dLoss_dAerial)
 
             if source.constraints.smoothness_weight > 0:
                 smooth_grad = source.compute_smoothness_gradient()
-                source_grad = source_grad + source.constraints.smoothness_weight * smooth_grad
+                source_grad = source_grad_raw + source.constraints.smoothness_weight * smooth_grad
+            else:
+                source_grad = source_grad_raw
 
             grad_norm = np.max(np.abs(source_grad)) + 1e-12
             normalized_grad = source_grad / grad_norm
@@ -1197,14 +1193,14 @@ class JointGradientOptimizer:
             mask = mask - lr_m * mask_grad / m_grad_norm
             mask = np.clip(mask, 0.0, 1.0)
 
-            raw_source_grad = self.imaging.compute_source_gradient(mask)
-            s_grad_norm = np.max(np.abs(raw_source_grad)) + 1e-12
+            source_grad_raw = self.imaging.compute_source_gradient(mask, dLoss_dAerial)
+            s_grad_norm = np.max(np.abs(source_grad_raw)) + 1e-12
 
             if source.constraints.smoothness_weight > 0:
                 smooth_grad = source.compute_smoothness_gradient()
-                total_s_grad = raw_source_grad / s_grad_norm + source.constraints.smoothness_weight * smooth_grad
+                total_s_grad = source_grad_raw / s_grad_norm + source.constraints.smoothness_weight * smooth_grad
             else:
-                total_s_grad = raw_source_grad / s_grad_norm
+                total_s_grad = source_grad_raw / s_grad_norm
 
             new_intensity = source.intensity - lr_s * total_s_grad
             source.set_intensity(new_intensity, auto_project=True)
