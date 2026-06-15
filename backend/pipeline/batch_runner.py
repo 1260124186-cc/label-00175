@@ -1257,7 +1257,8 @@ def save_batch_summary(summary: BatchSummary,
                 w = csv.DictWriter(f, fieldnames=fieldnames)
                 w.writeheader()
                 for r in rows:
-                    w.writerow(r)
+                    w.writerow({k: ';'.join(str(x) for x in v) if isinstance(v, list) else v
+                                for k, v in r.items()})
         else:
             with open(csv_path, 'w', encoding='utf-8') as f:
                 f.write('')

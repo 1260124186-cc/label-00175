@@ -681,7 +681,7 @@ class LayoutLibrary:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for r in records:
-                writer.writerow({k: ';'.join(v) if isinstance(v, list) else v
+                writer.writerow({k: ';'.join(str(x) for x in v) if isinstance(v, list) else v
                                  for k, v in r.items()})
         return filepath
 
