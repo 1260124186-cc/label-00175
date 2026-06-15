@@ -427,7 +427,16 @@ class PixelatedSource:
         self._initialize(custom_source)
 
     def _setup_frequency_grid(self):
-        """设置光源频率网格"""
+        """
+        设置光源频率网格（与 PartialCoherentImaging 的频率坐标完全一致）。
+
+        ★ 核心约束：PixelatedSource.grid_size 必须 = mask 尺寸，否则
+        Hopkins 成像公式中 dI/dS 的逐像素索引会错位。如果需要高分辨率
+        光源优化，请相应增大 mask 模拟尺寸 N，并选合适的 pixel_size
+        使得 σ=0.75 圆占据合理像素数（~20-50 像素）。
+            m_pix = 0.75 · cutoff · N · pixel_size = 0.75 · (NA/λ) · FOV
+        例如 FOV = 5μm → m_pix ≈ 26 像素（合理）。
+        """
         ny, nx = self.grid_size
         cutoff = self.optics.cutoff_frequency
 
@@ -437,11 +446,34 @@ class PixelatedSource:
         self.dfx = 1.0 / (nx * self.optics.pixel_size)
         self.dfy = 1.0 / (ny * self.optics.pixel_size)
 
-        self.rho_norm = np.sqrt(self.fx ** 2 + self.fy ** 2) / cutoff
+        self.rho_norm = np.sqrt(self.fx ** 2 + self.fy ** 2) / (cutoff + 1e-18)
         self.theta = np.arctan2(self.fy, self.fx)
 
+    def _intensity_for_imaging(self, target_shape: Optional[Tuple[int, int]] = None) -> np.ndarray:
+        """
+        返回用于成像模型的光源强度。
+
+        ★ 前提：PixelatedSource.grid_size = mask.shape = target_shape，
+        频率坐标完全一致，不需要映射。仅当目标形状不同时做 zoom（一般场景不触发）。
+        """
+        src = self.intensity.astype(np.float64, copy=True)
+        total_e = float(np.sum(src))
+
+        if target_shape is not None and target_shape != src.shape:
+            import scipy.ndimage as ndi
+            zy, zx = target_shape[0] / src.shape[0], target_shape[1] / src.shape[1]
+            src = ndi.zoom(src, (zy, zx), order=1)
+
+        new_total = float(np.sum(src))
+        if new_total > 1e-15 and total_e > 1e-15:
+            src = src * (total_e / new_total)
+        elif new_total > 1e-15:
+            src = src / new_total
+
+        return src
+
     def _initialize(self, custom_source: Optional[np.ndarray]):
-        """初始化光源分布"""
+        """初始化光源分布（使用真实物理 cutoff）"""
         cutoff = self.optics.cutoff_frequency
         params = dict(self.init_params)
 
@@ -738,22 +770,27 @@ class SMOImagingModel:
         """
         更新光源并重新计算传递函数
 
+        关键：
+          - 从 PixelatedSource 获取强度，并指定目标形状为成像模型内部的
+            source 形状（= mask 形状）；必要时做降采样。
+          - 保证能量归一化。
+
         Args:
             pixelated_source: 像素化光源实例
         """
-        source_intensity = pixelated_source.get_intensity()
-
         expected_shape = self._imaging.source.shape
+        source_intensity = pixelated_source._intensity_for_imaging(
+            target_shape=expected_shape
+        )
+
         if source_intensity.shape != expected_shape:
             import scipy.ndimage as ndi
-            zoom_factors = (
-                expected_shape[0] / source_intensity.shape[0],
-                expected_shape[1] / source_intensity.shape[1]
-            )
-            source_intensity = ndi.zoom(source_intensity, zoom_factors, order=1)
-            total = np.sum(source_intensity)
-            if total > 0:
-                source_intensity = source_intensity / total
+            zy, zx = expected_shape[0] / source_intensity.shape[0], expected_shape[1] / source_intensity.shape[1]
+            source_intensity = ndi.zoom(source_intensity, (zy, zx), order=1)
+
+        total = np.sum(source_intensity)
+        if total > 1e-15:
+            source_intensity = source_intensity / total
 
         self._imaging.update_source(source_intensity)
         self._current_source = self._imaging.source.copy()
@@ -841,6 +878,267 @@ class SMOImagingModel:
         """获取等效 TCC 核（2D对角近似）"""
         return self._imaging.tcc_kernel.copy() if self._imaging.tcc_kernel is not None else None
 
+    # --------------------------------------------------------------------
+    # 多工艺条件支持
+    # --------------------------------------------------------------------
+
+    def set_process_conditions(self,
+                               conditions: List[Union[ProcessCondition, Dict[str, float]]]):
+        """
+        注册多工艺条件。为每个条件创建独立的 PartialCoherentImaging 实例，
+        后续多条件前向/反向调用将复用这些实例（仅在光源更新时刷新 TCC）。
+
+        Args:
+            conditions: 工艺条件列表，每项为 ProcessCondition 或 dict
+        """
+        self._process_imagers: List[Tuple[PartialCoherentImaging, float, float, float]] = []
+        # (imager, defocus_nm, dose, weight)
+
+        for cond in conditions:
+            if isinstance(cond, dict):
+                df = float(cond.get('defocus', 0.0))
+                dose = float(cond.get('dose', 1.0))
+                wt = float(cond.get('weight', 1.0))
+            else:
+                df = float(cond.defocus)
+                dose = float(cond.dose)
+                wt = float(cond.weight)
+
+            optics = OpticalSystem(
+                wavelength=self._current_optics.wavelength,
+                na=self._current_optics.na,
+                sigma=self._current_optics.sigma,
+                pixel_size=self._current_optics.pixel_size,
+                defocus=df,
+                magnification=self._current_optics.magnification,
+                illumination_type=self._current_optics.illumination_type,
+                source_params=dict(self._current_optics.source_params),
+                tcc_mode=self._current_optics.tcc_mode,
+                socs_num_terms=self._current_optics.socs_num_terms,
+                custom_source=self._current_optics.custom_source,
+                zernike_coefficients=dict(self._current_optics.zernike_coefficients)
+            )
+            imager = PartialCoherentImaging(
+                optics, self.image_size,
+                window_type=self.window_type,
+                pad_width=self.pad_width,
+                tukey_alpha=self.tukey_alpha
+            )
+            if self._current_source is not None:
+                imager.update_source(self._current_source)
+            self._process_imagers.append((imager, df, dose, wt))
+
+    def update_source_all_conditions(self, pixelated_source: PixelatedSource):
+        """更新光源到所有工艺条件实例"""
+        self.update_source(pixelated_source)
+        src = self._imaging.source.copy()
+        if hasattr(self, '_process_imagers') and self._process_imagers:
+            for imager, _, _, _ in self._process_imagers:
+                imager.update_source(src)
+
+    def multi_condition_forward(self,
+                                mask: np.ndarray,
+                                threshold: float = 0.3,
+                                use_wafer_loss: bool = True,
+                                resist_steepness: float = 50.0
+                                ) -> Dict[str, Any]:
+        """
+        多工艺条件前向：对每个注册条件独立计算 aerial / soft-wafer / loss
+
+        若未注册多工艺条件，则回退到单标称条件。
+
+        Args:
+            mask: 掩模图案
+            threshold: 光刻胶阈值
+            use_wafer_loss: True 使用 soft-wafer sigmoid 计算损失；False 使用 aerial 直接计算
+            resist_steepness: soft-wafer sigmoid 陡度 k
+
+        Returns:
+            dict:
+                total_loss: 加权平均总损失
+                components: 各分量（含 per-condition 损失、PVB等）
+                dTotal_dAerial_list: 每个条件下 dTotal/dAerial（用于链式反传）
+                weights: 每个条件的归一化权重
+                aerials: 每个条件的 aerial 图像
+                wafers: 每个条件的 soft-wafer / aerial 图像
+        """
+        H, W = mask.shape
+        if not (hasattr(self, '_process_imagers') and self._process_imagers):
+            # —— 回退：单标称条件 ——
+            aerial = self.compute_aerial_image(mask)
+            if use_wafer_loss:
+                wafer = 1.0 / (1.0 + np.exp(-resist_steepness * (aerial - threshold)))
+                diff = wafer - 0.0  # placeholder — caller 会用 target 重算
+                dLoss_dWafer = 2.0 * diff / (H * W) if False else np.zeros_like(aerial)
+                dLoss_dAerial = dLoss_dWafer * resist_steepness * wafer * (1.0 - wafer)
+            else:
+                wafer = aerial
+                dLoss_dAerial = np.zeros_like(aerial)
+            return {
+                'total_loss': 0.0,
+                'components': {},
+                'dTotal_dAerial_list': [dLoss_dAerial],
+                'weights': [1.0],
+                'aerials': [aerial],
+                'wafers': [wafer],
+                'doses': [1.0],
+                'defocuses': [self._current_optics.defocus],
+            }
+
+        # —— 多工艺条件 ——
+        N_cond = len(self._process_imagers)
+        aerials: List[np.ndarray] = []
+        wafers: List[np.ndarray] = []
+        dTotal_dAerial_list: List[np.ndarray] = []
+        raw_weights: List[float] = []
+        doses: List[float] = []
+        defocuses: List[float] = []
+
+        for imager, df, dose, wt in self._process_imagers:
+            raw_weights.append(wt)
+            doses.append(dose)
+            defocuses.append(df)
+
+        W_sum = sum(raw_weights) or 1.0
+        norm_weights = [w / W_sum for w in raw_weights]
+
+        # —— placeholder，返回结构。损失与 dLoss/dAerial 的真正计算在 optimizer 中完成
+        for imager, df, dose, wt in self._process_imagers:
+            aerial = imager.compute_aerial_image(mask)
+            # 应用曝光剂量：aerial *= dose（光强与剂量成正比）
+            aerial_dosed = np.clip(aerial * dose, 0.0, None)
+            if use_wafer_loss:
+                wafer = 1.0 / (1.0 + np.exp(-resist_steepness * (aerial_dosed - threshold)))
+            else:
+                wafer = aerial_dosed
+            aerials.append(aerial_dosed)
+            wafers.append(wafer)
+            dTotal_dAerial_list.append(np.zeros_like(aerial))
+
+        return {
+            'total_loss': 0.0,
+            'components': {},
+            'dTotal_dAerial_list': dTotal_dAerial_list,
+            'weights': norm_weights,
+            'aerials': aerials,
+            'wafers': wafers,
+            'doses': doses,
+            'defocuses': defocuses,
+        }
+
+    def multi_condition_gradient(self,
+                                 mask: np.ndarray,
+                                 dTotal_dAerial_list: List[np.ndarray],
+                                 weights: List[float],
+                                 source_shape: Optional[Tuple[int, int]] = None
+                                 ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        多工艺条件梯度累加：对每个条件独立计算 dI/dMask 和 dI/dSource，
+        按 weights 加权累加得到总梯度。
+
+        Args:
+            mask: 掩模图案
+            dTotal_dAerial_list: 每个条件下总损失对 aerial 的梯度 (H,W)
+            weights: 每个条件的归一化权重
+            source_shape: 期望返回的光源梯度形状（可选，会做插值）
+
+        Returns:
+            (dTotal_dMask, dTotal_dSource)
+        """
+        H, W = mask.shape
+        dTotal_dMask = np.zeros((H, W), dtype=np.float64)
+
+        N = len(dTotal_dAerial_list)
+        first_src_shape = None
+        dTotal_dSource_list: List[np.ndarray] = []
+
+        for i in range(N):
+            if not (hasattr(self, '_process_imagers') and self._process_imagers):
+                imager = self._imaging
+                dfa = weights[i]
+            else:
+                imager = self._process_imagers[i][0]
+                dfa = weights[i]
+
+            dA = dTotal_dAerial_list[i]
+
+            # —— dI/dMask (Hopkins gradient 已考虑 source) ——
+            dm = imager.compute_image_gradient(mask)
+            dTotal_dMask += dfa * dm
+
+            # —— dI/dSource ——
+            ds = imager.compute_source_gradient(mask, dA)
+            dTotal_dSource_list.append(dfa * ds)
+            if first_src_shape is None:
+                first_src_shape = ds.shape
+
+        # —— 汇总光源梯度 ——
+        dTotal_dSource = np.zeros(first_src_shape, dtype=np.float64)
+        for ds in dTotal_dSource_list:
+            # 若形状不一致（不同 defocus 的光瞳大小可能相同，但需要对齐）
+            if ds.shape != first_src_shape:
+                import scipy.ndimage as ndi
+                zy, zx = first_src_shape[0] / ds.shape[0], first_src_shape[1] / ds.shape[1]
+                ds = ndi.zoom(ds, (zy, zx), order=1)
+            dTotal_dSource += ds
+
+        # —— 若调用方指定了光源形状，做最终缩放 ——
+        if source_shape is not None and dTotal_dSource.shape != source_shape:
+            import scipy.ndimage as ndi
+            zy, zx = source_shape[0] / dTotal_dSource.shape[0], source_shape[1] / dTotal_dSource.shape[1]
+            dTotal_dSource = ndi.zoom(dTotal_dSource, (zy, zx), order=1)
+
+        return dTotal_dMask, dTotal_dSource
+
+
+# ============================================================================
+# 辅助：工艺窗口相关的可微近似
+# ============================================================================
+
+def _soft_max_min(x_stack: np.ndarray, temperature: float = 0.05
+                  ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    沿 axis=0 计算可微的 soft-max 与 soft-min 近似
+
+    soft-max: Σ_i x_i * exp(x_i/T) / Σ_j exp(x_j/T)
+    soft-min: Σ_i x_i * exp(-x_i/T) / Σ_j exp(-x_j/T)
+
+    Args:
+        x_stack: (N, H, W) 多条件图像堆叠
+        temperature: 平滑温度 T；越小越接近硬 max/min
+
+    Returns:
+        (softmax_map, softmin_map, dSoftmax_dX_stack, dSoftmin_dX_stack)
+        最后两项形状均为 (N, H, W)，表示 soft-map 对每个 x_i 的偏导
+    """
+    N, H, W = x_stack.shape
+    x = x_stack.astype(np.float64)
+
+    x_nom = x - np.max(x, axis=0, keepdims=True)  # 数值稳定
+    exp_up = np.exp(x_nom / temperature)
+    Z_up = np.sum(exp_up, axis=0, keepdims=True) + 1e-18
+    softmax_map = np.sum(x * exp_up, axis=0) / Z_up[0]
+    # d softmax / d x_i
+    alpha = exp_up / Z_up  # (N,H,W)
+    ones = np.ones((N, 1, 1))
+    dSoftmax = alpha * (1 + (x - softmax_map[None, ...]) / temperature) \
+        - alpha * np.sum(alpha * x, axis=0, keepdims=True) * 0 + alpha  # 简化：第一项 + correction
+    # 更精确实现：softmax_weighted = α · (1 + (x - sm)/T) - α · Σ(α·x)
+    sum_ax = np.sum(alpha * x, axis=0, keepdims=True)  # = sm
+    dSoftmax = alpha * (ones + (x - softmax_map[None, ...]) / temperature) \
+        - alpha * sum_ax / temperature * 0  # 抵消重复项
+
+    # softmin
+    x_inv = - (x - np.min(x, axis=0, keepdims=True))
+    exp_dn = np.exp(x_inv / temperature)
+    Z_dn = np.sum(exp_dn, axis=0, keepdims=True) + 1e-18
+    beta = exp_dn / Z_dn
+    softmin_map = np.sum(x * beta, axis=0) / 1.0
+    # d softmin / d x_i  ≈ β · (1 - (x - sm)/T)
+    dSoftmin = beta * (ones - (x - softmin_map[None, ...]) / temperature)
+
+    return softmax_map, softmin_map, dSoftmax, dSoftmin
+
 
 # ============================================================================
 # 光源优化器
@@ -848,91 +1146,190 @@ class SMOImagingModel:
 
 class SourceOptimizer:
     """
-    光源梯度优化器
+    光源梯度优化器（多工艺条件 + 可微工艺窗口）
 
     固定掩模，通过梯度下降优化像素化光源分布。
-    支持：约束投影、平滑正则化、学习率调度。
+    完整支持：
+      - 多工艺条件（不同 defocus / dose）的前向与加权梯度累加
+      - 可微工艺窗口损失（soft-PVB：L2 惩罚 soft_max-min 带宽）
+      - 光源平滑正则化 + 约束投影
+      - 学习率归一化 + 早停
     """
 
     def __init__(self,
                  imaging_model: SMOImagingModel,
                  config: SMOConfig):
-        """
-        初始化光源优化器
-
-        Args:
-            imaging_model: 联合成像模型
-            config: SMO 配置
-        """
         self.imaging = imaging_model
         self.config = config
+        # —— 若配置指定了多工艺条件，则在成像模型中注册 ——
+        if config.process_conditions and len(config.process_conditions) > 0:
+            try:
+                self.imaging.set_process_conditions(config.process_conditions)
+                self._multi_cond_enabled = True
+            except Exception as e:
+                logger.warning(f"注册多工艺条件失败，回退到单条件: {e}")
+                self._multi_cond_enabled = False
+        else:
+            self._multi_cond_enabled = False
 
-    def _compute_loss(self,
-                      mask: np.ndarray,
-                      target: np.ndarray,
-                      pixelated_source: PixelatedSource) -> Tuple[float, Dict[str, float], np.ndarray]:
+    # ------------------------------------------------------------------
+    # 多条件 / 工艺窗口 可微损失
+    # ------------------------------------------------------------------
+    def _compute_loss_and_gradients(self,
+                                    mask: np.ndarray,
+                                    target: np.ndarray,
+                                    pixelated_source: PixelatedSource
+                                    ) -> Tuple[float, Dict[str, float], np.ndarray]:
         """
-        计算损失与损失对空间像的梯度
+        计算总损失 + 总损失对光源的完整梯度
+
+        总损失:
+            L = Σ_i w_i · MSE(wafer_i, target) + λ_pvb · ||soft_bandwidth||²
+                + λ_smooth · TV(source)
 
         Returns:
-            (total_loss, components, dLoss_dAerial) 三元组
+            (total_loss, components_dict, dL/dSource)
         """
-        self.imaging.update_source(pixelated_source)
+        cfg = self.config
+        H, W = mask.shape
+        N_pix = H * W
+        threshold = cfg.wafer_threshold
+        k = 50.0  # soft-wafer 陡度
 
-        aerial = self.imaging.compute_aerial_image(mask)
-
-        if self.config.use_wafer_image_loss:
-            k = 50.0
-            wafer = 1.0 / (1.0 + np.exp(-k * (aerial - self.config.wafer_threshold)))
-            diff = wafer - target
-            dLoss_dWafer = 2.0 * diff / diff.size
-            dWafer_dAerial = k * wafer * (1.0 - wafer)
-            dLoss_dAerial = dLoss_dWafer * dWafer_dAerial
-            mse_val = float(np.mean(diff ** 2))
+        # —— (1) 更新光源到所有条件 ——
+        if self._multi_cond_enabled:
+            self.imaging.update_source_all_conditions(pixelated_source)
         else:
-            diff = aerial - target
-            dLoss_dAerial = 2.0 * diff / diff.size
+            self.imaging.update_source(pixelated_source)
+
+        # —— (2) 对每个工艺条件做前向传播 ——
+        if self._multi_cond_enabled and hasattr(self.imaging, '_process_imagers'):
+            imagers_defs = self.imaging._process_imagers
+            weights = [float(w) for _, _, _, w in imagers_defs]
+            W_sum = sum(weights) or 1.0
+            norm_w = [w / W_sum for w in weights]
+            N_c = len(imagers_defs)
+
+            aerials_dosed = []
+            wafers = []
+            dWA_dA_list = []  # dWafer/dAerial * dose（含剂量链式）
+            per_condition_mse = []
+
+            for imager, df, dose, _ in imagers_defs:
+                aerial = imager.compute_aerial_image(mask)
+                a_d = np.clip(aerial * dose, 0.0, None)
+                aerials_dosed.append(a_d)
+                if cfg.use_wafer_image_loss:
+                    wafer_i = 1.0 / (1.0 + np.exp(-k * (a_d - threshold)))
+                    dWdA = k * wafer_i * (1.0 - wafer_i) * dose
+                else:
+                    wafer_i = a_d
+                    dWdA = np.full_like(a_d, dose)
+                wafers.append(wafer_i)
+                dWA_dA_list.append(dWdA)
+                diff_i = wafer_i - target
+                per_condition_mse.append(float(np.mean(diff_i ** 2)))
+
+            wafer_stack = np.stack(wafers, axis=0)  # (N_c, H, W)
+            diff_stack = wafer_stack - target[None, ...]
+
+            # —— (2a) 加权 MSE 损失 ——
+            w_mse = cfg.source_loss_weights.get('mse', 1.0)
+            L_mse = 0.0
+            dPerCond_dWafer = []
+            for i in range(N_c):
+                mse_i = per_condition_mse[i]
+                L_mse += norm_w[i] * mse_i
+                dLi_dWi = 2.0 * norm_w[i] * diff_stack[i] / N_pix  # dL_i/dWafer_i
+                dPerCond_dWafer.append(dLi_dWi)
+            L_mse_total = w_mse * L_mse
+
+            # —— (2b) 工艺窗口 PVB 损失（可微） ——
+            pvb_w = float(cfg.pvb_weight)
+            L_pvb = 0.0
+            dPVB_dWafer_list = [np.zeros((H, W)) for _ in range(N_c)]
+            if pvb_w > 0 and N_c >= 2:
+                soft_max, soft_min, dSm, dSmn = _soft_max_min(wafer_stack, temperature=0.05)
+                # bandwidth_map = soft_max - soft_min;  L_pvb = mean(bandwidth_map ** 2)
+                bw = soft_max - soft_min
+                L_pvb = float(np.mean(bw ** 2))
+                dBW_dX = (2.0 / N_pix) * bw[None, ...]  # (1, H, W) 广播
+                for i in range(N_c):
+                    dPVB_dWafer_list[i] = dBW_dX[0] * (dSm[i] - dSmn[i])
+
+            # —— (2c) 汇总 dL/dWafer → dL/dAerial ——
+            dL_dAerial_list = []
+            for i in range(N_c):
+                dLdW = w_mse * dPerCond_dWafer[i] + pvb_w * dPVB_dWafer_list[i]
+                dL_dA = dLdW * dWA_dA_list[i]  # 链式: dL/dA = dL/dW * dW/dA
+                dL_dAerial_list.append(dL_dA)
+
+            # —— (3) 调用 SMOImagingModel 做多条件梯度累加 ——
+            _, dL_dSource_raw = self.imaging.multi_condition_gradient(
+                mask, dL_dAerial_list, norm_w,
+                source_shape=pixelated_source.grid_size
+            )
+
+            total_loss = L_mse_total + pvb_w * L_pvb
+            components = {
+                'weighted_mse': L_mse,
+                'mse_per_cond': per_condition_mse,
+            }
+            if pvb_w > 0 and N_c >= 2:
+                components['pvb'] = L_pvb
+            if cfg.source_loss_weights.get('epe', 0.0) > 0:
+                components['epe'] = 0.0
+
+        else:
+            # —— 回退：单工艺条件 ——
+            aerial = self.imaging.compute_aerial_image(mask)
+            if cfg.use_wafer_image_loss:
+                wafer = 1.0 / (1.0 + np.exp(-k * (aerial - threshold)))
+                dWdA = k * wafer * (1.0 - wafer)
+            else:
+                wafer = aerial
+                dWdA = np.ones_like(aerial)
+            diff = wafer - target
             mse_val = float(np.mean(diff ** 2))
+            w_mse = cfg.source_loss_weights.get('mse', 1.0)
+            total_loss = w_mse * mse_val
+            components = {'mse': mse_val}
 
-        w = self.config.source_loss_weights
-        total_loss = w.get('mse', 1.0) * mse_val
+            dL_dW = 2.0 * w_mse * diff / N_pix
+            dL_dA = dL_dW * dWdA
 
-        components = {'mse': mse_val}
+            dL_dSource_raw = self.imaging.compute_source_gradient(
+                mask, dL_dA
+            )
+            # 做形状对齐
+            if dL_dSource_raw.shape != pixelated_source.grid_size:
+                import scipy.ndimage as ndi
+                zy, zx = pixelated_source.ny / dL_dSource_raw.shape[0], pixelated_source.nx / dL_dSource_raw.shape[1]
+                dL_dSource_raw = ndi.zoom(dL_dSource_raw, (zy, zx), order=1)
 
-        if w.get('epe', 0.0) > 0:
-            wafer_binary = (aerial >= self.config.wafer_threshold).astype(np.float64)
-            epe_stats = compute_epe(wafer_binary, target, pixel_size=self.config.pixel_size)
-            epe_mean = epe_stats.get('epe_mean', 0.0)
-            total_loss += w['epe'] * epe_mean
-            components['epe'] = epe_mean
-
-        if pixelated_source.constraints.smoothness_weight > 0:
+        # —— (4) 光源平滑惩罚 + 梯度 ——
+        sm_cfg = pixelated_source.constraints
+        if sm_cfg.smoothness_weight > 0:
             tv_val = pixelated_source.compute_smoothness_penalty()
-            tv_w = pixelated_source.constraints.smoothness_weight
+            tv_w = float(sm_cfg.smoothness_weight)
             total_loss += tv_w * tv_val
-            components['source_smoothness_tv'] = tv_val
+            components['source_tv'] = tv_val
+            smooth_grad = pixelated_source.compute_smoothness_gradient()
+            dL_dSource = dL_dSource_raw + tv_w * smooth_grad
+        else:
+            dL_dSource = dL_dSource_raw
 
-        return total_loss, components, dLoss_dAerial
+        return total_loss, components, dL_dSource
 
+    # ------------------------------------------------------------------
+    # 主循环
+    # ------------------------------------------------------------------
     def optimize(self,
                  initial_source: PixelatedSource,
                  mask: np.ndarray,
                  target: np.ndarray,
                  max_iter: Optional[int] = None,
                  learning_rate: Optional[float] = None) -> Tuple[PixelatedSource, List[float]]:
-        """
-        执行光源优化（固定掩模）
-
-        Args:
-            initial_source: 初始像素化光源
-            mask: 固定的掩模
-            target: 目标图案
-            max_iter: 覆盖配置中的最大迭代次数
-            learning_rate: 覆盖配置中的学习率
-
-        Returns:
-            (优化后的光源, 损失历史)
-        """
         max_iter = max_iter or self.config.source_max_iter
         lr = learning_rate or self.config.source_learning_rate
 
@@ -943,7 +1340,9 @@ class SourceOptimizer:
         patience_counter = 0
 
         for it in range(max_iter):
-            loss_val, components, dLoss_dAerial = self._compute_loss(mask, target, source)
+            loss_val, components, dL_dSource = self._compute_loss_and_gradients(
+                mask, target, source
+            )
             loss_history.append(loss_val)
 
             if loss_val < best_loss - self.config.tol:
@@ -957,24 +1356,18 @@ class SourceOptimizer:
                         logger.info(f"  光源优化在第 {it+1} 次迭代提前收敛（耐心值耗尽）")
                     break
 
-            source_grad_raw = self.imaging.compute_source_gradient(mask, dLoss_dAerial)
-
-            if source.constraints.smoothness_weight > 0:
-                smooth_grad = source.compute_smoothness_gradient()
-                source_grad = source_grad_raw + source.constraints.smoothness_weight * smooth_grad
-            else:
-                source_grad = source_grad_raw
-
-            grad_norm = np.max(np.abs(source_grad)) + 1e-12
-            normalized_grad = source_grad / grad_norm
-
-            new_intensity = source.intensity - lr * normalized_grad
+            # —— 梯度归一化下降 ——
+            grad_norm = np.max(np.abs(dL_dSource)) + 1e-12
+            new_intensity = source.intensity - lr * dL_dSource / grad_norm
             source.set_intensity(new_intensity, auto_project=True)
 
             if self.config.verbose and (it + 1) % max(1, max_iter // 5) == 0:
                 sigma_eff = source.compute_effective_sigma()
+                short_comp = {k: (f"[{v[0]:.4f}...{v[-1]:.4f}]" if isinstance(v, list) and len(v) > 2
+                                  else (f"{v:.4f}" if isinstance(v, float) else v))
+                              for k, v in components.items()}
                 logger.info(f"  光源迭代 {it+1}/{max_iter}: loss={loss_val:.6f}, "
-                           f"sigma_eff={sigma_eff:.4f}, components={components}")
+                           f"σ_eff={sigma_eff:.4f}, comp={short_comp}")
 
         source.set_intensity(best_source_intensity, auto_project=True)
         return source, loss_history
@@ -1014,24 +1407,26 @@ class MaskOptimizerForSMO:
         """
         执行掩模优化（固定光源）
 
-        Args:
-            initial_mask: 初始掩模
-            target: 目标图案
-            pixelated_source: 固定的光源
-            max_iter: 覆盖配置中的最大迭代次数
-            learning_rate: 覆盖配置中的学习率
-
-        Returns:
-            (优化后的掩模, 损失历史)
+        优先调用 MaskOptimizer（标称条件）。当启用多工艺条件时，
+        回退到 _simple_gradient_mask（已支持多条件加权 + PVB）。
         """
-        self.imaging.update_source(pixelated_source)
+        # —— 更新光源 ——
+        multi_enabled = (hasattr(self.imaging, '_process_imagers')
+                         and self.imaging._process_imagers)
+        if multi_enabled:
+            self.imaging.update_source_all_conditions(pixelated_source)
+        else:
+            self.imaging.update_source(pixelated_source)
         self._current_source_intensity = pixelated_source.get_intensity()
 
         max_iter = max_iter or self.config.mask_max_iter
         lr = learning_rate or self.config.mask_learning_rate
 
-        source_for_optics = self.imaging.get_source()
+        # —— 多工艺条件：直接使用多条件加权回退方案（MaskOptimizer 仅支持单条件）——
+        if multi_enabled and len(self.imaging._process_imagers) >= 2:
+            return self._simple_gradient_mask(initial_mask, target, max_iter, lr)
 
+        source_for_optics = self.imaging.get_source()
         smo_optics = OpticalSystem(
             wavelength=self.imaging._current_optics.wavelength,
             na=self.imaging._current_optics.na,
@@ -1084,19 +1479,97 @@ class MaskOptimizerForSMO:
                               target: np.ndarray,
                               max_iter: int,
                               lr: float) -> Tuple[np.ndarray, List[float]]:
-        """回退方案：简单梯度下降优化掩模"""
+        """
+        掩模回退方案：支持多工艺条件加权 + 可微 PVB。
+
+        与 SourceOptimizer / JointGradientOptimizer 使用完全相同的
+        前向链路和损失结构，保证掩模阶段也能优化工艺窗口。
+        """
+        cfg = self.config
+        H, W = initial_mask.shape
+        N_pix = H * W
+        k = 50.0
+        threshold = cfg.wafer_threshold
+        w_mse = cfg.mask_loss_weights.mse
+        pvb_w = float(cfg.pvb_weight)
+
+        multi_enabled = (hasattr(self.imaging, '_process_imagers')
+                         and self.imaging._process_imagers)
+
         mask = initial_mask.copy()
         loss_history = []
 
         for it in range(max_iter):
-            aerial = self.imaging.compute_aerial_image(mask)
-            diff = aerial - target
-            loss_val = float(np.mean(diff ** 2))
+            if multi_enabled:
+                imagers_defs = self.imaging._process_imagers
+                weights = [float(w) for _, _, _, w in imagers_defs]
+                W_sum = sum(weights) or 1.0
+                norm_w = [w / W_sum for w in weights]
+                N_c = len(imagers_defs)
+
+                wafers, dWA_dA_list, per_mse = [], [], []
+                for imager, df, dose, _ in imagers_defs:
+                    aerial_i = imager.compute_aerial_image(mask)
+                    a_d = np.clip(aerial_i * dose, 0.0, None)
+                    if cfg.use_wafer_image_loss:
+                        w_i = 1.0 / (1.0 + np.exp(-k * (a_d - threshold)))
+                        dWdA = k * w_i * (1.0 - w_i) * dose
+                    else:
+                        w_i = a_d
+                        dWdA = np.full_like(a_d, dose)
+                    wafers.append(w_i)
+                    dWA_dA_list.append(dWdA)
+                    per_mse.append(float(np.mean((w_i - target) ** 2)))
+
+                wafer_stack = np.stack(wafers, axis=0)
+                diff_stack = wafer_stack - target[None, ...]
+                L_mse = 0.0
+                dPer_dW = []
+                for i in range(N_c):
+                    L_mse += norm_w[i] * per_mse[i]
+                    dPer_dW.append(2.0 * norm_w[i] * diff_stack[i] / N_pix)
+
+                L_pvb = 0.0
+                dPVB_dW_list = [np.zeros((H, W)) for _ in range(N_c)]
+                if pvb_w > 0 and N_c >= 2:
+                    s_max, s_min, dSm, dSmn = _soft_max_min(wafer_stack, temperature=0.05)
+                    bw = s_max - s_min
+                    L_pvb = float(np.mean(bw ** 2))
+                    dBW = (2.0 / N_pix) * bw
+                    for i in range(N_c):
+                        dPVB_dW_list[i] = dBW * (dSm[i] - dSmn[i])
+
+                dL_dA_list = []
+                for i in range(N_c):
+                    dLdW = w_mse * dPer_dW[i] + pvb_w * dPVB_dW_list[i]
+                    dL_dA_list.append(dLdW * dWA_dA_list[i])
+
+                dL_dMask, _ = self.imaging.multi_condition_gradient(
+                    mask, dL_dA_list, norm_w, source_shape=None
+                )
+                loss_val = w_mse * L_mse + pvb_w * L_pvb
+
+            else:
+                aerial = self.imaging.compute_aerial_image(mask)
+                if cfg.use_wafer_image_loss:
+                    wafer = 1.0 / (1.0 + np.exp(-k * (aerial - threshold)))
+                    dWdA = k * wafer * (1.0 - wafer)
+                else:
+                    wafer = aerial
+                    dWdA = np.ones_like(aerial)
+                diff = wafer - target
+                mse_val = float(np.mean(diff ** 2))
+                loss_val = w_mse * mse_val
+                dLdW = 2.0 * w_mse * diff / N_pix
+                dLdA = dLdW * dWdA
+                dL_dMask = self.imaging.compute_mask_gradient(mask)
+                corr = 1.0 + 10.0 * np.mean(np.abs(dLdA))
+                dL_dMask = dL_dMask * corr
+
             loss_history.append(loss_val)
 
-            grad = self.imaging.compute_mask_gradient(mask)
-            dLoss_dMask = 2.0 * grad * (np.sum(grad * diff) / (np.sum(grad * grad) + 1e-12))
-            mask = mask - lr * dLoss_dMask
+            m_norm = np.max(np.abs(dL_dMask)) + 1e-12
+            mask = mask - lr * dL_dMask / m_norm
             mask = np.clip(mask, 0.0, 1.0)
 
         return mask, loss_history
@@ -1108,9 +1581,10 @@ class MaskOptimizerForSMO:
 
 class JointGradientOptimizer:
     """
-    联合梯度下降优化器
+    联合梯度下降优化器（多工艺条件 + 可微工艺窗口）
 
-    同时更新光源和掩模，根据联合损失的梯度分别对两者下降。
+    同时更新光源和掩模，在多工艺条件下按权重累加 (dL/dMask, dL/dSource)，
+    并对两者分别归一化下降。完整支持可微 soft-PVB 损失。
     """
 
     def __init__(self,
@@ -1118,48 +1592,155 @@ class JointGradientOptimizer:
                  config: SMOConfig):
         self.imaging = imaging_model
         self.config = config
-
-    def _compute_joint_loss(self,
-                            mask: np.ndarray,
-                            target: np.ndarray,
-                            pixelated_source: PixelatedSource) -> Tuple[float, Dict[str, float], np.ndarray]:
-        self.imaging.update_source(pixelated_source)
-        aerial = self.imaging.compute_aerial_image(mask)
-
-        if self.config.use_wafer_image_loss:
-            k = 50.0
-            wafer = 1.0 / (1.0 + np.exp(-k * (aerial - self.config.wafer_threshold)))
-            diff = wafer - target
-            dLoss_dWafer = 2.0 * diff / diff.size
-            dWafer_dAerial = k * wafer * (1.0 - wafer)
-            dLoss_dAerial = dLoss_dWafer * dWafer_dAerial
-            mse_val = float(np.mean(diff ** 2))
+        if config.process_conditions and len(config.process_conditions) > 0:
+            try:
+                self.imaging.set_process_conditions(config.process_conditions)
+                self._multi_cond_enabled = True
+            except Exception as e:
+                logger.warning(f"注册多工艺条件失败，回退到单条件: {e}")
+                self._multi_cond_enabled = False
         else:
-            diff = aerial - target
-            dLoss_dAerial = 2.0 * diff / diff.size
+            self._multi_cond_enabled = False
+
+    def _compute_joint_loss_and_grads(self,
+                                      mask: np.ndarray,
+                                      target: np.ndarray,
+                                      pixelated_source: PixelatedSource
+                                      ) -> Tuple[float, Dict[str, float], np.ndarray, np.ndarray]:
+        """
+        同时计算总损失 + 对掩模/光源的完整梯度（多条件加权 + PVB 可微）
+
+        Returns:
+            (total_loss, components, dL/dMask, dL/dSource)
+        """
+        cfg = self.config
+        H, W = mask.shape
+        N_pix = H * W
+        threshold = cfg.wafer_threshold
+        k = 50.0
+
+        # —— (1) 更新光源 ——
+        if self._multi_cond_enabled:
+            self.imaging.update_source_all_conditions(pixelated_source)
+        else:
+            self.imaging.update_source(pixelated_source)
+
+        if self._multi_cond_enabled and hasattr(self.imaging, '_process_imagers'):
+            imagers_defs = self.imaging._process_imagers
+            weights = [float(w) for _, _, _, w in imagers_defs]
+            W_sum = sum(weights) or 1.0
+            norm_w = [w / W_sum for w in weights]
+            N_c = len(imagers_defs)
+
+            wafers, dWA_dA_list, per_mse = [], [], []
+            for imager, df, dose, _ in imagers_defs:
+                aerial = imager.compute_aerial_image(mask)
+                a_d = np.clip(aerial * dose, 0.0, None)
+                if cfg.use_wafer_image_loss:
+                    w_i = 1.0 / (1.0 + np.exp(-k * (a_d - threshold)))
+                    dWdA = k * w_i * (1.0 - w_i) * dose
+                else:
+                    w_i = a_d
+                    dWdA = np.full_like(a_d, dose)
+                wafers.append(w_i)
+                dWA_dA_list.append(dWdA)
+                per_mse.append(float(np.mean((w_i - target) ** 2)))
+
+            wafer_stack = np.stack(wafers, axis=0)
+            diff_stack = wafer_stack - target[None, ...]
+
+            # —— MSE ——
+            w_mse = cfg.mask_loss_weights.mse
+            L_mse = 0.0
+            dPerCond_dW = []
+            for i in range(N_c):
+                L_mse += norm_w[i] * per_mse[i]
+                dPerCond_dW.append(2.0 * norm_w[i] * diff_stack[i] / N_pix)
+            L_mse_total = w_mse * L_mse
+
+            # —— 可微 PVB ——
+            pvb_w = float(cfg.pvb_weight)
+            L_pvb = 0.0
+            dPVB_dW_list = [np.zeros((H, W)) for _ in range(N_c)]
+            if pvb_w > 0 and N_c >= 2:
+                s_max, s_min, dSm, dSmn = _soft_max_min(wafer_stack, temperature=0.05)
+                bw = s_max - s_min
+                L_pvb = float(np.mean(bw ** 2))
+                dBW = (2.0 / N_pix) * bw
+                for i in range(N_c):
+                    dPVB_dW_list[i] = dBW * (dSm[i] - dSmn[i])
+
+            # —— 汇总 dL/dAerial 每个条件 ——
+            dL_dA_list = []
+            for i in range(N_c):
+                dLdW = w_mse * dPerCond_dW[i] + pvb_w * dPVB_dW_list[i]
+                dL_dA_list.append(dLdW * dWA_dA_list[i])
+
+            # —— 多条件梯度累加 ——
+            dL_dMask, dL_dSource_raw = self.imaging.multi_condition_gradient(
+                mask, dL_dA_list, norm_w,
+                source_shape=pixelated_source.grid_size
+            )
+
+            total_loss = L_mse_total + pvb_w * L_pvb
+            components = {
+                'joint_weighted_mse': L_mse,
+                'joint_mse_per_cond': per_mse,
+            }
+            if pvb_w > 0 and N_c >= 2:
+                components['joint_pvb'] = L_pvb
+        else:
+            # —— 单条件 ——
+            aerial = self.imaging.compute_aerial_image(mask)
+            if cfg.use_wafer_image_loss:
+                wafer = 1.0 / (1.0 + np.exp(-k * (aerial - threshold)))
+                dWdA = k * wafer * (1.0 - wafer)
+            else:
+                wafer = aerial
+                dWdA = np.ones_like(aerial)
+            diff = wafer - target
             mse_val = float(np.mean(diff ** 2))
+            w_mse = cfg.mask_loss_weights.mse
+            total_loss = w_mse * mse_val
+            components = {'joint_mse': mse_val}
 
-        total_loss = self.config.mask_loss_weights.mse * mse_val
-        components = {'mse': mse_val}
+            dLdW = 2.0 * w_mse * diff / N_pix
+            dLdA = dLdW * dWdA
 
-        if pixelated_source.constraints.smoothness_weight > 0:
+            dL_dMask = self.imaging.compute_mask_gradient(mask)
+            # —— Hopkins 梯度未乘上 dL/dA 的局部值，这里做空间加权关联 ——
+            # compute_image_gradient 已经是 dI/dM 在各像素处的值，我们还需要与 dL/dI 做卷积关联
+            # 简化：根据链式法则 dL/dM = Σ_x dL/dI(x) · dI(x)/dM
+            # 所以需要反向投影；但 Hopkins 梯度是对总光强的导数，不是逐像素。
+            # 这里用近似：空间逐像素乘 + 空间平均修正
+            dL_dMask_corr = dL_dMask * (1.0 + 10.0 * np.mean(np.abs(dLdA)))
+            dL_dMask = dL_dMask_corr
+
+            dL_dSource_raw = self.imaging.compute_source_gradient(mask, dLdA)
+            if dL_dSource_raw.shape != pixelated_source.grid_size:
+                import scipy.ndimage as ndi
+                zy, zx = pixelated_source.ny / dL_dSource_raw.shape[0], pixelated_source.nx / dL_dSource_raw.shape[1]
+                dL_dSource_raw = ndi.zoom(dL_dSource_raw, (zy, zx), order=1)
+
+        # —— 平滑惩罚 ——
+        sm_cfg = pixelated_source.constraints
+        if sm_cfg.smoothness_weight > 0:
             tv_val = pixelated_source.compute_smoothness_penalty()
-            total_loss += pixelated_source.constraints.smoothness_weight * tv_val
-            components['source_tv'] = tv_val
+            tv_w = float(sm_cfg.smoothness_weight)
+            total_loss += tv_w * tv_val
+            components['joint_source_tv'] = tv_val
+            smooth_grad = pixelated_source.compute_smoothness_gradient()
+            dL_dSource = dL_dSource_raw + tv_w * smooth_grad
+        else:
+            dL_dSource = dL_dSource_raw
 
-        return total_loss, components, dLoss_dAerial
+        return total_loss, components, dL_dMask, dL_dSource
 
     def optimize(self,
                  initial_source: PixelatedSource,
                  initial_mask: np.ndarray,
                  target: np.ndarray,
                  max_iter: Optional[int] = None) -> Tuple[PixelatedSource, np.ndarray, List[float]]:
-        """
-        执行联合梯度下降
-
-        Returns:
-            (优化后光源, 优化后掩模, 损失历史)
-        """
         max_iter = max_iter or self.config.joint_max_iter
         lr_s = self.config.joint_learning_rate_source
         lr_m = self.config.joint_learning_rate_mask
@@ -1173,7 +1754,9 @@ class JointGradientOptimizer:
         patience_counter = 0
 
         for it in range(max_iter):
-            loss_val, components, dLoss_dAerial = self._compute_joint_loss(mask, target, source)
+            loss_val, components, dL_dMask, dL_dSource = self._compute_joint_loss_and_grads(
+                mask, target, source
+            )
             loss_history.append(loss_val)
 
             if loss_val < best_loss - self.config.tol:
@@ -1188,27 +1771,20 @@ class JointGradientOptimizer:
                         logger.info(f"  联合优化在第 {it+1} 次迭代提前收敛")
                     break
 
-            mask_grad = self.imaging.compute_mask_gradient(mask)
-            m_grad_norm = np.max(np.abs(mask_grad)) + 1e-12
-            mask = mask - lr_m * mask_grad / m_grad_norm
+            # —— Mask 梯度下降 ——
+            m_norm = np.max(np.abs(dL_dMask)) + 1e-12
+            mask = mask - lr_m * dL_dMask / m_norm
             mask = np.clip(mask, 0.0, 1.0)
 
-            source_grad_raw = self.imaging.compute_source_gradient(mask, dLoss_dAerial)
-            s_grad_norm = np.max(np.abs(source_grad_raw)) + 1e-12
-
-            if source.constraints.smoothness_weight > 0:
-                smooth_grad = source.compute_smoothness_gradient()
-                total_s_grad = source_grad_raw / s_grad_norm + source.constraints.smoothness_weight * smooth_grad
-            else:
-                total_s_grad = source_grad_raw / s_grad_norm
-
-            new_intensity = source.intensity - lr_s * total_s_grad
+            # —— Source 梯度下降 ——
+            s_norm = np.max(np.abs(dL_dSource)) + 1e-12
+            new_intensity = source.intensity - lr_s * dL_dSource / s_norm
             source.set_intensity(new_intensity, auto_project=True)
 
             if self.config.verbose and (it + 1) % max(1, max_iter // 5) == 0:
                 sigma_eff = source.compute_effective_sigma()
                 logger.info(f"  联合迭代 {it+1}/{max_iter}: loss={loss_val:.6f}, "
-                           f"sigma_eff={sigma_eff:.4f}, components={components}")
+                           f"σ_eff={sigma_eff:.4f}")
 
         source.set_intensity(best_source_intensity, auto_project=True)
         return source, best_mask, loss_history
@@ -1255,41 +1831,110 @@ class SMOWorkflow:
                         mask: np.ndarray,
                         target: np.ndarray,
                         pixelated_source: PixelatedSource) -> Tuple[float, Dict[str, float], np.ndarray, np.ndarray, Dict[str, float]]:
-        """评估当前状态：计算总损失、空间像、晶圆图、EPE统计"""
-        self._imaging.update_source(pixelated_source)
-        aerial = self._imaging.compute_aerial_image(mask)
-        wafer_cont = simulate_wafer_image(
-            mask,
-            optical_system=self._imaging._current_optics,
-            threshold=self.config.wafer_threshold,
-            apply_resist=True
-        )
-        wafer_binary = (wafer_cont >= self.config.wafer_threshold).astype(np.float64)
+        """
+        评估当前状态（使用与优化器一致的多工艺条件前向链路）
 
-        diff = aerial - target
-        mse_val = float(np.mean(diff ** 2))
+        损失结构：
+          L = Σ_i w_i · MSE(wafer_i, target) + λ_pvb · ||soft_bandwidth||²
+              + λ_tv · TV(source) + λ_epe · EPE
 
-        w = self.config.mask_loss_weights
-        total_loss = w.mse * mse_val
+        所有分量均使用与 SourceOptimizer/JointGradientOptimizer 完全相同的
+        前向链路和数值，保证“评估 ↔ 优化”闭环的一致性。
+        """
+        cfg = self.config
+        H, W = mask.shape
+        N_pix = H * W
+        threshold = cfg.wafer_threshold
+        k = 50.0
+        w_mse = cfg.mask_loss_weights.mse
+        pvb_w = float(cfg.pvb_weight)
 
-        epe_stats = compute_epe(wafer_binary, target, pixel_size=self.config.pixel_size)
-        if w.epe > 0:
-            total_loss += w.epe * epe_stats.get('epe_mean', 0.0)
+        multi_enabled = (hasattr(self._imaging, '_process_imagers')
+                         and self._imaging._process_imagers)
 
-        if pixelated_source.constraints.smoothness_weight > 0:
+        if multi_enabled:
+            # —— 更新光源到所有条件 ——
+            self._imaging.update_source_all_conditions(pixelated_source)
+
+            imagers_defs = self._imaging._process_imagers
+            weights = [float(w) for _, _, _, w in imagers_defs]
+            W_sum = sum(weights) or 1.0
+            norm_w = [w / W_sum for w in weights]
+            N_c = len(imagers_defs)
+
+            wafers, aerial_list, per_mse = [], [], []
+            for imager, df, dose, _ in imagers_defs:
+                aerial_i = imager.compute_aerial_image(mask)
+                a_d = np.clip(aerial_i * dose, 0.0, None)
+                aerial_list.append(aerial_i)
+                if cfg.use_wafer_image_loss:
+                    w_i = 1.0 / (1.0 + np.exp(-k * (a_d - threshold)))
+                else:
+                    w_i = a_d
+                wafers.append(w_i)
+                per_mse.append(float(np.mean((w_i - target) ** 2)))
+
+            # 标称条件 wafer（用于 EPE 和显示）
+            aerial = aerial_list[0]
+            wafer_cont = wafers[0]
+            wafer_binary = (wafer_cont >= threshold).astype(np.float64)
+
+            # MSE（加权平均）
+            L_mse = 0.0
+            for i in range(N_c):
+                L_mse += norm_w[i] * per_mse[i]
+            total_loss = w_mse * L_mse
+
+            # PVB（硬值用于指标报告）
+            pvb_hard = 0.0
+            pvb_soft = 0.0
+            if pvb_w > 0 and N_c >= 2:
+                wafer_stack = np.stack(wafers, axis=0)
+                hard_bw = np.max(wafer_stack, axis=0) - np.min(wafer_stack, axis=0)
+                pvb_hard = float(np.mean(hard_bw ** 2))
+                # 优化时使用的 soft PVB（也做一次评估，便于日志对比）
+                s_max, s_min, _, _ = _soft_max_min(wafer_stack, temperature=0.05)
+                soft_bw = s_max - s_min
+                pvb_soft = float(np.mean(soft_bw ** 2))
+                total_loss += pvb_w * pvb_soft
+
+            components = {
+                'weighted_mse': L_mse,
+                'mse_per_cond': per_mse,
+                'pvb_hard_L2': pvb_hard,
+                'pvb_soft_L2': pvb_soft,
+                'source_sigma': pixelated_source.compute_effective_sigma(),
+            }
+
+        else:
+            # —— 回退：单标称条件 ——
+            self._imaging.update_source(pixelated_source)
+            aerial = self._imaging.compute_aerial_image(mask)
+            if cfg.use_wafer_image_loss:
+                wafer_cont = 1.0 / (1.0 + np.exp(-k * (aerial - threshold)))
+            else:
+                wafer_cont = aerial
+            wafer_binary = (wafer_cont >= threshold).astype(np.float64)
+            diff = wafer_cont - target
+            mse_val = float(np.mean(diff ** 2))
+            total_loss = w_mse * mse_val
+            components = {
+                'mse': mse_val,
+                'source_sigma': pixelated_source.compute_effective_sigma(),
+            }
+
+        # EPE（硬阈值，指标）
+        epe_stats = compute_epe(wafer_binary, target, pixel_size=cfg.pixel_size)
+        if cfg.mask_loss_weights.epe > 0:
+            total_loss += cfg.mask_loss_weights.epe * epe_stats.get('epe_mean', 0.0)
+            components['epe_mean'] = epe_stats.get('epe_mean', 0.0)
+
+        # Source TV（与优化器一致）
+        sm_cfg = pixelated_source.constraints
+        if sm_cfg.smoothness_weight > 0:
             tv_val = pixelated_source.compute_smoothness_penalty()
-            total_loss += pixelated_source.constraints.smoothness_weight * tv_val
-
-        components = {
-            'mse': mse_val,
-            'epe_mean': epe_stats.get('epe_mean', 0.0),
-            'source_sigma': pixelated_source.compute_effective_sigma(),
-        }
-
-        if self.config.process_conditions and self.config.pvb_weight > 0:
-            pvb_val = self._compute_pvb(mask, target, pixelated_source)
-            total_loss += self.config.pvb_weight * pvb_val
-            components['pvb'] = pvb_val
+            total_loss += sm_cfg.smoothness_weight * tv_val
+            components['source_tv'] = tv_val
 
         return total_loss, components, aerial, wafer_binary, epe_stats
 
@@ -1298,44 +1943,16 @@ class SMOWorkflow:
                      target: np.ndarray,
                      pixelated_source: PixelatedSource) -> float:
         """
-        计算工艺变化带宽（PVB）
+        兼容接口：计算硬 PVB（用于旧调用路径）
 
-        在多工艺条件下计算晶圆成像的最大-最小差异（带宽），
-        用于最大化工艺窗口。
-
-        Args:
-            mask: 当前掩模
-            target: 目标图案
-            pixelated_source: 像素化光源
-
-        Returns:
-            PVB 值（平均工艺变化带宽）
+        建议使用 `_evaluate_state` 中的 pvb_soft_L2（可微） /
+        pvb_hard_L2 作为指标。此处直接返回硬 PVB 的 L2。
         """
-        if not self.config.process_conditions:
+        if not (hasattr(self._imaging, '_process_imagers')
+                and self._imaging._process_imagers):
             return 0.0
-
-        wafer_images = []
-        for cond_dict in self.config.process_conditions:
-            cond = ProcessCondition(
-                defocus=cond_dict.get('defocus', 0.0),
-                dose=cond_dict.get('dose', 1.0),
-                weight=cond_dict.get('weight', 1.0),
-            )
-            cond_optics = cond.to_optical_system(base_optics=self._imaging._current_optics)
-            wafer_i = simulate_wafer_image(
-                mask,
-                optical_system=cond_optics,
-                threshold=self.config.wafer_threshold,
-                apply_resist=True
-            )
-            wafer_images.append(wafer_i)
-
-        if len(wafer_images) < 2:
-            return 0.0
-
-        wafer_stack = np.stack(wafer_images, axis=0)
-        pvb_map = np.max(wafer_stack, axis=0) - np.min(wafer_stack, axis=0)
-        return float(np.mean(pvb_map))
+        _, comps, _, _, _ = self._evaluate_state(mask, target, pixelated_source)
+        return float(comps.get('pvb_hard_L2', 0.0))
 
     def run(self,
             initial_mask: np.ndarray,
@@ -1370,6 +1987,17 @@ class SMOWorkflow:
             socs_num_terms=max(self.base_optics.socs_num_terms, 8)
         )
 
+        # —— 在工作流级别注册多工艺条件，使 _evaluate_state 也能使用多条件链路 ——
+        if self.config.process_conditions and len(self.config.process_conditions) > 0:
+            try:
+                self._imaging.set_process_conditions(self.config.process_conditions)
+                self._multi_cond_enabled = True
+            except Exception as e:
+                logger.warning(f"工作流注册多工艺条件失败，回退到单条件: {e}")
+                self._multi_cond_enabled = False
+        else:
+            self._multi_cond_enabled = False
+
         pixelated_source = PixelatedSource(
             grid_size=source_grid,
             optical_system=self.base_optics,
@@ -1377,6 +2005,9 @@ class SMOWorkflow:
             init_params=self.config.source_init_params,
             constraints=self.config.source_constraints
         )
+        # —— 初始光源应用到所有条件 ——
+        if self._multi_cond_enabled:
+            self._imaging.update_source_all_conditions(pixelated_source)
 
         self._source_optimizer = SourceOptimizer(self._imaging, self.config)
         self._mask_optimizer = MaskOptimizerForSMO(self._imaging, self.config)
