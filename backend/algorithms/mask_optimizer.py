@@ -70,6 +70,12 @@ from algorithms.callbacks import (
     LambdaCallback, AnimationCallback
 )
 
+try:
+    from surrogate import SurrogateImaging
+    _HAS_SURROGATE = True
+except ImportError:
+    _HAS_SURROGATE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -389,6 +395,13 @@ class OptimizationConfig:
     # 评估阶段切换为矢量后端（用于高精度最终评估）
     use_vector_backend_for_evaluation: bool = False
 
+    # 神经网络代理模型（Surrogate Model）配置
+    use_surrogate: bool = False  # 是否启用代理模型做快速近似优化
+    surrogate_checkpoint_path: Optional[str] = None  # 训练好的 .pt 模型路径
+    use_surrogate_for_gradient: bool = True  # 梯度计算也使用代理模型（更快）
+    use_real_model_for_final_evaluation: bool = True  # 优化结束后用真实模型验证
+    surrogate_device: str = 'auto'  # 代理模型推理设备: 'auto' | 'cpu' | 'cuda' | 'mps'
+
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'OptimizationConfig':
         if d is None:
@@ -588,6 +601,9 @@ class MaskOptimizer:
         self._multi_conditions: Optional[List[ProcessCondition]] = None
         self._multi_weights: Optional[List[float]] = None
 
+        self._surrogate_imaging: Optional['SurrogateImaging'] = None
+        self._surrogate_multi_models: Optional[List['SurrogateImaging']] = None
+
         self._callbacks: CallbackList = CallbackList(callbacks)
         self._history_callback: Optional[HistoryCallback] = None
         self._trainer_state: Optional[TrainerState] = None
@@ -653,6 +669,175 @@ class MaskOptimizer:
             return gradient
         return bandlimited_gradient_projection(gradient, self._bandlimit_mask)
 
+    def _should_use_surrogate(self, for_evaluation: bool = False, for_gradient: bool = False) -> bool:
+        """判断是否应该使用代理模型
+
+        Args:
+            for_evaluation: 是否为评估阶段（最终评估优先使用真实模型）
+            for_gradient: 是否用于梯度计算
+
+        Returns:
+            是否使用代理模型
+        """
+        cfg = self.config
+        if not cfg.use_surrogate:
+            return False
+        if not _HAS_SURROGATE:
+            return False
+        if for_evaluation and cfg.use_real_model_for_final_evaluation:
+            return False
+        if for_gradient and not cfg.use_surrogate_for_gradient:
+            return False
+        if for_gradient:
+            return self._surrogate_imaging is not None or self._surrogate_multi_models is not None
+        return self._surrogate_imaging is not None or self._surrogate_multi_models is not None
+
+    def _setup_surrogate_model(self, image_size: tuple):
+        """设置神经网络代理模型
+
+        当 config.use_surrogate=True 且指定了 checkpoint_path 时，
+        加载训练好的 SurrogateImaging 模型。
+
+        Args:
+            image_size: 图像尺寸 (height, width)
+        """
+        cfg = self.config
+        self._surrogate_imaging = None
+        self._surrogate_multi_models = None
+
+        if not cfg.use_surrogate:
+            return
+
+        if not _HAS_SURROGATE:
+            logger.warning("surrogate 模块不可用（请安装 PyTorch），将回退到真实成像模型")
+            cfg.use_surrogate = False
+            return
+
+        checkpoint_path = cfg.surrogate_checkpoint_path
+        if checkpoint_path is None:
+            logger.warning("use_surrogate=True 但未指定 surrogate_checkpoint_path，将回退到真实成像模型")
+            cfg.use_surrogate = False
+            return
+
+        try:
+            device = cfg.surrogate_device
+            self._surrogate_imaging = SurrogateImaging.from_checkpoint(
+                checkpoint_path=checkpoint_path,
+                optical_system=self.optical_system,
+                device=device,
+            )
+            self._surrogate_imaging._image_size = tuple(image_size)
+
+            if self._multi_conditions is not None:
+                self._surrogate_multi_models = []
+                for cond in self._multi_conditions:
+                    try:
+                        cond_optics = cond.to_optical_system(base_optics=self.optical_system)
+                        surr = SurrogateImaging.from_checkpoint(
+                            checkpoint_path=checkpoint_path,
+                            optical_system=cond_optics,
+                            device=device,
+                        )
+                        surr._image_size = tuple(image_size)
+                        self._surrogate_multi_models.append(surr)
+                    except Exception as e:
+                        logger.warning(f"多工艺条件代理模型初始化失败（cond={cond}），该条件回退到真实模型: {e}")
+                        self._surrogate_multi_models.append(None)
+
+            logger.info(
+                f"神经网络代理模型加载成功: {checkpoint_path}"
+                + (f", 多工艺条件 {len(self._surrogate_multi_models)} 个" if self._surrogate_multi_models else "")
+            )
+        except Exception as e:
+            logger.warning(f"加载代理模型失败，将回退到真实成像模型: {e}")
+            cfg.use_surrogate = False
+            self._surrogate_imaging = None
+            self._surrogate_multi_models = None
+
+    def _surrogate_compute_aerial(self, mask: np.ndarray, for_evaluation: bool = False) -> Optional[np.ndarray]:
+        """通过代理模型计算空间像（单工艺条件）
+
+        Args:
+            mask: 掩模图案
+            for_evaluation: 是否为评估阶段
+
+        Returns:
+            空间像，若不使用代理模型返回 None
+        """
+        if not self._should_use_surrogate(for_evaluation=for_evaluation):
+            return None
+        if self._surrogate_imaging is None:
+            return None
+        try:
+            return self._surrogate_imaging.compute_aerial_image(mask)
+        except Exception as e:
+            logger.warning(f"代理模型推理失败，回退到真实模型: {e}")
+            return None
+
+    def _surrogate_compute_gradient(self, mask: np.ndarray) -> Optional[np.ndarray]:
+        """通过代理模型计算成像梯度 d(aerial)/d(mask)
+
+        Args:
+            mask: 掩模图案
+
+        Returns:
+            梯度数组，若不使用代理模型返回 None
+        """
+        if not self._should_use_surrogate(for_gradient=True):
+            return None
+        if self._surrogate_imaging is None:
+            return None
+        try:
+            return self._surrogate_imaging.compute_image_gradient(mask)
+        except Exception as e:
+            logger.warning(f"代理模型梯度计算失败，回退到真实模型: {e}")
+            return None
+
+    def _multi_surrogate_compute_aerial(self, idx: int, mask: np.ndarray, for_evaluation: bool = False) -> Optional[np.ndarray]:
+        """多工艺条件下，通过指定索引的代理模型计算空间像
+
+        Args:
+            idx: 工艺条件索引
+            mask: 掩模图案
+            for_evaluation: 是否为评估阶段
+
+        Returns:
+            空间像，若不使用代理模型返回 None
+        """
+        if not self._should_use_surrogate(for_evaluation=for_evaluation):
+            return None
+        if (self._surrogate_multi_models is None
+                or idx >= len(self._surrogate_multi_models)
+                or self._surrogate_multi_models[idx] is None):
+            return None
+        try:
+            return self._surrogate_multi_models[idx].compute_aerial_image(mask)
+        except Exception as e:
+            logger.warning(f"多工艺条件代理模型[{idx}]推理失败，回退到真实模型: {e}")
+            return None
+
+    def _multi_surrogate_compute_gradient(self, idx: int, mask: np.ndarray) -> Optional[np.ndarray]:
+        """多工艺条件下，通过指定索引的代理模型计算成像梯度
+
+        Args:
+            idx: 工艺条件索引
+            mask: 掩模图案
+
+        Returns:
+            梯度数组，若不使用代理模型返回 None
+        """
+        if not self._should_use_surrogate(for_gradient=True):
+            return None
+        if (self._surrogate_multi_models is None
+                or idx >= len(self._surrogate_multi_models)
+                or self._surrogate_multi_models[idx] is None):
+            return None
+        try:
+            return self._surrogate_multi_models[idx].compute_image_gradient(mask)
+        except Exception as e:
+            logger.warning(f"多工艺条件代理模型[{idx}]梯度失败，回退到真实模型: {e}")
+            return None
+
     def _setup_imaging_model(self, image_size: tuple):
         """设置成像模型（标量 Hopkins 模型，始终初始化以用于梯度回退）"""
         self._imaging_model = PartialCoherentImaging(
@@ -681,18 +866,19 @@ class MaskOptimizer:
 
     def _simulate_aerial(self, mask: np.ndarray, for_evaluation: bool = False):
         """
-        统一空间像仿真入口：根据配置选择 Hopkins/RCWA/FDTD 后端。
+        统一空间像仿真入口：根据配置选择 代理模型/Hopkins/RCWA/FDTD 后端。
 
-        对于需要梯度的训练阶段：
-        - 若后端为 Hopkins，直接返回 PartialCoherentImaging 的空间像；
-        - 若后端为 RCWA/FDTD，返回矢量修正后的空间像（数值上与 Hopkins 接近，
-          梯度可近似使用 _imaging_model.compute_image_gradient()）。
+        优先级：代理模型（仅训练阶段）→ RCWA/FDTD → Hopkins
         """
+        if not for_evaluation:
+            surrogate_aerial = self._surrogate_compute_aerial(mask, for_evaluation=for_evaluation)
+            if surrogate_aerial is not None:
+                return surrogate_aerial
+
         backend = self._effective_backend(for_evaluation=for_evaluation)
         if backend == SimulationBackend.HOPKINS.value:
             return self._imaging_model.compute_aerial_image(mask)
 
-        # RCWA / FDTD 路径：走 unified_simulate
         sim_res = unified_simulate(
             mask=mask,
             backend=backend,
@@ -709,9 +895,15 @@ class MaskOptimizer:
         """
         统一晶圆图仿真入口（含阈值/光刻胶模型）。
         """
+        if not for_evaluation:
+            surrogate_aerial = self._surrogate_compute_aerial(mask, for_evaluation=for_evaluation)
+            if surrogate_aerial is not None:
+                if self.config.use_wafer_image_loss:
+                    return _apply_threshold_for_loss(surrogate_aerial, self.config.threshold)
+                return surrogate_aerial
+
         backend = self._effective_backend(for_evaluation=for_evaluation)
         if backend == SimulationBackend.HOPKINS.value:
-            # 沿用 Hopkins 原生路径
             aerial = self._imaging_model.compute_aerial_image(mask)
             if self.config.use_wafer_image_loss:
                 return _apply_threshold_for_loss(aerial, self.config.threshold)
@@ -1535,36 +1727,47 @@ class MaskOptimizer:
     def _compute_composite_single_condition(self, mask: np.ndarray,
                                             imaging_model: PartialCoherentImaging,
                                             dose: float = 1.0,
-                                            for_evaluation: bool = False) -> Tuple[float, np.ndarray, CompositeLossComponents]:
+                                            for_evaluation: bool = False,
+                                            multi_idx: Optional[int] = None) -> Tuple[float, np.ndarray, CompositeLossComponents]:
         """
         计算单工艺条件下的复合损失、成像结果及各分量（不含 PVB 和正则化）
 
-        支持统一仿真后端：若配置了 RCWA/FDTD 后端，则通过 unified_simulate 计算空间像。
+        支持统一仿真后端：代理模型 → RCWA/FDTD → Hopkins
 
         Args:
             mask: 掩模
             imaging_model: 成像模型（其 optics 作为当前工艺条件的光学参数）
             dose: 曝光剂量
             for_evaluation: 是否为评估阶段（可切换到矢量后端）
+            multi_idx: 多工艺条件索引（用于选择对应代理模型）
 
         Returns:
             (loss_value, processed_image, components)
         """
-        backend = self._effective_backend(for_evaluation=for_evaluation)
-        if backend == SimulationBackend.HOPKINS.value:
-            aerial = imaging_model.compute_aerial_image(mask)
-        else:
-            sim_res = unified_simulate(
-                mask=mask,
-                backend=backend,
-                optical_system=imaging_model.optics,
-                threshold=self.config.threshold,
-                apply_resist=False,
-                pixel_size_nm=imaging_model.optics.pixel_size,
-                rcwa_config=self.config.rcwa_config,
-                fdtd_config=self.config.fdtd_config,
-            )
-            aerial = sim_res.aerial_image
+        aerial = None
+        if not for_evaluation:
+            if multi_idx is not None:
+                aerial = self._multi_surrogate_compute_aerial(multi_idx, mask, for_evaluation=for_evaluation)
+            else:
+                aerial = self._surrogate_compute_aerial(mask, for_evaluation=for_evaluation)
+
+        if aerial is None:
+            backend = self._effective_backend(for_evaluation=for_evaluation)
+            if backend == SimulationBackend.HOPKINS.value:
+                aerial = imaging_model.compute_aerial_image(mask)
+            else:
+                sim_res = unified_simulate(
+                    mask=mask,
+                    backend=backend,
+                    optical_system=imaging_model.optics,
+                    threshold=self.config.threshold,
+                    apply_resist=False,
+                    pixel_size_nm=imaging_model.optics.pixel_size,
+                    rcwa_config=self.config.rcwa_config,
+                    fdtd_config=self.config.fdtd_config,
+                )
+                aerial = sim_res.aerial_image
+
         image = self._prepare_image(aerial, dose)
         components = self._compute_image_loss_components(image, self._target_image)
         loss = components.mse + components.ssim + components.weighted_mse + components.weighted_mae
@@ -1573,45 +1776,53 @@ class MaskOptimizer:
     def _compute_single_condition_loss(self, mask: np.ndarray,
                                        imaging_model: PartialCoherentImaging,
                                        dose: float = 1.0,
-                                       for_evaluation: bool = False) -> float:
+                                       for_evaluation: bool = False,
+                                       multi_idx: Optional[int] = None) -> float:
         """
         计算单组工艺条件下的损失
 
         当 config.use_composite_loss=True 时，使用复合损失（MSE/SSIM 加权）；
         否则回退到旧的单一 metric 逻辑。
 
-        支持统一仿真后端：若配置了 RCWA/FDTD 后端，则通过 unified_simulate 计算空间像。
-
         Args:
             mask: 掩模图案
             imaging_model: 成像模型（其 optics 作为当前工艺条件的光学参数）
             dose: 曝光相对剂量
             for_evaluation: 是否为评估阶段（可切换到矢量后端）
+            multi_idx: 多工艺条件索引（用于选择对应代理模型）
 
         Returns:
             损失值
         """
         if self.config.use_composite_loss:
             loss, _, _ = self._compute_composite_single_condition(
-                mask, imaging_model, dose, for_evaluation=for_evaluation
+                mask, imaging_model, dose, for_evaluation=for_evaluation, multi_idx=multi_idx
             )
             return loss
 
-        backend = self._effective_backend(for_evaluation=for_evaluation)
-        if backend == SimulationBackend.HOPKINS.value:
-            aerial = imaging_model.compute_aerial_image(mask)
-        else:
-            sim_res = unified_simulate(
-                mask=mask,
-                backend=backend,
-                optical_system=imaging_model.optics,
-                threshold=self.config.threshold,
-                apply_resist=False,
-                pixel_size_nm=imaging_model.optics.pixel_size,
-                rcwa_config=self.config.rcwa_config,
-                fdtd_config=self.config.fdtd_config,
-            )
-            aerial = sim_res.aerial_image
+        aerial = None
+        if not for_evaluation:
+            if multi_idx is not None:
+                aerial = self._multi_surrogate_compute_aerial(multi_idx, mask, for_evaluation=for_evaluation)
+            else:
+                aerial = self._surrogate_compute_aerial(mask, for_evaluation=for_evaluation)
+
+        if aerial is None:
+            backend = self._effective_backend(for_evaluation=for_evaluation)
+            if backend == SimulationBackend.HOPKINS.value:
+                aerial = imaging_model.compute_aerial_image(mask)
+            else:
+                sim_res = unified_simulate(
+                    mask=mask,
+                    backend=backend,
+                    optical_system=imaging_model.optics,
+                    threshold=self.config.threshold,
+                    apply_resist=False,
+                    pixel_size_nm=imaging_model.optics.pixel_size,
+                    rcwa_config=self.config.rcwa_config,
+                    fdtd_config=self.config.fdtd_config,
+                )
+                aerial = sim_res.aerial_image
 
         if self.config.use_wafer_image_loss:
             if dose != 1.0:
@@ -1659,12 +1870,14 @@ class MaskOptimizer:
             per_losses = []
             total_img_loss = 0.0
 
-            for model, cond, w in zip(
+            for idx, (model, cond, w) in enumerate(zip(
                 self._multi_imaging_models,
                 self._multi_conditions,
                 self._multi_weights
-            ):
-                loss_i, img_i, _ = self._compute_composite_single_condition(mask, model, cond.dose)
+            )):
+                loss_i, img_i, _ = self._compute_composite_single_condition(
+                    mask, model, cond.dose, multi_idx=idx
+                )
                 per_images.append(img_i)
                 per_losses.append(loss_i)
                 total_img_loss += w * loss_i
@@ -1696,12 +1909,14 @@ class MaskOptimizer:
             return total_loss
 
         per_losses = []
-        for model, cond, w in zip(
+        for idx, (model, cond, w) in enumerate(zip(
             self._multi_imaging_models,
             self._multi_conditions,
             self._multi_weights
-        ):
-            loss_i = self._compute_single_condition_loss(mask, model, cond.dose)
+        )):
+            loss_i = self._compute_single_condition_loss(
+                mask, model, cond.dose, multi_idx=idx
+            )
             per_losses.append(loss_i)
 
         self._last_per_condition_losses = per_losses
@@ -1729,6 +1944,7 @@ class MaskOptimizer:
                  + λ_robust * dVar(L_i)/dmask
 
         对于包含 PVB 或使用矢量仿真后端 (RCWA/FDTD) 的情况，退化为数值梯度。
+        支持代理模型（Surrogate Model）快速计算 aerial 和 gradient。
 
         Args:
             mask: 掩模图案
@@ -1751,12 +1967,14 @@ class MaskOptimizer:
             per_images = []
             per_losses = []
 
-            for model, cond, w in zip(
+            for idx, (model, cond, w) in enumerate(zip(
                 self._multi_imaging_models,
                 self._multi_conditions,
                 self._multi_weights
-            ):
-                aerial = model.compute_aerial_image(mask)
+            )):
+                aerial = self._multi_surrogate_compute_aerial(idx, mask)
+                if aerial is None:
+                    aerial = model.compute_aerial_image(mask)
                 image = self._prepare_image(aerial, cond.dose)
                 per_images.append(image)
 
@@ -1778,7 +1996,9 @@ class MaskOptimizer:
                         image, self._target_image, self._spatial_weight_mask
                     )
 
-                imaging_grad = model.compute_image_gradient(mask)
+                imaging_grad = self._multi_surrogate_compute_gradient(idx, mask)
+                if imaging_grad is None:
+                    imaging_grad = model.compute_image_gradient(mask)
 
                 if cond.dose != 1.0:
                     error_grad = error_grad * cond.dose
@@ -1790,7 +2010,9 @@ class MaskOptimizer:
 
                 gradient += w * (error_grad * imaging_grad)
 
-                loss_i, _, _ = self._compute_composite_single_condition(mask, model, cond.dose)
+                loss_i, _, _ = self._compute_composite_single_condition(
+                    mask, model, cond.dose, multi_idx=idx
+                )
                 per_losses.append(loss_i)
 
             if lw.mask_complexity > 0:
@@ -1804,16 +2026,17 @@ class MaskOptimizer:
                 loss_arr = np.array(per_losses)
                 mean_loss = np.mean(loss_arr)
                 n = len(per_losses)
-                for model, cond, w in zip(
+                for idx, (model, cond, w) in enumerate(zip(
                     self._multi_imaging_models,
                     self._multi_conditions,
                     self._multi_weights
-                ):
-                    idx = self._multi_conditions.index(cond)
+                )):
                     factor = 2.0 * cfg.robustness_loss_weight * (per_losses[idx] - mean_loss) / (n * n)
                     if abs(factor) < 1e-12:
                         continue
-                    aerial = model.compute_aerial_image(mask)
+                    aerial = self._multi_surrogate_compute_aerial(idx, mask)
+                    if aerial is None:
+                        aerial = model.compute_aerial_image(mask)
                     image = self._prepare_image(aerial, cond.dose)
                     error_grad = np.zeros_like(image)
                     if lw.mse > 0:
@@ -1828,7 +2051,9 @@ class MaskOptimizer:
                         error_grad += lw.weighted_mae * weighted_mae_gradient(
                             image, self._target_image, self._spatial_weight_mask
                         )
-                    imaging_grad = model.compute_image_gradient(mask)
+                    imaging_grad = self._multi_surrogate_compute_gradient(idx, mask)
+                    if imaging_grad is None:
+                        imaging_grad = model.compute_image_gradient(mask)
                     if cond.dose != 1.0:
                         error_grad = error_grad * cond.dose
                     gradient += factor * (error_grad * imaging_grad)
@@ -1839,12 +2064,14 @@ class MaskOptimizer:
         gradient = np.zeros_like(mask)
         per_losses = []
 
-        for model, cond, w in zip(
+        for idx, (model, cond, w) in enumerate(zip(
             self._multi_imaging_models,
             self._multi_conditions,
             self._multi_weights
-        ):
-            aerial = model.compute_aerial_image(mask)
+        )):
+            aerial = self._multi_surrogate_compute_aerial(idx, mask)
+            if aerial is None:
+                aerial = model.compute_aerial_image(mask)
 
             if cond.dose != 1.0:
                 aerial_dosed = np.clip(aerial * cond.dose, 0.0, 1.0)
@@ -1865,7 +2092,9 @@ class MaskOptimizer:
             else:
                 return self._numerical_gradient(mask)
 
-            imaging_grad = model.compute_image_gradient(mask)
+            imaging_grad = self._multi_surrogate_compute_gradient(idx, mask)
+            if imaging_grad is None:
+                imaging_grad = model.compute_image_gradient(mask)
 
             if cond.dose != 1.0:
                 error_grad = error_grad * cond.dose
@@ -1876,23 +2105,26 @@ class MaskOptimizer:
 
             gradient += w * (error_grad * imaging_grad)
 
-            loss_i = self._compute_single_condition_loss(mask, model, cond.dose)
+            loss_i = self._compute_single_condition_loss(
+                mask, model, cond.dose, multi_idx=idx
+            )
             per_losses.append(loss_i)
 
         if self.config.robustness_loss_weight > 0 and len(per_losses) > 1:
             loss_arr = np.array(per_losses)
             mean_loss = np.mean(loss_arr)
             n = len(per_losses)
-            for model, cond, w in zip(
+            for idx, (model, cond, w) in enumerate(zip(
                 self._multi_imaging_models,
                 self._multi_conditions,
                 self._multi_weights
-            ):
-                idx = self._multi_conditions.index(cond)
+            )):
                 factor = 2.0 * self.config.robustness_loss_weight * (per_losses[idx] - mean_loss) / (n * n)
                 if abs(factor) < 1e-12:
                     continue
-                aerial = model.compute_aerial_image(mask)
+                aerial = self._multi_surrogate_compute_aerial(idx, mask)
+                if aerial is None:
+                    aerial = model.compute_aerial_image(mask)
                 if cond.dose != 1.0:
                     aerial_dosed = np.clip(aerial * cond.dose, 0.0, 1.0)
                 else:
@@ -1903,7 +2135,9 @@ class MaskOptimizer:
                     error_grad = np.sign(aerial_dosed - self._target_image) / mask.size
                 elif metric == 'ssim':
                     error_grad = ssim_loss_gradient(aerial_dosed, self._target_image)
-                imaging_grad = model.compute_image_gradient(mask)
+                imaging_grad = self._multi_surrogate_compute_gradient(idx, mask)
+                if imaging_grad is None:
+                    imaging_grad = model.compute_image_gradient(mask)
                 if cond.dose != 1.0:
                     error_grad = error_grad * cond.dose
                 gradient += factor * (error_grad * imaging_grad)
@@ -1946,7 +2180,9 @@ class MaskOptimizer:
             loss += self._compute_regularization_loss(mask)
             return loss
 
-        wafer_image = self._imaging_model.compute_aerial_image(mask)
+        wafer_image = self._surrogate_compute_aerial(mask)
+        if wafer_image is None:
+            wafer_image = self._imaging_model.compute_aerial_image(mask)
 
         if self.config.use_wafer_image_loss:
             wafer_image = _apply_threshold_for_loss(wafer_image, self.config.threshold)
@@ -1982,9 +2218,14 @@ class MaskOptimizer:
         if cfg.use_composite_loss:
             lw = cfg.loss_weights
 
-            aerial = self._imaging_model.compute_aerial_image(mask)
+            aerial = self._surrogate_compute_aerial(mask)
+            if aerial is None:
+                aerial = self._imaging_model.compute_aerial_image(mask)
             image = self._prepare_image(aerial, dose=1.0)
-            imaging_grad = self._imaging_model.compute_image_gradient(mask)
+
+            imaging_grad = self._surrogate_compute_gradient(mask)
+            if imaging_grad is None:
+                imaging_grad = self._imaging_model.compute_image_gradient(mask)
 
             error_grad = np.zeros_like(image)
 
@@ -2019,7 +2260,9 @@ class MaskOptimizer:
 
             return gradient
 
-        wafer_image = self._imaging_model.compute_aerial_image(mask)
+        wafer_image = self._surrogate_compute_aerial(mask)
+        if wafer_image is None:
+            wafer_image = self._imaging_model.compute_aerial_image(mask)
 
         if self.config.use_wafer_image_loss:
             wafer_image_for_grad = _apply_threshold_for_loss(wafer_image, self.config.threshold)
@@ -2035,7 +2278,9 @@ class MaskOptimizer:
         else:
             return self._numerical_gradient(mask)
 
-        imaging_grad = self._imaging_model.compute_image_gradient(mask)
+        imaging_grad = self._surrogate_compute_gradient(mask)
+        if imaging_grad is None:
+            imaging_grad = self._imaging_model.compute_image_gradient(mask)
 
         if self.config.use_wafer_image_loss:
             threshold_grad = (wafer_image >= self.config.threshold).astype(np.float64)
@@ -2229,6 +2474,8 @@ class MaskOptimizer:
             self._multi_imaging_models = None
             self._multi_conditions = None
             self._multi_weights = None
+
+        self._setup_surrogate_model(initial_mask.shape)
 
         if self.config.use_multi_process:
             logger.info(f"开始多工艺条件联合掩模优化，{len(self._multi_conditions)} 个工艺条件，"
