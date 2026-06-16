@@ -361,4 +361,10 @@ class TestTJunctionGenerator:
 
     def test_output_shape(self):
         params = TJunctionParams(grid_size=(64, 128))
-        mask =
+        mask = TJunctionGenerator.generate(params)
+        assert mask.shape == (64, 128)
+
+    def test_binary_values(self):
+        params = TJunctionParams(grid_size=(32, 32))
+        mask = TJunctionGenerator.generate(params)
+        assert np.all(np.logical_or(mask == 0.0, mask == 1.0))

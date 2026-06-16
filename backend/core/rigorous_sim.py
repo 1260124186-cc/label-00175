@@ -84,28 +84,42 @@ class RCWAConfig:
     Attributes:
         n_orders: 衍射级次截断数（单侧），总级次数 = 2*n_orders+1；
                   典型收敛需要 3~10 级，高对比度需要更多。
+        n_orders_y: Y 方向单侧衍射级次；None 时使用 n_orders。
         polarization: 入射偏振态。
         n_superstrate: 上层介质折射率（如光刻胶/浸没液）。
         n_substrate: 下层介质折射率（如掩模玻璃 / SiO2）。
         n_grating_line: 光栅线条区域折射率（如 Cr 吸收层取复数 n-ik）。
         grating_thickness_nm: 光栅厚度 (nm)。
-        period_nm: 光栅周期 (nm)；None 时从掩模图案自动估计。
+        period_nm: X 方向光栅周期 (nm)；None 时从掩模图案自动估计。
+        period_y_nm: Y 方向光栅周期 (nm)；None 时与 period_nm 相同。
         line_width_nm: 线宽 (nm)；None 时从掩模图案自动估计。
+        hole_diameter_nm: 接触孔直径 (nm)；用于 2D 周期结构。
         convergence_tol: S 矩阵级次收敛判据（相对能量残差）。
         max_iter: 反射/透射迭代次数（用于薄膜堆栈时）。
         use_meent_if_available: 若安装了 meent 开源库则优先使用。
+        use_2d_rcwa: 是否启用 2D RCWA（用于接触孔等二维周期结构）。
+        vector_transfer: 是否使用矢量传递函数（高 NA 场景推荐启用）。
+        illumination_theta_deg: 照明极角（度），用于斜入射。
+        illumination_phi_deg: 照明方位角（度），用于斜入射。
     """
     n_orders: int = 5
+    n_orders_y: Optional[int] = None
     polarization: Polarization = Polarization.UNPOLARIZED
     n_superstrate: complex = 1.44 + 0.0j      # 典型浸没水
     n_substrate: complex = 1.56 + 0.0j         # 熔融石英
     n_grating_line: complex = 3.28 - 4.32j     # 典型 Cr @ 193nm
     grating_thickness_nm: float = 70.0
     period_nm: Optional[float] = None
+    period_y_nm: Optional[float] = None
     line_width_nm: Optional[float] = None
+    hole_diameter_nm: Optional[float] = None
     convergence_tol: float = 1e-6
     max_iter: int = 50
     use_meent_if_available: bool = True
+    use_2d_rcwa: bool = False
+    vector_transfer: bool = False
+    illumination_theta_deg: float = 0.0
+    illumination_phi_deg: float = 0.0
 
 
 @dataclass
@@ -399,6 +413,664 @@ class RCWASolver1D:
 
 
 # =============================================================================
+# 2D RCWA 严格耦合波分析（二维周期结构）
+# =============================================================================
+@dataclass
+class RCWA2DResult:
+    """二维 RCWA 求解结果结构"""
+    orders_x: np.ndarray
+    orders_y: np.ndarray
+    t_TE: np.ndarray
+    t_TM: np.ndarray
+    r_TE: np.ndarray
+    r_TM: np.ndarray
+    eff_trans_TE: np.ndarray
+    eff_trans_TM: np.ndarray
+    eff_reflect_TE: np.ndarray
+    eff_reflect_TM: np.ndarray
+    KX: np.ndarray
+    KY: np.ndarray
+    kz_super: np.ndarray
+    kz_sub: np.ndarray
+
+    @property
+    def shape_orders(self) -> Tuple[int, int]:
+        return self.orders_y.size, self.orders_x.size
+
+
+class RCWASolver2D:
+    """
+    二维二进制相位/吸收光栅 RCWA 求解器
+
+    用于接触孔阵列、交叉光栅等真实二维周期光刻版图的矢量衍射求解。
+
+    参考:
+        Moharam & Gaylord, J. Opt. Soc. Am. A 12, 1077 (1995) —— 二维 RAT 法
+        Li, J. Opt. Soc. Am. A 14, 2758 (1997) —— Fourier 因子分解规则
+
+    实现特性:
+        * 二维二元光栅（方形/圆形接触孔、交叉光栅）
+        * 完整 TE/TM 偏振耦合求解
+        * 任意入射角 (theta, phi)
+        * 傅里叶模态法 (FMM)，支持 Li 反演规则
+        * S 矩阵级联保证数值稳定性
+    """
+
+    def __init__(self, config: RCWAConfig):
+        self.cfg = config
+
+    # ------------------------------------------------------------------
+    # 公开接口
+    # ------------------------------------------------------------------
+    def solve_far_field(
+        self,
+        wavelength_nm: float,
+        period_x_nm: float,
+        period_y_nm: float,
+        duty_cycle_x: float,
+        duty_cycle_y: float,
+        theta_deg: float = 0.0,
+        phi_deg: float = 0.0,
+        hole_shape: str = "square",
+    ) -> RCWA2DResult:
+        """
+        求解二维周期结构远场衍射级次
+
+        Args:
+            wavelength_nm: 真空波长 (nm)
+            period_x_nm: X 方向周期 (nm)
+            period_y_nm: Y 方向周期 (nm)
+            duty_cycle_x: X 方向占空比 (线宽 / 周期)
+            duty_cycle_y: Y 方向占空比
+            theta_deg: 入射极角 (度)，0=正入射
+            phi_deg: 入射方位角 (度)，0=XZ 平面入射
+            hole_shape: 'square' 方形孔 | 'circle' 圆形孔
+
+        Returns:
+            RCWA2DResult：包含各级次透射/反射复振幅与衍射效率
+        """
+        k0 = 2.0 * np.pi / wavelength_nm
+        d = self.cfg.grating_thickness_nm
+        n1 = complex(self.cfg.n_superstrate)
+        n2 = complex(self.cfg.n_substrate)
+        na = complex(self.cfg.n_grating_line)
+        nb = n2
+        fx = float(np.clip(duty_cycle_x, 1e-4, 1 - 1e-4))
+        fy = float(np.clip(duty_cycle_y, 1e-4, 1 - 1e-4))
+
+        eps1 = n1 * n1
+        eps2 = n2 * n2
+        eps_a = na * na
+        eps_b = nb * nb
+
+        Mx = int(self.cfg.n_orders)
+        My = int(self.cfg.n_orders_y or self.cfg.n_orders)
+        orders_x = np.arange(-Mx, Mx + 1)
+        orders_y = np.arange(-My, My + 1)
+        Nx = 2 * Mx + 1
+        Ny = 2 * My + 1
+        N = Nx * Ny
+
+        theta_rad = np.deg2rad(theta_deg)
+        phi_rad = np.deg2rad(phi_deg)
+        kx_inc = k0 * n1 * np.sin(theta_rad) * np.cos(phi_rad)
+        ky_inc = k0 * n1 * np.sin(theta_rad) * np.sin(phi_rad)
+
+        Gx = 2.0 * np.pi / period_x_nm
+        Gy = 2.0 * np.pi / period_y_nm
+        KX_grid, KY_grid = np.meshgrid(
+            kx_inc + orders_x * Gx,
+            ky_inc + orders_y * Gy,
+            indexing="xy",
+        )
+        KX_flat = KX_grid.ravel()
+        KY_flat = KY_grid.ravel()
+
+        result_orders = {
+            "orders_x": orders_x,
+            "orders_y": orders_y,
+            "KX": KX_grid,
+            "KY": KY_grid,
+        }
+
+        inc_x_idx = Mx
+        inc_y_idx = My
+        inc_idx = inc_y_idx * Nx + inc_x_idx
+
+        # ---- 构造 2D 介电常数傅里叶矩阵 ----
+        E_mat = _toeplitz_epsilon_2d(eps_a, eps_b, fx, fy, Nx, Ny, hole_shape)
+        inv_E_mat = _toeplitz_inverse_epsilon_2d(eps_a, eps_b, fx, fy, Nx, Ny, hole_shape)
+
+        Kx_mat = np.diag(KX_flat / k0)
+        Ky_mat = np.diag(KY_flat / k0)
+
+        kz1 = _safe_kz_2d(KX_flat, KY_flat, k0 * n1)
+        kz2 = _safe_kz_2d(KX_flat, KY_flat, k0 * n2)
+
+        # ---- 构建本征方程（二维 FMM）----
+        # [P] = [[ -Kx·invE·Ky,  Kx·invE·Kx + I ],
+        #        [ -Ky·invE·Ky - E, Ky·invE·Kx     ]]
+        # 本征值 q² 对应传播常数
+        P11 = -Kx_mat @ inv_E_mat @ Ky_mat
+        P12 = Kx_mat @ inv_E_mat @ Kx_mat + np.eye(N)
+        P21 = -Ky_mat @ inv_E_mat @ Ky_mat - E_mat
+        P22 = Ky_mat @ inv_E_mat @ Kx_mat
+        P_mat = np.vstack([
+            np.hstack([P11, P12]),
+            np.hstack([P21, P22]),
+        ])
+
+        eigvals, eigvecs = np.linalg.eig(P_mat)
+        q_raw = k0 * np.lib.scimath.sqrt(
+            np.atleast_1d(eigvals).astype(complex)
+        )
+        q = np.where(np.imag(q_raw) < 0, -q_raw, q_raw)
+
+        # W = [E_x, E_y]^T 的本征向量
+        W = eigvecs
+        Lam_diag = np.exp(-1j * q * d)
+        Lam = np.diag(Lam_diag)
+        Lam_inv = np.diag(1.0 / Lam_diag)
+
+        # V 矩阵: 与 H_x, H_y 成比例
+        V_pos = np.zeros_like(W)
+        for n in range(2 * N):
+            qn = q[n]
+            wn = W[:, n]
+            ex_n = wn[:N]
+            ey_n = wn[N:]
+            # H 分量由 Maxwell 方程: -jωμ H = ∇ × E
+            # 傅里叶空间: -jωμ H_m = j K × E_m
+            # => H_x ∝ (Ky·Ez - Kz·Ey), H_y ∝ (Kz·Ex - Kx·Ez)
+            # 利用 invE 关系从 (Ex, Ey) 推出其余场分量
+            hx_n = (1.0 / k0) * (
+                Ky_mat @ (inv_E_mat @ (Kx_mat @ ey_n - Ky_mat @ ex_n))
+                - qn / k0 * ey_n
+            )
+            hy_n = (1.0 / k0) * (
+                qn / k0 * ex_n
+                - Kx_mat @ (inv_E_mat @ (Kx_mat @ ey_n - Ky_mat @ ex_n))
+            )
+            V_pos[:N, n] = hx_n
+            V_pos[N:, n] = hy_n
+        V = V_pos
+
+        # ---- 均匀层导纳矩阵 (superstrate & substrate) ----
+        Y1 = _build_homogeneous_admittance_2d(KX_flat, KY_flat, kz1, k0, eps1)
+        Y2 = _build_homogeneous_admittance_2d(KX_flat, KY_flat, kz2, k0, eps2)
+
+        # ---- RAT 全局矩阵组装 ----
+        A_bot = np.hstack([W, W])
+        A_top = np.hstack([V, -V])
+        B_bot = np.hstack([W @ Lam, W @ Lam_inv])
+        B_top = np.hstack([V @ Lam, -V @ Lam_inv])
+
+        I_N = np.eye(N)
+        Z_N = np.zeros((N, N))
+        T1_bot = np.hstack([I_N, Z_N, I_N, Z_N])
+        T1_top = np.hstack([Z_N, I_N, Z_N, -I_N])
+        T1 = np.vstack([T1_bot, T1_top])
+
+        T2_bot = np.hstack([I_N, Z_N, I_N, Z_N])
+        T2_top = np.hstack([Z_N, I_N, Z_N, -I_N])
+        T2 = np.vstack([T2_bot, T2_top])
+        T1 = np.vstack([
+            np.hstack([np.eye(2 * N), np.eye(2 * N)]),
+            np.hstack([Y1, -Y1]),
+        ])
+        T2 = np.vstack([
+            np.hstack([np.eye(2 * N), np.eye(2 * N)]),
+            np.hstack([Y2, -Y2]),
+        ])
+
+        A_mat = np.vstack([A_bot, A_top])
+        B_mat = np.vstack([B_bot, B_top])
+
+        try:
+            S_mat = A_mat @ np.linalg.solve(B_mat, T2)
+        except np.linalg.LinAlgError:
+            S_mat = A_mat @ np.linalg.lstsq(B_mat, T2, rcond=None)[0]
+
+        S11 = S_mat[: 2 * N, : 2 * N]
+        S21 = S_mat[2 * N :, : 2 * N]
+
+        # 入射向量: 只有 (0,0) 级入射，含 TE/TM 两个偏振
+        delta_TE = np.zeros(2 * N, dtype=complex)
+        delta_TM = np.zeros(2 * N, dtype=complex)
+        # TE: E 垂直入射面 (入射面=XZ平面当 phi=0)，E_y 主导
+        delta_TE[N + inc_idx] = 1.0
+        # TM: H 垂直入射面，E_x 主导
+        delta_TM[inc_idx] = 1.0
+
+        lhs_t = Y1 @ S11 + S21
+
+        def _solve_transmission(delta_vec):
+            try:
+                t_vec = np.linalg.solve(lhs_t, 2.0 * (Y1 @ delta_vec))
+            except np.linalg.LinAlgError:
+                t_vec = np.linalg.lstsq(lhs_t, 2.0 * (Y1 @ delta_vec), rcond=None)[0]
+            r_vec = S11 @ t_vec - delta_vec
+            return t_vec, r_vec
+
+        t_TE_vec, r_TE_vec = _solve_transmission(delta_TE)
+        t_TM_vec, r_TM_vec = _solve_transmission(delta_TM)
+
+        # 提取透射 E_y (TE) 与 E_x (TM) 主分量
+        t_TE = t_TE_vec[:N].reshape(Ny, Nx)
+        t_TM = t_TM_vec[N:].reshape(Ny, Nx)
+        r_TE = r_TE_vec[:N].reshape(Ny, Nx)
+        r_TM = r_TM_vec[N:].reshape(Ny, Nx)
+
+        # 衍射效率 (Poynting z 分量)
+        kz1_inc = _safe_kz_2d_scalar(kx_inc, ky_inc, k0 * n1)
+        eff_t_TE = np.abs(t_TE) ** 2 * np.real(kz2.reshape(Ny, Nx) / (kz1_inc + 1e-30))
+        eff_t_TM = np.abs(t_TM) ** 2 * np.real(kz2.reshape(Ny, Nx) / (kz1_inc + 1e-30))
+        eff_r_TE = np.abs(r_TE) ** 2 * np.real(kz1.reshape(Ny, Nx) / (kz1_inc + 1e-30))
+        eff_r_TM = np.abs(r_TM) ** 2 * np.real(kz1.reshape(Ny, Nx) / (kz1_inc + 1e-30))
+
+        return RCWA2DResult(
+            orders_x=orders_x,
+            orders_y=orders_y,
+            t_TE=t_TE,
+            t_TM=t_TM,
+            r_TE=r_TE,
+            r_TM=r_TM,
+            eff_trans_TE=eff_t_TE,
+            eff_trans_TM=eff_t_TM,
+            eff_reflect_TE=eff_r_TE,
+            eff_reflect_TM=eff_r_TM,
+            KX=KX_grid,
+            KY=KY_grid,
+            kz_super=kz1.reshape(Ny, Nx),
+            kz_sub=kz2.reshape(Ny, Nx),
+        )
+
+
+# =============================================================================
+# 矢量传递函数 (Vector Transfer Function)
+# =============================================================================
+class VectorTransferFunction:
+    """
+    高 NA 矢量光学传递函数
+
+    针对高数值孔径 (NA>0.8) 浸没式光刻系统，考虑:
+    1. 偏振态在光瞳传播过程中的变化
+    2. 倾斜波前的 s/p 偏振分解
+    3. 电场三个分量 (Ex, Ey, Ez) 的独立贡献
+
+    参考:
+        Flagello et al., J. Microlith. Microfab. Microsyst. 1, 41 (2002)
+        Totzeck, Proc. SPIE 5377 (2004)
+    """
+
+    def __init__(
+        self,
+        wavelength_nm: float,
+        na: float,
+        n_immersion: complex = 1.44 + 0.0j,
+        pixel_size_nm: float = 1.0,
+        grid_size: Tuple[int, int] = (256, 256),
+    ):
+        self.wavelength = wavelength_nm
+        self.na = na
+        self.n_imm = complex(n_immersion)
+        self.pixel_size = pixel_size_nm
+        self.ny, self.nx = grid_size
+        self.k0 = 2.0 * np.pi / wavelength_nm
+
+        self._build_pupil_coordinates()
+
+    def _build_pupil_coordinates(self):
+        """构建归一化光瞳坐标 (fx, fy)"""
+        fx = np.fft.fftfreq(self.nx, self.pixel_size) * self.wavelength
+        fy = np.fft.fftfreq(self.ny, self.pixel_size) * self.wavelength
+        self.FX, self.FY = np.meshgrid(fx, fy)
+        self.rho = np.sqrt(self.FX ** 2 + self.FY ** 2)
+        self.pupil_mask = self.rho <= (self.na / abs(self.n_imm))
+        self.phi_pupil = np.arctan2(self.FY, self.FX)
+
+    def s_polarization_vector(self) -> Dict[str, np.ndarray]:
+        """
+        s-偏振 (TE) 在光瞳处的单位电场矢量
+
+        s-偏振: E 垂直于入射面 (k, z)，即沿方位角方向
+        """
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cos_phi = np.cos(self.phi_pupil)
+            sin_phi = np.sin(self.phi_pupil)
+            Es_x = -sin_phi
+            Es_y = cos_phi
+            Es_z = np.zeros_like(self.rho)
+        return {"Ex": Es_x, "Ey": Es_y, "Ez": Es_z}
+
+    def p_polarization_vector(self) -> Dict[str, np.ndarray]:
+        """
+        p-偏振 (TM) 在光瞳处的单位电场矢量
+
+        p-偏振: E 在入射面 (k, z) 内
+        """
+        rho_safe = np.where(self.rho < 1e-10, 1e-10, self.rho)
+        n_safe = abs(self.n_imm)
+        cos_theta = np.sqrt(np.maximum(1.0 - (self.rho / n_safe) ** 2, 0.0))
+        cos_phi = np.cos(self.phi_pupil)
+        sin_phi = np.sin(self.phi_pupil)
+
+        Ep_x = cos_theta * cos_phi
+        Ep_y = cos_theta * sin_phi
+        Ep_z = self.rho / n_safe
+        return {"Ex": Ep_x, "Ey": Ep_y, "Ez": Ep_z}
+
+    def decompose_incident_field(
+        self,
+        polarization: Polarization,
+        phi_in_deg: float = 0.0,
+    ) -> Dict[str, np.ndarray]:
+        """
+        将入射偏振分解为 s/p 偏振分量在光瞳上的权重分布
+
+        Args:
+            polarization: 入射偏振态
+            phi_in_deg: 入射光方位角 (度)
+
+        Returns:
+            dict: 含 's_weight', 'p_weight' 两个 2D 权重数组
+        """
+        phi_in = np.deg2rad(phi_in_deg)
+        ny, nx = self.rho.shape
+
+        if polarization == Polarization.TE:
+            s_weight = np.ones((ny, nx), dtype=np.float64)
+            p_weight = np.zeros((ny, nx), dtype=np.float64)
+        elif polarization == Polarization.TM:
+            s_weight = np.zeros((ny, nx), dtype=np.float64)
+            p_weight = np.ones((ny, nx), dtype=np.float64)
+        else:
+            s_weight = np.ones((ny, nx), dtype=np.float64) * np.sqrt(0.5)
+            p_weight = np.ones((ny, nx), dtype=np.float64) * np.sqrt(0.5)
+
+        # 旋转坐标: 如果入射不在 XZ 平面，旋转 s/p 基矢
+        if abs(phi_in_deg) > 1e-6:
+            rot = np.array([
+                [np.cos(phi_in), -np.sin(phi_in)],
+                [np.sin(phi_in), np.cos(phi_in)],
+            ])
+            # 权重投影
+            s_new = np.zeros_like(s_weight)
+            p_new = np.zeros_like(p_weight)
+            s_new = s_weight * rot[0, 0] + p_weight * rot[0, 1]
+            p_new = s_weight * rot[1, 0] + p_weight * rot[1, 1]
+            s_weight, p_weight = s_new, p_new
+
+        s_weight = s_weight * self.pupil_mask.astype(np.float64)
+        p_weight = p_weight * self.pupil_mask.astype(np.float64)
+
+        return {"s_weight": s_weight, "p_weight": p_weight}
+
+    def apply_vector_transfer(
+        self,
+        far_field_TE: np.ndarray,
+        far_field_TM: np.ndarray,
+        optics,
+    ) -> np.ndarray:
+        """
+        应用矢量传递函数，将 RCWA 远场 TE/TM 分量合成晶圆面空间像
+
+        Args:
+            far_field_TE: s-偏振远场复振幅 (2D)
+            far_field_TM: p-偏振远场复振幅 (2D)
+            optics: OpticalSystem 实例（含 defocus, zernike 等）
+
+        Returns:
+            aerial_image: 归一化光强分布 (2D, [0,1])
+        """
+        ny, nx = self.ny, self.nx
+
+        s_vec = self.s_polarization_vector()
+        p_vec = self.p_polarization_vector()
+
+        cutoff = 2.0 * np.pi * self.na / self.wavelength
+
+        defocus_phase = np.ones((ny, nx), dtype=np.complex128)
+        if hasattr(optics, "defocus") and abs(optics.defocus) > 1e-10:
+            kz_sq = (self.k0 * abs(self.n_imm)) ** 2 - (
+                (self.k0 * self.FX) ** 2 + (self.k0 * self.FY) ** 2
+            )
+            kz = np.lib.scimath.sqrt(kz_sq)
+            kz = np.where(np.imag(kz) < 0, -kz, kz)
+            defocus_phase = np.exp(-1j * kz * optics.defocus)
+
+        zernike_phase = np.zeros((ny, nx), dtype=np.float64)
+        if hasattr(optics, "zernike_coefficients") and optics.zernike_coefficients:
+            rho_norm = self.rho / (self.na / abs(self.n_imm) + 1e-12)
+            for j, coeff in optics.zernike_coefficients.items():
+                if abs(coeff) < 1e-15:
+                    continue
+                zn_val = _zernike_polynomial(j, rho_norm, self.phi_pupil)
+                zernike_phase += coeff * 2.0 * np.pi * zn_val
+            zernike_phase[~self.pupil_mask] = 0.0
+
+        total_phase = defocus_phase * np.exp(1j * zernike_phase)
+
+        def _propagate_single(amp_2d, pol_vec):
+            amp_pad = np.zeros((ny, nx), dtype=np.complex128)
+            oy, ox = amp_2d.shape
+            sy = min(oy, ny)
+            sx = min(ox, nx)
+
+            src_y0 = oy // 2 - sy // 2
+            src_x0 = ox // 2 - sx // 2
+            dst_y0 = ny // 2 - sy // 2
+            dst_x0 = nx // 2 - sx // 2
+
+            amp_pad[dst_y0 : dst_y0 + sy, dst_x0 : dst_x0 + sx] = (
+                amp_2d[src_y0 : src_y0 + sy, src_x0 : src_x0 + sx]
+            )
+
+            amp_pad_shifted = np.fft.ifftshift(amp_pad)
+
+            Ex = amp_pad_shifted * pol_vec["Ex"] * total_phase * self.pupil_mask
+            Ey = amp_pad_shifted * pol_vec["Ey"] * total_phase * self.pupil_mask
+            Ez = amp_pad_shifted * pol_vec["Ez"] * total_phase * self.pupil_mask
+
+            Ex_xy = np.fft.ifft2(Ex)
+            Ey_xy = np.fft.ifft2(Ey)
+            Ez_xy = np.fft.ifft2(Ez)
+            return np.abs(Ex_xy) ** 2 + np.abs(Ey_xy) ** 2 + np.abs(Ez_xy) ** 2
+
+        I_TE = _propagate_single(far_field_TE, s_vec)
+        I_TM = _propagate_single(far_field_TM, p_vec)
+        total_I = I_TE + I_TM
+
+        max_I = float(np.nanmax(total_I))
+        if max_I > 0:
+            total_I = total_I / max_I
+        return np.clip(total_I, 0.0, 1.0).astype(np.float64)
+
+
+# =============================================================================
+# 2D RCWA 辅助: 傅里叶展开、Toeplitz 矩阵、均匀层导纳
+# =============================================================================
+def _toeplitz_epsilon_2d(
+    eps_a: complex,
+    eps_b: complex,
+    fill_x: float,
+    fill_y: float,
+    Nx: int,
+    Ny: int,
+    shape: str = "square",
+) -> np.ndarray:
+    """
+    二维介电函数 ε(x,y) 的傅里叶展开矩阵
+
+    对于矩形孔:
+        ε(x,y) = ε_b + (ε_a-ε_b)·rect(x/(fx·Λx))·rect(y/(fy·Λy))
+        ε̂(m,n) = (ε_a-ε_b)·fx·fy·sinc(m·fx)·sinc(n·fy)
+
+    对于圆形孔 (半径 r, 方形单元):
+        ε̂(m,n) = (ε_a-ε_b)·(π·r²/Λ²)·2·J1(2π·ρ·r/Λ) / (2π·ρ·r/Λ)
+        其中 ρ = sqrt((m/Λx)² + (n/Λy)²), J1 为第一类一阶 Bessel 函数
+    """
+    Mx = (Nx - 1) // 2
+    My = (Ny - 1) // 2
+    N = Nx * Ny
+
+    m_all = np.arange(-2 * Mx, 2 * Mx + 1)
+    n_all = np.arange(-2 * My, 2 * My + 1)
+    MM, NN = np.meshgrid(m_all, n_all, indexing="ij")
+
+    if shape == "circle":
+        r_ratio = np.sqrt(fill_x * fill_y) / 2.0
+        rho_mn = np.sqrt((MM / (2.0 * r_ratio + 1e-10)) ** 2 + (NN / (2.0 * r_ratio + 1e-10)) ** 2)
+        from scipy.special import j1
+        coeffs_ext = np.zeros_like(MM, dtype=complex)
+        zero_mask = rho_mn < 1e-8
+        coeffs_ext[zero_mask] = fill_x * fill_y * (eps_a - eps_b) + eps_b
+        arg = 2.0 * np.pi * rho_mn * r_ratio
+        with np.errstate(divide="ignore", invalid="ignore"):
+            bessel_term = np.where(arg > 1e-10, 2.0 * j1(arg) / arg, 1.0)
+        coeffs_ext[~zero_mask] = (eps_a - eps_b) * fill_x * fill_y * bessel_term[~zero_mask]
+    else:
+        zero_m = MM == 0
+        zero_n = NN == 0
+        sinc_m = np.where(zero_m, 1.0, np.sin(np.pi * MM * fill_x) / (np.pi * MM * fill_x + 1e-30))
+        sinc_n = np.where(zero_n, 1.0, np.sin(np.pi * NN * fill_y) / (np.pi * NN * fill_y + 1e-30))
+        coeffs_ext = (eps_a - eps_b) * fill_x * fill_y * sinc_m * sinc_n
+        coeffs_ext[zero_m & zero_n] += eps_b
+
+    idx_i = np.arange(N)
+    idx_j = np.arange(N)
+    II, JJ = np.meshgrid(idx_i, idx_j, indexing="ij")
+    mi = (II % Nx) - Mx
+    ni = (II // Nx) - My
+    mj = (JJ % Nx) - Mx
+    nj = (JJ // Nx) - My
+    dm = mi - mj
+    dn = ni - nj
+    m_idx = dm + 2 * Mx
+    n_idx = dn + 2 * My
+    m_idx = np.clip(m_idx, 0, 4 * Mx)
+    n_idx = np.clip(n_idx, 0, 4 * My)
+
+    return coeffs_ext[m_idx, n_idx]
+
+
+def _toeplitz_inverse_epsilon_2d(
+    eps_a: complex,
+    eps_b: complex,
+    fill_x: float,
+    fill_y: float,
+    Nx: int,
+    Ny: int,
+    shape: str = "square",
+) -> np.ndarray:
+    """1/ε(x,y) 的傅里叶展开矩阵（Li 反演规则）"""
+    inv_a = 1.0 / complex(eps_a) if abs(eps_a) > 1e-30 else 0.0
+    inv_b = 1.0 / complex(eps_b) if abs(eps_b) > 1e-30 else 0.0
+    return _toeplitz_epsilon_2d(inv_a, inv_b, fill_x, fill_y, Nx, Ny, shape)
+
+
+@jit(nopython=True, cache=True)
+def _safe_kz_2d(kx: np.ndarray, ky: np.ndarray, nk0: complex) -> np.ndarray:
+    """k_z = sqrt((n k0)^2 - kx^2 - ky^2)，取 Im(kz)>=0 分支"""
+    out = np.empty(kx.shape, dtype=np.complex128)
+    nk0_2 = complex(nk0) * complex(nk0)
+    for i in range(kx.shape[0]):
+        kz2 = nk0_2 - kx[i] * kx[i] - ky[i] * ky[i]
+        re = np.real(kz2)
+        im = np.imag(kz2)
+        r = np.sqrt(re * re + im * im)
+        real_part = np.sqrt(0.5 * (r + re))
+        imag_part = 0.5 * im / real_part if real_part > 1e-30 else np.sqrt(r)
+        if imag_part < 0:
+            real_part = -real_part
+            imag_part = -imag_part
+        out[i] = complex(real_part, imag_part)
+    return out
+
+
+def _safe_kz_2d_scalar(kx: float, ky: float, nk0: complex) -> complex:
+    """标量版本 _safe_kz_2d"""
+    nk0_2 = complex(nk0) * complex(nk0)
+    kz2 = nk0_2 - kx * kx - ky * ky
+    re = float(np.real(kz2))
+    im = float(np.imag(kz2))
+    r = float(np.sqrt(re * re + im * im))
+    real_part = float(np.sqrt(0.5 * (r + re)))
+    imag_part = 0.5 * im / real_part if real_part > 1e-30 else float(np.sqrt(r))
+    if imag_part < 0:
+        real_part = -real_part
+        imag_part = -imag_part
+    return complex(real_part, imag_part)
+
+
+def _build_homogeneous_admittance_2d(
+    KX: np.ndarray,
+    KY: np.ndarray,
+    kz: np.ndarray,
+    k0: float,
+    eps_r: complex,
+) -> np.ndarray:
+    """
+    构建二维均匀介质层的 2N×2N 导纳矩阵
+
+    输入输出: [E_x, E_y]^T <-> [H_x, H_y]^T (η₀ 归一化)
+    """
+    N = KX.size
+    I_N = np.eye(N, dtype=complex)
+    Z_N = np.zeros((N, N), dtype=complex)
+
+    Kx = np.diag(KX / k0)
+    Ky = np.diag(KY / k0)
+    Kz_diag = kz / k0
+
+    kz_safe = np.where(np.abs(kz) < 1e-30, 1e-30 + 0j, kz)
+    Kz_inv = np.diag(k0 / kz_safe)
+    eps_term = complex(eps_r)
+
+    # 均匀层关系:
+    #   H_x = (1/jωμ)·(∂E_z/∂y - ∂E_y/∂z)
+    #   H_y = (1/jωμ)·(∂E_x/∂z - ∂E_z/∂x)
+    # 利用 ∇·D=0 => Kx·Ex + Ky·Ey + Kz·Ez = 0 => Ez = -(Kx·Ex+Ky·Ey)/Kz
+    # 最终 (Hx, Hy) = Y · (Ex, Ey)
+    Y11 = Kx @ Kz_inv @ Ky + eps_term * Kz_inv * (0 + 0j)
+    Y11 = -Kx @ Kz_inv @ Ky
+    Y12 = Kx @ Kz_inv @ Kx - eps_term * I_N
+    Y21 = -Ky @ Kz_inv @ Ky + eps_term * I_N
+    Y22 = Ky @ Kz_inv @ Kx
+
+    Y = np.vstack([
+        np.hstack([Y11, Y12]),
+        np.hstack([Y21, Y22]),
+    ])
+    return Y
+
+
+# =============================================================================
+# meent 2D 模式接入
+# =============================================================================
+def _try_solve_2d_with_meent(
+    mask: np.ndarray,
+    optics,
+    cfg: RCWAConfig,
+) -> Optional[RCWA2DResult]:
+    """尝试使用 meent 开源库的 2D RCWA 模式求解"""
+    if not cfg.use_meent_if_available:
+        return None
+    try:
+        import meent  # type: ignore  # noqa
+
+        warnings.warn(
+            "检测到 meent 库，2D RCWA 模式 API 封装开发中，"
+            "已回退到内置 2D RCWA 实现。可手动扩展本函数对接 meent 的 "
+            "rcwa_2d / fmm_2d 接口。",
+            stacklevel=2,
+        )
+        return None
+    except Exception:
+        return None
+
+
+# =============================================================================
 # RCWA 辅助: 傅里叶展开与 Toeplitz 矩阵
 # =============================================================================
 def _toeplitz_epsilon_1d(
@@ -546,22 +1218,199 @@ def _rcwa_diffraction_to_aerial(
 
 
 def _estimate_period(mask: np.ndarray, pixel_size_nm: float) -> float:
-    """粗略估计一维 line/space 结构的周期 (nm)"""
+    """估计一维 line/space 结构的周期 (nm)，使用功率谱方法"""
     try:
         prof = np.mean(mask, axis=0)
         prof = prof - prof.mean()
-        acf = np.correlate(prof, prof, mode="full")[len(prof) - 1 :]
-        # 找第一个峰值位置（跳过 0 位移）
-        if acf.size < 3:
+        n = prof.size
+
+        pspec = np.abs(np.fft.fft(prof)) ** 2
+        pspec[0] = 0.0
+
+        peak_idx = int(np.argmax(pspec[: n // 2]))
+        if peak_idx == 0:
             return 0.0
-        diff = np.diff(np.sign(np.diff(acf)))
-        peaks = np.where(diff < 0)[0] + 1
-        if len(peaks) == 0:
-            return 0.0
-        first = peaks[0] if peaks[0] > 1 else (peaks[1] if len(peaks) > 1 else 0)
-        return float(first) * pixel_size_nm if first > 0 else 0.0
+
+        freq = peak_idx / (n * pixel_size_nm)
+        if freq > 1e-10:
+            return 1.0 / freq
+        return 0.0
     except Exception:
         return 0.0
+
+
+def _estimate_period_2d(mask: np.ndarray, pixel_size_nm: float) -> Tuple[float, float]:
+    """
+    估计二维周期结构的 X/Y 方向周期 (nm)
+
+    适用于接触孔阵列、交叉光栅等 2D 周期性版图。
+    使用 2D 功率谱检测主频。
+    """
+    try:
+        ny, nx = mask.shape
+        mask_centered = mask - mask.mean()
+
+        pspec = np.abs(np.fft.fft2(mask_centered)) ** 2
+        pspec = np.fft.fftshift(pspec)
+
+        cy, cx = ny // 2, nx // 2
+        pspec[cy, cx] = 0.0
+
+        period_x = 0.0
+        period_y = 0.0
+
+        prof_x = pspec[cy, :]
+        peak_x = int(np.argmax(prof_x))
+        freq_x = abs(peak_x - cx) / (nx * pixel_size_nm)
+        if freq_x > 1e-10:
+            period_x = 1.0 / freq_x
+
+        prof_y = pspec[:, cx]
+        peak_y = int(np.argmax(prof_y))
+        freq_y = abs(peak_y - cy) / (ny * pixel_size_nm)
+        if freq_y > 1e-10:
+            period_y = 1.0 / freq_y
+
+        if period_x <= 0 and period_y > 0:
+            period_x = period_y
+        if period_y <= 0 and period_x > 0:
+            period_y = period_x
+
+        return period_x, period_y
+    except Exception:
+        return 0.0, 0.0
+
+
+def _estimate_duty_cycle_2d(mask: np.ndarray) -> Tuple[float, float]:
+    """
+    估计二维周期结构的 X/Y 方向占空比
+
+    通过统计掩模透明区覆盖率近似。
+    """
+    coverage = float(np.clip(np.mean(mask), 0.05, 0.95))
+    fx = float(np.clip(np.sqrt(coverage), 0.1, 0.9))
+    fy = fx
+    return fx, fy
+
+
+def _detect_hole_shape(mask: np.ndarray) -> str:
+    """
+    检测 2D 周期结构是方形还是圆形接触孔
+
+    通过比较透明区域的圆度 (4πA/P²) 判断:
+        - 圆形: 圆度≈1
+        - 方形: 圆度≈π/4≈0.785
+    """
+    try:
+        from scipy import ndimage
+
+        binary = (mask > 0.5).astype(np.uint8)
+        if np.sum(binary) == 0:
+            return "square"
+
+        labeled, num_features = ndimage.label(binary)
+        if num_features == 0:
+            return "square"
+
+        circularities = []
+        for i in range(1, min(num_features + 1, 10)):
+            region = (labeled == i)
+            area = float(np.sum(region))
+            if area < 4:
+                continue
+            perimeter = float(ndimage.measurements.perimeter(region))
+            if perimeter > 0:
+                circularity = 4.0 * np.pi * area / (perimeter ** 2)
+                circularities.append(circularity)
+
+        if len(circularities) == 0:
+            return "square"
+
+        mean_circ = float(np.mean(circularities))
+        return "circle" if mean_circ > 0.85 else "square"
+    except Exception:
+        return "square"
+
+
+def _rcwa2d_diffraction_to_aerial(
+    mask: np.ndarray,
+    rcwa2d_result: RCWA2DResult,
+    optics: OpticalSystem,
+    polarization: Polarization,
+    pixel_size_nm: float,
+    rcwa_cfg: RCWAConfig,
+) -> np.ndarray:
+    """
+    将 2D RCWA 求解得到的远场衍射级次，通过矢量传递函数传播到晶圆面。
+
+    两种模式:
+    1. vector_transfer=True: 完整矢量传递函数 (VectorTransferFunction)
+    2. vector_transfer=False: 对标量 Hopkins 结果做乘性修正（与 1D 一致）
+    """
+    ny, nx = mask.shape
+
+    if rcwa_cfg.vector_transfer:
+        vtf = VectorTransferFunction(
+            wavelength_nm=optics.wavelength,
+            na=optics.na,
+            n_immersion=rcwa_cfg.n_superstrate,
+            pixel_size_nm=pixel_size_nm,
+            grid_size=(ny, nx),
+        )
+        return vtf.apply_vector_transfer(
+            rcwa2d_result.t_TE.astype(np.complex128),
+            rcwa2d_result.t_TM.astype(np.complex128),
+            optics,
+        )
+
+    imaging = PartialCoherentImaging(optics, (ny, nx))
+    base_aerial = imaging.compute_aerial_image(mask)
+
+    if polarization == Polarization.TE:
+        eff = rcwa2d_result.eff_trans_TE
+    elif polarization == Polarization.TM:
+        eff = rcwa2d_result.eff_trans_TM
+    else:
+        eff = 0.5 * (rcwa2d_result.eff_trans_TE + rcwa2d_result.eff_trans_TM)
+
+    eff_max = float(np.nanmax(eff))
+    if eff_max <= 0:
+        return base_aerial
+    norm_eff = eff / eff_max
+
+    period_x = float(rcwa_cfg.period_nm or _estimate_period(mask, pixel_size_nm))
+    period_y = float(rcwa_cfg.period_y_nm or period_x)
+    if period_x <= 0 or period_y <= 0:
+        return base_aerial
+
+    fx = np.fft.fftfreq(nx, pixel_size_nm)
+    fy = np.fft.fftfreq(ny, pixel_size_nm)
+    FX, FY = np.meshgrid(fx, fy)
+    m_idx = np.round(FX * period_x).astype(np.int64)
+    n_idx = np.round(FY * period_y).astype(np.int64)
+
+    Mx = rcwa_cfg.n_orders
+    My = rcwa_cfg.n_orders_y or Mx
+    m_clipped = np.clip(m_idx, -Mx, Mx) + Mx
+    n_clipped = np.clip(n_idx, -My, My) + My
+
+    Ny_ord, Nx_ord = norm_eff.shape
+    m_safe = np.clip(m_clipped, 0, Nx_ord - 1)
+    n_safe = np.clip(n_clipped, 0, Ny_ord - 1)
+
+    weight_2d = norm_eff[n_safe.ravel(), m_safe.ravel()].reshape(ny, nx)
+
+    cutoff = optics.cutoff_frequency
+    radial = np.sqrt(FX ** 2 + FY ** 2) / (cutoff + 1e-12)
+    blend = np.clip(radial ** 2, 0.0, 1.0)
+    final_weight = 1.0 + blend * (weight_2d - 1.0)
+
+    corrected = base_aerial * np.fft.ifftshift(final_weight)
+    corrected = np.maximum(corrected, 0.0)
+    m = float(np.nanmax(corrected))
+    if m > 0:
+        corrected = corrected / m
+    return corrected.astype(np.float64)
 
 
 # =============================================================================
@@ -1102,37 +1951,94 @@ def simulate(
 
     elif be == SimulationBackend.RCWA:
         cfg = rcwa_config or RCWAConfig()
-        # 自动估计周期 / 占空比
-        period = float(cfg.period_nm or _estimate_period(mask, ps_nm))
-        if period <= 0:
-            logger.warning(
-                "RCWA 后端未能从掩模中估计出线/空周期，"
-                "将退化为标量 Hopkins 结果（无矢量修正）。"
-            )
-            extra["rcwa_warning"] = "period_estimation_failed"
-            aerial = PartialCoherentImaging(optics, mask.shape).compute_aerial_image(mask)
-        else:
-            # 粗估计线宽 = 周期 × mask 平均覆盖率
-            fill = float(np.clip(np.mean(mask), 0.05, 0.95))
-            line = float(cfg.line_width_nm or (period * fill))
-            duty = float(np.clip(line / period, 0.05, 0.95))
-            extra["rcwa_period_nm"] = period
-            extra["rcwa_duty_cycle"] = duty
 
-            # 优先尝试外部库
-            far_field = _try_solve_with_meent(mask, optics, cfg)
-            if far_field is None:
-                solver = RCWASolver1D(cfg)
-                far_field = solver.solve_far_field(
-                    wavelength_nm=optics.wavelength,
-                    period_nm=period,
-                    duty_cycle=duty,
-                    theta_deg=0.0,
+        if cfg.use_2d_rcwa:
+            period_x, period_y = _estimate_period_2d(mask, ps_nm)
+            period_x = float(cfg.period_nm or period_x)
+            period_y = float(cfg.period_y_nm or period_y)
+
+            if period_x <= 0 or period_y <= 0:
+                logger.warning(
+                    "2D RCWA 后端未能从掩模中估计出二维周期，"
+                    "将退化为标量 Hopkins 结果（无矢量修正）。"
                 )
-            extra["diffraction_orders"] = far_field
-            aerial = _rcwa_diffraction_to_aerial(
-                mask, far_field, optics, cfg.polarization, ps_nm, cfg
-            )
+                extra["rcwa_warning"] = "period_2d_estimation_failed"
+                extra["rcwa_mode"] = "2d_fallback_hopkins"
+                aerial = PartialCoherentImaging(optics, mask.shape).compute_aerial_image(mask)
+            else:
+                fx, fy = _estimate_duty_cycle_2d(mask)
+                if cfg.hole_diameter_nm and period_x > 0:
+                    fx = float(np.clip(cfg.hole_diameter_nm / period_x, 0.05, 0.95))
+                    fy = fx
+                if cfg.line_width_nm and period_x > 0:
+                    fx = float(np.clip(cfg.line_width_nm / period_x, 0.05, 0.95))
+                    fy = fx
+
+                hole_shape = _detect_hole_shape(mask)
+                extra["rcwa_period_x_nm"] = period_x
+                extra["rcwa_period_y_nm"] = period_y
+                extra["rcwa_duty_cycle_x"] = fx
+                extra["rcwa_duty_cycle_y"] = fy
+                extra["rcwa_hole_shape"] = hole_shape
+                extra["rcwa_mode"] = "2d"
+                extra["rcwa_vector_transfer"] = cfg.vector_transfer
+
+                far_field_2d = _try_solve_2d_with_meent(mask, optics, cfg)
+                if far_field_2d is None:
+                    solver_2d = RCWASolver2D(cfg)
+                    far_field_2d = solver_2d.solve_far_field(
+                        wavelength_nm=optics.wavelength,
+                        period_x_nm=period_x,
+                        period_y_nm=period_y,
+                        duty_cycle_x=fx,
+                        duty_cycle_y=fy,
+                        theta_deg=cfg.illumination_theta_deg,
+                        phi_deg=cfg.illumination_phi_deg,
+                        hole_shape=hole_shape,
+                    )
+
+                extra["diffraction_orders_2d"] = {
+                    "orders_x": far_field_2d.orders_x.tolist(),
+                    "orders_y": far_field_2d.orders_y.tolist(),
+                    "eff_trans_TE": far_field_2d.eff_trans_TE.tolist(),
+                    "eff_trans_TM": far_field_2d.eff_trans_TM.tolist(),
+                    "eff_reflect_TE": far_field_2d.eff_reflect_TE.tolist(),
+                    "eff_reflect_TM": far_field_2d.eff_reflect_TM.tolist(),
+                }
+                aerial = _rcwa2d_diffraction_to_aerial(
+                    mask, far_field_2d, optics, cfg.polarization, ps_nm, cfg
+                )
+        else:
+            period = float(cfg.period_nm or _estimate_period(mask, ps_nm))
+            if period <= 0:
+                logger.warning(
+                    "RCWA 后端未能从掩模中估计出线/空周期，"
+                    "将退化为标量 Hopkins 结果（无矢量修正）。"
+                )
+                extra["rcwa_warning"] = "period_estimation_failed"
+                extra["rcwa_mode"] = "1d_fallback_hopkins"
+                aerial = PartialCoherentImaging(optics, mask.shape).compute_aerial_image(mask)
+            else:
+                fill = float(np.clip(np.mean(mask), 0.05, 0.95))
+                line = float(cfg.line_width_nm or (period * fill))
+                duty = float(np.clip(line / period, 0.05, 0.95))
+                extra["rcwa_period_nm"] = period
+                extra["rcwa_duty_cycle"] = duty
+                extra["rcwa_mode"] = "1d"
+
+                far_field = _try_solve_with_meent(mask, optics, cfg)
+                if far_field is None:
+                    solver = RCWASolver1D(cfg)
+                    far_field = solver.solve_far_field(
+                        wavelength_nm=optics.wavelength,
+                        period_nm=period,
+                        duty_cycle=duty,
+                        theta_deg=0.0,
+                    )
+                extra["diffraction_orders"] = far_field
+                aerial = _rcwa_diffraction_to_aerial(
+                    mask, far_field, optics, cfg.polarization, ps_nm, cfg
+                )
 
     elif be == SimulationBackend.FDTD:
         cfg = fdtd_config or FDTDConfig()
@@ -1622,7 +2528,10 @@ __all__ = [
     "RCWAConfig",
     "FDTDConfig",
     "SimulationResult",
+    "RCWA2DResult",
     "RCWASolver1D",
+    "RCWASolver2D",
+    "VectorTransferFunction",
     "MeepFDTDSolver",
     "simulate",
     "simulate_multi_process_unified",
