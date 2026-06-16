@@ -69,7 +69,12 @@ export const simulationApi = {
 }
 
 export const workflowApi = {
-  runOpc: (opticalSystem: any, opcConfig: OPCConfigParams, patternType: string, patternParams: Record<string, any>) =>
+  runOpc: (
+    opticalSystem: any,
+    opcConfig: OPCConfigParams,
+    patternType: string,
+    patternParams: Record<string, any>
+  ): Promise<TaskSubmitResponse> =>
     service.post<any, TaskSubmitResponse>('/api/workflows/opc', {
       optical_system: opticalSystem,
       opc_config: opcConfig,
@@ -77,7 +82,12 @@ export const workflowApi = {
       pattern_params: patternParams,
     }),
 
-  runSmo: (opticalSystem: any, smoConfig: SMOConfigParams, patternType: string, patternParams: Record<string, any>) =>
+  runSmo: (
+    opticalSystem: any,
+    smoConfig: SMOConfigParams,
+    patternType: string,
+    patternParams: Record<string, any>
+  ): Promise<TaskSubmitResponse> =>
     service.post<any, TaskSubmitResponse>('/api/workflows/smo', {
       optical_system: opticalSystem,
       smo_config: smoConfig,
@@ -85,7 +95,12 @@ export const workflowApi = {
       pattern_params: patternParams,
     }),
 
-  runIlt: (opticalSystem: any, iltConfig: ILTConfigParams, patternType: string, patternParams: Record<string, any>) =>
+  runIlt: (
+    opticalSystem: any,
+    iltConfig: ILTConfigParams,
+    patternType: string,
+    patternParams: Record<string, any>
+  ): Promise<TaskSubmitResponse> =>
     service.post<any, TaskSubmitResponse>('/api/workflows/ilt', {
       optical_system: opticalSystem,
       ilt_config: iltConfig,
@@ -93,7 +108,12 @@ export const workflowApi = {
       pattern_params: patternParams,
     }),
 
-  runProcessWindow: (opticalSystem: any, pwConfig: ProcessWindowConfig, patternType: string, patternParams: Record<string, any>) =>
+  runProcessWindow: (
+    opticalSystem: any,
+    pwConfig: ProcessWindowConfig,
+    patternType: string,
+    patternParams: Record<string, any>
+  ): Promise<TaskSubmitResponse> =>
     service.post<any, TaskSubmitResponse>('/api/workflows/process-window', {
       optical_system: opticalSystem,
       pattern_type: patternType,
@@ -106,40 +126,50 @@ export const workflowApi = {
       save_visualizations: pwConfig.save_visualizations,
     }),
 
-  runBatch: (batchConfig: BatchOptimizationConfig, opticalSystem: any, optimization: any) =>
+  runBatch: (
+    source: string,
+    layer: number | null,
+    opticalSystem: any,
+    optimization: any,
+    maxWorkers: number | null,
+    maxRetries: number,
+    saveOptimizedMasks: boolean,
+    outputDir: string | null,
+    stopOnFirstFailure: boolean
+  ): Promise<TaskSubmitResponse> =>
     service.post<any, TaskSubmitResponse>('/api/workflows/batch', {
-      source: batchConfig.source,
-      layer: batchConfig.layer,
+      source,
+      layer,
       optical_system: opticalSystem,
-      optimization: optimization,
-      max_workers: batchConfig.max_workers,
-      max_retries: batchConfig.max_retries,
-      save_optimized_masks: batchConfig.save_optimized_masks,
-      output_dir: batchConfig.output_dir,
-      stop_on_first_failure: batchConfig.stop_on_first_failure,
+      optimization,
+      max_workers: maxWorkers,
+      max_retries: maxRetries,
+      save_optimized_masks: saveOptimizedMasks,
+      output_dir: outputDir,
+      stop_on_first_failure: stopOnFirstFailure,
     }),
 }
 
 export const taskApi = {
-  list: (taskType?: WorkflowType, status?: TaskStatus) => {
+  list: (taskType?: WorkflowType, status?: TaskStatus): Promise<TaskListResponse> => {
     const params: Record<string, string> = {}
     if (taskType) params.task_type = taskType
     if (status) params.status = status
     return service.get<any, TaskListResponse>('/api/tasks', { params })
   },
 
-  getStatus: (taskId: string) =>
+  getStatus: (taskId: string): Promise<WorkflowTask> =>
     service.get<any, WorkflowTask>(`/api/tasks/${taskId}`),
 
-  getResult: (taskId: string) =>
+  getResult: (taskId: string): Promise<any> =>
     service.get<any, any>(`/api/tasks/${taskId}/result`),
 
-  download: (taskId: string) =>
-    service.get<any, any>(`/api/tasks/${taskId}/download`, { responseType: 'blob' }),
+  download: (taskId: string): Promise<Blob> =>
+    service.get<any, Blob>(`/api/tasks/${taskId}/download`, { responseType: 'blob' }),
 }
 
 export const gdsApi = {
-  upload: (file: File) => {
+  upload: (file: File): Promise<GdsFileInfo> => {
     const formData = new FormData()
     formData.append('file', file)
     return service.post<any, GdsFileInfo>('/api/gds/upload', formData, {
@@ -148,13 +178,13 @@ export const gdsApi = {
     })
   },
 
-  list: () =>
+  list: (): Promise<{ files: GdsFileInfo[] }> =>
     service.get<any, { files: GdsFileInfo[] }>('/api/gds/files'),
 
-  getLayers: (filename: string) =>
+  getLayers: (filename: string): Promise<GdsFileInfo> =>
     service.get<any, GdsFileInfo>(`/api/gds/files/${encodeURIComponent(filename)}`),
 
-  delete: (filename: string) =>
+  delete: (filename: string): Promise<any> =>
     service.delete<any, any>(`/api/gds/files/${encodeURIComponent(filename)}`),
 }
 

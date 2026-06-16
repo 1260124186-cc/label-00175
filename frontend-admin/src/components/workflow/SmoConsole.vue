@@ -311,7 +311,8 @@ function onGdsSelect(file: any, layer: number, datatype: number) {
 }
 
 async function handleRun() {
-  if (!configStore.config?.optical_system) {
+  const config = (configStore as any).config
+  if (!config?.optical_system) {
     ElMessage.warning('请先到「参数配置」页加载光学系统配置')
     return
   }
@@ -331,8 +332,8 @@ async function handleRun() {
       y_end: patternParams.y_end,
     }
 
-    const res: any = await workflowApi.runSmo(
-      configStore.config.optical_system,
+    const res = await workflowApi.runSmo(
+      config.optical_system,
       smoConfig,
       patternType.value,
       patternParamsObj

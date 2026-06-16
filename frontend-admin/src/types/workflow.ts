@@ -103,6 +103,8 @@ export interface ProcessWindowConfig {
 export interface BatchOptimizationConfig {
   source: string
   layer: number | null
+  optical_system?: OpticalSystem
+  optimization?: Optimization
   max_workers: number | null
   max_retries: number
   save_optimized_masks: boolean
@@ -117,13 +119,13 @@ export interface WorkflowTask {
   progress: number
   message?: string
   error?: string
-  stage?: string
-  current_loss?: number
-  iteration?: number
   created_at?: number
   started_at?: number
   finished_at?: number
   result_summary?: Record<string, any>
+  stage?: string
+  current_loss?: number
+  iteration?: number
 }
 
 export interface TaskSubmitResponse {

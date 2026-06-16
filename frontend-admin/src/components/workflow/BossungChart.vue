@@ -251,7 +251,8 @@ const metrics = computed(() => {
 let wsUnsubscribe: (() => void) | null = null
 
 async function handleRun() {
-  if (!configStore.config?.optical_system) {
+  const config = (configStore as any).config
+  if (!config?.optical_system) {
     ElMessage.warning('请先到「参数配置」页加载光学系统配置')
     return
   }
@@ -267,8 +268,8 @@ async function handleRun() {
       y_end: 44,
     }
 
-    const res: any = await workflowApi.runProcessWindow(
-      configStore.config.optical_system,
+    const res = await workflowApi.runProcessWindow(
+      config.optical_system,
       pwConfig,
       patternType.value,
       patternParams

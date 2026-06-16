@@ -358,7 +358,8 @@ async function handleRun() {
     ElMessage.warning('请选择 GDS 文件')
     return
   }
-  if (!configStore.config?.optical_system) {
+  const config = (configStore as any).config
+  if (!config?.optical_system) {
     ElMessage.warning('请先到「参数配置」页加载光学系统配置')
     return
   }
@@ -366,27 +367,23 @@ async function handleRun() {
   isRunning.value = true
   try {
     const optConfig = useConfigParams.value
-      ? configStore.config.optimization
+      ? config.optimization
       : {
-          ...configStore.config.optimization,
+          ...config.optimization,
           max_iter: customMaxIter.value,
           learning_rate: customLearningRate.value,
         }
 
-    const batchConfigPayload: BatchOptimizationConfig = {
-      source: selectedGds.value,
-      layer: selectedLayer.value,
-      max_workers: batchConfig.max_workers_value,
-      max_retries: batchConfig.max_retries,
-      save_optimized_masks: batchConfig.save_optimized_masks,
-      output_dir: batchConfig.output_dir_value || null,
-      stop_on_first_failure: batchConfig.stop_on_first_failure,
-    }
-
-    const res: any = await workflowApi.runBatch(
-      batchConfigPayload,
-      configStore.config.optical_system,
-      optConfig
+    const res = await workflowApi.runBatch(
+      selectedGds.value,
+      selectedLayer.value,
+      config.optical_system,
+      optConfig,
+      batchConfig.max_workers_value,
+      batchConfig.max_retries,
+      batchConfig.save_optimized_masks,
+      batchConfig.output_dir_value || null,
+      batchConfig.stop_on_first_failure
     )
 
     if (res.success) {
