@@ -95,7 +95,7 @@ export const useConfigStore = defineStore('config', {
   actions: {
     _setConfig(newConfig: SimulationConfig): void {
       const cloned = JSON.parse(JSON.stringify(newConfig))
-      this.config.value = cloned
+      ;(this.config as any).value = cloned
     },
     async _fetchDefaultConfig(): Promise<SimulationConfig> {
       try {

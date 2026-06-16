@@ -18,6 +18,12 @@ const routes: RouteRecordRaw[] = [
         name: 'Simulation',
         component: () => import('@/views/SimulationPage.vue'),
         meta: { title: '仿真运行', icon: 'Cpu' }
+      },
+      {
+        path: 'workflow',
+        name: 'Workflow',
+        component: () => import('@/views/WorkflowPage.vue'),
+        meta: { title: 'RET 工作流', icon: 'SetUp' }
       }
     ]
   }

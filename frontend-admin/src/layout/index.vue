@@ -22,6 +22,10 @@
           <el-icon><Cpu /></el-icon>
           <template #title>仿真运行</template>
         </el-menu-item>
+        <el-menu-item index="/workflow">
+          <el-icon><SetUp /></el-icon>
+          <template #title>RET 工作流</template>
+        </el-menu-item>
       </el-menu>
     </el-aside>
 
