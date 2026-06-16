@@ -183,3 +183,215 @@ class SimulationRunResponse(BaseModel):
     message: str
     task_id: Optional[str] = None
     status: Optional[str] = None
+
+
+class TaskSubmitResponse(BaseModel):
+    success: bool
+    message: str
+    task_id: str
+    task_type: str
+    status: str = "pending"
+
+
+class TaskStatusResponse(BaseModel):
+    task_id: str
+    task_type: str
+    status: str
+    progress: float = 0.0
+    message: Optional[str] = None
+    error: Optional[str] = None
+    created_at: Optional[float] = None
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    result_summary: Optional[Dict[str, Any]] = None
+
+
+class TaskListResponse(BaseModel):
+    count: int
+    tasks: List[TaskStatusResponse]
+
+
+class OPCConfigParams(BaseModel):
+    epe_threshold: float = Field(3.0, gt=0, description="EPE 热点判定阈值 (nm)")
+    epe_convergence_threshold: float = Field(1.0, gt=0, description="EPE 收敛阈值 (nm)")
+    max_iterations: int = Field(10, gt=0, description="最大迭代次数")
+    min_hotspot_area: int = Field(4, gt=0, description="最小热点区域面积（像素）")
+    hotspot_dilation: int = Field(2, ge=0, description="热点区域膨胀像素数")
+    edge_offset_step: float = Field(0.5, gt=0, description="每次边缘偏移步长（像素）")
+    max_edge_offset: float = Field(3.0, gt=0, description="最大边缘偏移量（像素）")
+    corner_bias_size: float = Field(1.0, gt=0, description="拐角 serif 尺寸（像素）")
+    line_end_extension: float = Field(2.0, gt=0, description="线端延伸长度（像素）")
+    line_end_width: float = Field(2.0, gt=0, description="线端延伸宽度（像素）")
+    sraf_enable: bool = Field(True, description="是否启用 SRAF 插入")
+    sraf_min_distance: float = Field(2.0, gt=0, description="SRAF 与主特征最小间距（像素）")
+    sraf_max_distance: float = Field(5.0, gt=0, description="SRAF 与主特征最大间距（像素）")
+    sraf_width: float = Field(1.0, gt=0, description="SRAF 宽度（像素）")
+    sraf_length: float = Field(4.0, gt=0, description="SRAF 长度（像素）")
+    sraf_spacing: float = Field(2.0, gt=0, description="相邻 SRAF 间距（像素）")
+    sraf_min_feature_size: float = Field(1.0, gt=0, description="SRAF 最小尺寸（像素）")
+    sraf_max_aspect_ratio: float = Field(10.0, gt=0, description="SRAF 最大长宽比")
+    optimizer_enable: bool = Field(True, description="是否启用 MaskOptimizer 精细优化")
+    optimizer_max_iter: int = Field(20, gt=0, description="优化器每轮最大迭代次数")
+    optimizer_learning_rate: float = Field(0.05, gt=0, description="优化器学习率")
+    optimizer_epe_weight: float = Field(1.0, ge=0, description="优化器 EPE 损失权重")
+    wafer_threshold: float = Field(0.3, ge=0, le=1, description="晶圆成像二值化阈值")
+    verbose: bool = Field(True, description="是否输出详细日志")
+
+
+class OPCRunRequest(BaseModel):
+    optical_system: OpticalSystem = Field(default_factory=OpticalSystem)
+    opc_config: OPCConfigParams = Field(default_factory=OPCConfigParams)
+    pattern_type: str = Field("rectangle", description="测试图案类型")
+    pattern_params: Dict[str, Any] = Field(
+        default_factory=lambda: {"size": [64, 64], "x_start": 20, "x_end": 44, "y_start": 20, "y_end": 44}
+    )
+
+
+class SourceConstraintsParams(BaseModel):
+    energy_conservation: bool = Field(True, description="是否启用总能量守恒约束")
+    energy_target: float = Field(1.0, gt=0, description="目标总能量")
+    sigma_target: Optional[float] = Field(None, description="目标等效sigma值")
+    sigma_tolerance: float = Field(0.02, ge=0, description="sigma约束容差")
+    smoothness_weight: float = Field(0.01, ge=0, description="平滑正则化权重")
+    smoothness_type: str = Field("tv", description="平滑类型 'tv' 或 'gaussian'")
+    gaussian_sigma: float = Field(1.5, gt=0, description="高斯平滑 sigma")
+    non_negative: bool = Field(True, description="是否强制光源强度非负")
+    support_radius: Optional[float] = Field(None, description="光源最大支持半径")
+    support_radius_inner: Optional[float] = Field(None, description="光源最小内半径")
+
+
+class SMOConfigParams(BaseModel):
+    strategy: str = Field("alternating", description="优化策略: alternating, joint_gradient, source_first")
+    max_outer_iterations: int = Field(20, gt=0, description="外层交替优化最大迭代次数")
+    source_max_iter: int = Field(50, gt=0, description="每轮光源优化最大迭代次数")
+    mask_max_iter: int = Field(100, gt=0, description="每轮掩模优化最大迭代次数")
+    joint_max_iter: int = Field(200, gt=0, description="联合梯度下降最大迭代次数")
+    source_learning_rate: float = Field(0.005, gt=0, description="光源优化学习率")
+    mask_learning_rate: float = Field(0.01, gt=0, description="掩模优化学习率")
+    joint_learning_rate_source: float = Field(0.003, gt=0, description="联合优化时光源学习率")
+    joint_learning_rate_mask: float = Field(0.008, gt=0, description="联合优化时掩模学习率")
+    tol: float = Field(1e-5, gt=0, description="收敛容差")
+    convergence_patience: int = Field(5, ge=0, description="收敛耐心值")
+    source_init_type: str = Field("conventional", description="光源初始化类型")
+    source_constraints: SourceConstraintsParams = Field(default_factory=SourceConstraintsParams)
+    wafer_threshold: float = Field(0.3, ge=0, le=1, description="晶圆成像二值化阈值")
+    use_wafer_image_loss: bool = Field(True, description="是否使用wafer图像计算损失")
+    pvb_weight: float = Field(0.0, ge=0, description="工艺变化带宽损失权重")
+    verbose: bool = Field(True, description="是否输出详细日志")
+
+    @field_validator("strategy")
+    @classmethod
+    def validate_strategy(cls, v):
+        valid = ["alternating", "joint_gradient", "source_first"]
+        if v not in valid:
+            raise ValueError(f"优化策略必须为以下之一: {valid}")
+        return v
+
+    @field_validator("source_init_type")
+    @classmethod
+    def validate_source_init(cls, v):
+        valid = ["conventional", "annular", "dipole", "quasar", "uniform_disk", "random", "custom"]
+        if v not in valid:
+            raise ValueError(f"光源初始化类型必须为以下之一: {valid}")
+        return v
+
+
+class SMORunRequest(BaseModel):
+    optical_system: OpticalSystem = Field(default_factory=OpticalSystem)
+    smo_config: SMOConfigParams = Field(default_factory=SMOConfigParams)
+    pattern_type: str = Field("rectangle", description="测试图案类型")
+    pattern_params: Dict[str, Any] = Field(
+        default_factory=lambda: {"size": [64, 64], "x_start": 20, "x_end": 44, "y_start": 20, "y_end": 44}
+    )
+
+
+class ILTComplexityParams(BaseModel):
+    perimeter_weight: float = Field(0.0, ge=0, description="掩模周长惩罚权重")
+    vertex_weight: float = Field(0.0, ge=0, description="顶点数惩罚权重")
+    sub_feature_weight: float = Field(0.0, ge=0, description="辅助特征数量惩罚权重")
+    sub_feature_min_area: int = Field(2, gt=0, description="辅助特征最小面积阈值")
+    sub_feature_max_area: int = Field(100, gt=0, description="辅助特征最大面积阈值")
+
+
+class ILTConfigParams(BaseModel):
+    max_iter: int = Field(200, gt=0, description="最大迭代次数")
+    learning_rate: float = Field(0.01, gt=0, description="学习率")
+    optimizer_type: str = Field("adam_projection", description="优化器类型")
+    convergence_tol: float = Field(1e-6, gt=0, description="收敛容差")
+    convergence_patience: int = Field(20, ge=0, description="收敛耐心值")
+    transmission_level: str = Field("continuous", description="离散透射率等级: binary, ternary, continuous")
+    quantization_start_iter: int = Field(100, ge=0, description="开始量化的迭代数")
+    quantization_schedule: str = Field("linear", description="量化调度类型: step, linear, cosine")
+    quantization_strength: float = Field(1.0, ge=0, le=1, description="量化强度")
+    resist_steepness: float = Field(50.0, gt=0, description="soft resist sigmoid 陡度参数 k")
+    wafer_threshold: float = Field(0.3, ge=0, le=1, description="光刻胶阈值")
+    l2_wafer_weight: float = Field(1.0, ge=0, description="晶圆图 L2 损失权重")
+    complexity: ILTComplexityParams = Field(default_factory=ILTComplexityParams)
+    binary_penalty_weight: float = Field(0.0, ge=0, description="二值化惩罚权重")
+    tv_smooth_weight: float = Field(0.0, ge=0, description="TV 平滑权重")
+    verbose: bool = Field(True, description="是否输出详细日志")
+
+    @field_validator("optimizer_type")
+    @classmethod
+    def validate_ilt_optimizer(cls, v):
+        valid = ["gradient_projection", "adam_projection", "sgd_projection"]
+        if v not in valid:
+            raise ValueError(f"ILT优化器类型必须为以下之一: {valid}")
+        return v
+
+    @field_validator("transmission_level")
+    @classmethod
+    def validate_transmission(cls, v):
+        valid = ["binary", "ternary", "continuous"]
+        if v not in valid:
+            raise ValueError(f"透射率等级必须为以下之一: {valid}")
+        return v
+
+    @field_validator("quantization_schedule")
+    @classmethod
+    def validate_quant_schedule(cls, v):
+        valid = ["step", "linear", "cosine"]
+        if v not in valid:
+            raise ValueError(f"量化调度必须为以下之一: {valid}")
+        return v
+
+
+class ILTRunRequest(BaseModel):
+    optical_system: OpticalSystem = Field(default_factory=OpticalSystem)
+    ilt_config: ILTConfigParams = Field(default_factory=ILTConfigParams)
+    pattern_type: str = Field("rectangle", description="测试图案类型")
+    pattern_params: Dict[str, Any] = Field(
+        default_factory=lambda: {"size": [64, 64], "x_start": 20, "x_end": 44, "y_start": 20, "y_end": 44}
+    )
+
+
+class ProcessWindowRunRequest(BaseModel):
+    optical_system: OpticalSystem = Field(default_factory=OpticalSystem)
+    pattern_type: str = Field("rectangle", description="测试图案类型")
+    pattern_params: Dict[str, Any] = Field(
+        default_factory=lambda: {"size": [64, 64], "x_start": 20, "x_end": 44, "y_start": 20, "y_end": 44}
+    )
+    focus_range: List[float] = Field(
+        [-150.0, 150.0, 11],
+        description="离焦量扫描范围 [start, stop, num_points]"
+    )
+    dose_range: List[float] = Field(
+        [0.85, 1.15, 11],
+        description="曝光剂量扫描范围 [start, stop, num_points]"
+    )
+    cd_tolerance: float = Field(0.1, gt=0, description="CD 相对容差")
+    epe_tolerance: Optional[float] = Field(None, gt=0, description="EPE 绝对容差 (nm)，None 则不检查 EPE")
+    threshold: float = Field(0.3, ge=0, le=1, description="光刻胶阈值")
+    save_visualizations: bool = Field(False, description="是否保存可视化图片")
+
+
+class BatchOptimizationRequest(BaseModel):
+    source: str = Field(..., description="GDS文件路径或目录路径")
+    layer: Optional[int] = Field(None, description="GDS 层号")
+    optical_system: OpticalSystem = Field(default_factory=OpticalSystem)
+    optimization: Optimization = Field(default_factory=Optimization)
+    max_workers: Optional[int] = Field(None, description="最大并发 worker 数")
+    max_retries: int = Field(2, ge=0, description="失败重试次数")
+    save_optimized_masks: bool = Field(True, description="是否保存每个 cell 优化后的掩模")
+    output_dir: Optional[str] = Field(None, description="输出目录")
+    stop_on_first_failure: bool = Field(False, description="是否遇到第一个失败就停止整批")

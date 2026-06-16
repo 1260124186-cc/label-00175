@@ -15,6 +15,8 @@ from fastapi.responses import RedirectResponse
 
 from routers.config import router as config_router
 from routers.simulation import router as simulation_router
+from routers.workflows import router as workflows_router
+from routers.tasks import router as tasks_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,9 +25,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="光刻仿真工作台 API",
-    description="计算光刻仿真框架 Web API，支持参数配置、仿真运行、结果查看",
-    version="1.0.0",
+    title="RET 光刻仿真工作台 API",
+    description="计算光刻仿真框架 Web API，支持参数配置、仿真运行、OPC/SMO/ILT 工作流、工艺窗口分析、批处理优化、统一任务管理",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -38,6 +40,8 @@ app.add_middleware(
 
 app.include_router(config_router)
 app.include_router(simulation_router)
+app.include_router(workflows_router)
+app.include_router(tasks_router)
 
 
 @app.get("/", summary="根路径 - 跳转到 API 文档")
@@ -49,8 +53,18 @@ async def root():
 async def health_check():
     return {
         "status": "ok",
-        "service": "litho-simulation-api",
-        "version": "1.0.0"
+        "service": "ret-litho-api",
+        "version": "2.0.0",
+        "features": [
+            "config",
+            "simulation",
+            "opc",
+            "smo",
+            "ilt",
+            "process_window",
+            "batch_optimization",
+            "task_management",
+        ],
     }
 
 
