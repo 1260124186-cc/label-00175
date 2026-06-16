@@ -7,7 +7,8 @@
 2. 频域滤波器（低通、高通、带通）
 3. 相位调制函数
 
-核心计算函数使用numba加速。
+核心计算函数支持 CPU (numba加速) 和 GPU (CuPy) 两种后端，
+通过 ArrayBackend 统一调度，可通过 device 配置项切换。
 """
 
 import numpy as np
@@ -16,6 +17,29 @@ from typing import Tuple, Optional, Union
 from scipy import fft as scipy_fft
 from scipy.signal.windows import tukey as _scipy_tukey
 from enum import Enum
+
+from core.array_backend import get_backend, DeviceType
+
+
+def _use_gpu() -> bool:
+    """检查当前是否使用 GPU 后端"""
+    return get_backend().device == DeviceType.CUDA
+
+
+def _asarray(arr):
+    """确保数组为当前后端的数组类型"""
+    backend = get_backend()
+    if isinstance(arr, np.ndarray) and _use_gpu():
+        return backend.from_numpy(arr)
+    return arr
+
+
+def _tonumpy(arr):
+    """确保返回 numpy 数组（用于对外 API 兼容）"""
+    backend = get_backend()
+    if _use_gpu():
+        return backend.to_numpy(arr)
+    return np.asarray(arr)
 
 
 class WindowType(Enum):
@@ -152,15 +176,19 @@ def fft1d(signal: np.ndarray,
     Returns:
         频域信号（复数数组）
     """
-    spectrum = scipy_fft.fft(signal)
+    backend = get_backend()
+    x = _asarray(signal)
+
+    spectrum = backend.fft(x)
 
     if shift:
-        spectrum = _fftshift_1d(spectrum.astype(np.complex128))
+        spectrum = backend.fftshift(spectrum)
 
     if normalize:
-        spectrum = spectrum / len(signal)
+        n = x.shape[-1]
+        spectrum = spectrum / n
 
-    return spectrum
+    return _tonumpy(spectrum)
 
 
 def ifft1d(spectrum: np.ndarray,
@@ -177,15 +205,19 @@ def ifft1d(spectrum: np.ndarray,
     Returns:
         时域信号
     """
-    if shifted:
-        spectrum = _ifftshift_1d(spectrum.astype(np.complex128))
+    backend = get_backend()
+    spec = _asarray(spectrum)
 
-    signal = scipy_fft.ifft(spectrum)
+    if shifted:
+        spec = backend.ifftshift(spec)
+
+    signal = backend.ifft(spec)
 
     if was_normalized:
-        signal = signal * len(spectrum)
+        n = spec.shape[-1]
+        signal = signal * n
 
-    return signal
+    return _tonumpy(signal)
 
 
 def fft2d(image: np.ndarray,
@@ -202,15 +234,18 @@ def fft2d(image: np.ndarray,
     Returns:
         频域图像（复数数组）
     """
-    spectrum = scipy_fft.fft2(image)
+    backend = get_backend()
+    x = _asarray(image)
+
+    spectrum = backend.fft2(x)
 
     if shift:
-        spectrum = _fftshift_2d(spectrum.astype(np.complex128))
+        spectrum = backend.fftshift(spectrum)
 
     if normalize:
-        spectrum = _normalize_spectrum(spectrum.astype(np.complex128), float(image.size))
+        spectrum = spectrum / x.size
 
-    return spectrum
+    return _tonumpy(spectrum)
 
 
 def ifft2d(spectrum: np.ndarray,
@@ -227,15 +262,18 @@ def ifft2d(spectrum: np.ndarray,
     Returns:
         空域图像
     """
-    if shifted:
-        spectrum = _ifftshift_2d(spectrum.astype(np.complex128))
+    backend = get_backend()
+    spec = _asarray(spectrum)
 
-    image = scipy_fft.ifft2(spectrum)
+    if shifted:
+        spec = backend.ifftshift(spec)
+
+    image = backend.ifft2(spec)
 
     if was_normalized:
-        image = image * spectrum.size
+        image = image * spec.size
 
-    return image
+    return _tonumpy(image)
 
 
 @jit(nopython=True, parallel=True, cache=True)
@@ -289,28 +327,25 @@ def frequency_filter(spectrum: np.ndarray,
     Returns:
         滤波后的频谱
     """
-    ny, nx = spectrum.shape
+    backend = get_backend()
+    spec = _asarray(spectrum)
+
+    ny, nx = spec.shape
     cy, cx = ny // 2, nx // 2
 
-    # 创建频率网格
-    y = np.arange(ny) - cy
-    x = np.arange(nx) - cx
-    X, Y = np.meshgrid(x, y)
+    y = backend.arange(ny) - cy
+    x = backend.arange(nx) - cx
+    X, Y = backend.meshgrid(x, y)
 
-    # 归一化距离
-    max_dist = np.sqrt(cy**2 + cx**2)
-    D = np.sqrt(X**2 + Y**2) / max_dist
+    max_dist = backend.sqrt(cy**2 + cx**2)
+    D = backend.sqrt(X**2 + Y**2) / max_dist
 
-    # 截止频率对应的距离
     D0 = cutoff
 
-    # 创建滤波器
     if filter_type == 'lowpass':
-        # 巴特沃斯低通滤波器
         H = 1.0 / (1.0 + (D / D0)**(2 * order))
 
     elif filter_type == 'highpass':
-        # 巴特沃斯高通滤波器
         H = 1.0 / (1.0 + (D0 / (D + 1e-10))**(2 * order))
 
     elif filter_type == 'bandpass':
@@ -328,7 +363,7 @@ def frequency_filter(spectrum: np.ndarray,
     else:
         raise ValueError(f"未知的滤波器类型: {filter_type}")
 
-    return spectrum * H
+    return _tonumpy(spec * H)
 
 
 @jit(nopython=True, parallel=True, cache=True)
@@ -371,36 +406,37 @@ def phase_modulation(spectrum: np.ndarray,
     Returns:
         相位调制后的频谱
     """
+    backend = get_backend()
+    spec = _asarray(spectrum)
+
     if params is None:
         params = {}
 
-    ny, nx = spectrum.shape
+    ny, nx = spec.shape
     cy, cx = ny // 2, nx // 2
 
-    # 创建坐标网格
-    y = np.arange(ny) - cy
-    x = np.arange(nx) - cx
-    X, Y = np.meshgrid(x, y)
+    y = backend.arange(ny) - cy
+    x = backend.arange(nx) - cx
+    X, Y = backend.meshgrid(x, y)
 
     if phase_type == 'linear':
-        # 线性相位（对应空域平移）
         kx = params.get('kx', 0.0)
         ky = params.get('ky', 0.0)
-        phase = 2 * np.pi * (kx * X / nx + ky * Y / ny)
+        phase = 2 * backend.pi * (kx * X / nx + ky * Y / ny)
 
     elif phase_type == 'quadratic':
-        # 二次相位（对应离焦）
         alpha = params.get('alpha', 0.01)
         phase = alpha * (X**2 + Y**2)
 
     elif phase_type == 'custom':
-        # 自定义相位
-        phase = params.get('phase_array', np.zeros((ny, nx)))
+        custom_phase = params.get('phase_array', np.zeros((ny, nx)))
+        phase = _asarray(custom_phase)
 
     else:
         raise ValueError(f"未知的相位类型: {phase_type}")
 
-    return _apply_phase_array(spectrum, phase.astype(np.float64))
+    result = spec * backend.exp(1j * phase)
+    return _tonumpy(result)
 
 
 def compute_power_spectrum(image: np.ndarray) -> np.ndarray:
@@ -413,13 +449,15 @@ def compute_power_spectrum(image: np.ndarray) -> np.ndarray:
     Returns:
         功率谱（对数尺度）
     """
-    spectrum = fft2d(image, shift=True, normalize=True)
-    power = np.abs(spectrum)**2
+    backend = get_backend()
+    img = _asarray(image)
 
-    # 对数变换以便可视化
-    power_log = np.log10(power + 1e-10)
+    spectrum = backend.fftshift(backend.fft2(img)) / img.size
+    power = backend.abs(spectrum) ** 2
 
-    return power_log
+    power_log = backend.log10(power + 1e-10)
+
+    return _tonumpy(power_log)
 
 
 def get_frequency_coordinates(shape: Tuple[int, int],
@@ -434,35 +472,59 @@ def get_frequency_coordinates(shape: Tuple[int, int],
     Returns:
         (fx, fy) 频率坐标网格
     """
+    backend = get_backend()
     ny, nx = shape
 
-    fx = scipy_fft.fftshift(scipy_fft.fftfreq(nx, pixel_size))
-    fy = scipy_fft.fftshift(scipy_fft.fftfreq(ny, pixel_size))
+    fx = backend.fftshift(backend.fftfreq(nx, pixel_size))
+    fy = backend.fftshift(backend.fftfreq(ny, pixel_size))
 
-    FX, FY = np.meshgrid(fx, fy)
+    FX, FY = backend.meshgrid(fx, fy)
 
-    return FX, FY
+    return _tonumpy(FX), _tonumpy(FY)
 
 
 def hann_window_2d(shape: Tuple[int, int]) -> np.ndarray:
+    backend = get_backend()
     ny, nx = shape
-    wy = np.hanning(ny)
-    wx = np.hanning(nx)
-    return np.outer(wy, wx).astype(np.float64)
+    wy = backend.xp.hanning(ny)
+    wx = backend.xp.hanning(nx)
+    return _tonumpy(backend.outer(wy, wx).astype(backend.float64))
 
 
 def hamming_window_2d(shape: Tuple[int, int]) -> np.ndarray:
+    backend = get_backend()
     ny, nx = shape
-    wy = np.hamming(ny)
-    wx = np.hamming(nx)
-    return np.outer(wy, wx).astype(np.float64)
+    wy = backend.xp.hamming(ny)
+    wx = backend.xp.hamming(nx)
+    return _tonumpy(backend.outer(wy, wx).astype(backend.float64))
 
 
 def tukey_window_2d(shape: Tuple[int, int], alpha: float = 0.5) -> np.ndarray:
-    ny, nx = shape
-    wy = _scipy_tukey(ny, alpha=alpha)
-    wx = _scipy_tukey(nx, alpha=alpha)
-    return np.outer(wy, wx).astype(np.float64)
+    if _use_gpu():
+        backend = get_backend()
+        ny, nx = shape
+
+        def _tukey_1d(n, alpha):
+            if alpha <= 0:
+                return backend.ones(n)
+            if alpha >= 1:
+                return backend.xp.hanning(n)
+            n_taper = int(round(alpha * n / 2))
+            w = backend.ones(n)
+            t = backend.linspace(0, 1, n_taper, endpoint=False)
+            taper = 0.5 * (1 - backend.cos(backend.pi * t / alpha))
+            w[:n_taper] = taper
+            w[-n_taper:] = taper[::-1]
+            return w
+
+        wy = _tukey_1d(ny, alpha)
+        wx = _tukey_1d(nx, alpha)
+        return _tonumpy(backend.outer(wy, wx).astype(backend.float64))
+    else:
+        ny, nx = shape
+        wy = _scipy_tukey(ny, alpha=alpha)
+        wx = _scipy_tukey(nx, alpha=alpha)
+        return np.outer(wy, wx).astype(np.float64)
 
 
 def create_window(shape: Tuple[int, int],
@@ -484,6 +546,9 @@ def create_window(shape: Tuple[int, int],
 def apply_zero_padding(image: np.ndarray,
                        pad_width: Union[int, Tuple[int, int], Tuple[Tuple[int, int], Tuple[int, int]]] = 32,
                        mode: str = 'constant') -> Tuple[np.ndarray, Tuple]:
+    backend = get_backend()
+    img = _asarray(image)
+
     if isinstance(pad_width, int):
         pw = ((pad_width, pad_width), (pad_width, pad_width))
     elif isinstance(pad_width, tuple) and len(pad_width) == 2 and isinstance(pad_width[0], int):
@@ -491,8 +556,8 @@ def apply_zero_padding(image: np.ndarray,
     else:
         pw = pad_width
 
-    padded = np.pad(image, pw, mode=mode)
-    return padded, pw
+    padded = backend.pad(img, pw, mode=mode)
+    return _tonumpy(padded), pw
 
 
 def remove_padding(padded_image: np.ndarray, pad_width: Tuple) -> np.ndarray:
@@ -507,14 +572,17 @@ def apply_window_and_padding(image: np.ndarray,
                              window_type: Optional[Union[WindowType, str]] = None,
                              pad_width: Optional[Union[int, Tuple[int, int]]] = None,
                              tukey_alpha: float = 0.5) -> Tuple[np.ndarray, dict]:
-    if window_type is None and pad_width is None:
-        return image.copy(), {'original_shape': image.shape, 'pad_width': ((0, 0), (0, 0)), 'window': None}
+    backend = get_backend()
+    img = _asarray(image)
 
-    original_shape = image.shape
-    processed = image.copy().astype(np.float64)
+    if window_type is None and pad_width is None:
+        return _tonumpy(backend.copy(img)), {'original_shape': img.shape, 'pad_width': ((0, 0), (0, 0)), 'window': None}
+
+    original_shape = img.shape
+    processed = backend.copy(img).astype(backend.float64)
 
     if window_type is not None:
-        win = create_window(image.shape, window_type, tukey_alpha)
+        win = _asarray(create_window(img.shape, window_type, tukey_alpha))
         processed = processed * win
     else:
         win = None
@@ -535,7 +603,7 @@ def apply_window_and_padding(image: np.ndarray,
 def crop_to_original(padded_image: np.ndarray, info: dict) -> np.ndarray:
     pw = info['pad_width']
     if pw == ((0, 0), (0, 0)):
-        return padded_image.copy()
+        return np.array(padded_image).copy() if _use_gpu() else padded_image.copy()
     return remove_padding(padded_image, pw)
 
 
@@ -645,6 +713,114 @@ def _create_smooth_cosine_butterworth_bandlimit(shape: Tuple[int, int],
     return mask
 
 
+def _create_circular_bandlimit_gpu(shape: Tuple[int, int],
+                                   inner_radius: float,
+                                   outer_radius: float):
+    backend = get_backend()
+    ny, nx = shape
+    cy, cx = ny // 2, nx // 2
+    max_r = backend.sqrt(cy**2 + cx**2)
+    if max_r <= 0:
+        max_r = 1.0
+
+    y = backend.arange(ny) - cy
+    x = backend.arange(nx) - cx
+    X, Y = backend.meshgrid(x, y)
+    dist = backend.sqrt(Y**2 + X**2)
+    norm_dist = dist / max_r
+
+    mask = backend.zeros((ny, nx), dtype=backend.float64)
+    mask[(norm_dist >= inner_radius) & (norm_dist <= outer_radius)] = 1.0
+    return mask
+
+
+def _create_rectangular_bandlimit_gpu(shape: Tuple[int, int],
+                                      fx_low: float,
+                                      fx_high: float,
+                                      fy_low: float,
+                                      fy_high: float):
+    backend = get_backend()
+    ny, nx = shape
+    cy, cx = ny // 2, nx // 2
+
+    y = backend.arange(ny) - cy
+    x = backend.arange(nx) - cx
+    X, Y = backend.meshgrid(x, y)
+
+    fx_norm = X / cx if cx > 0 else backend.zeros_like(X)
+    fy_norm = Y / cy if cy > 0 else backend.zeros_like(Y)
+
+    mask = backend.zeros((ny, nx), dtype=backend.float64)
+    mask[(backend.abs(fx_norm) >= fx_low) & (backend.abs(fx_norm) <= fx_high) &
+         (backend.abs(fy_norm) >= fy_low) & (backend.abs(fy_norm) <= fy_high)] = 1.0
+    return mask
+
+
+def _create_directional_bandlimit_gpu(shape: Tuple[int, int],
+                                      inner_radius: float,
+                                      outer_radius: float,
+                                      angle_min: float,
+                                      angle_max: float):
+    backend = get_backend()
+    ny, nx = shape
+    cy, cx = ny // 2, nx // 2
+    max_r = backend.sqrt(cy**2 + cx**2)
+    if max_r <= 0:
+        max_r = 1.0
+
+    y = backend.arange(ny) - cy
+    x = backend.arange(nx) - cx
+    X, Y = backend.meshgrid(x, y)
+    dist = backend.sqrt(Y**2 + X**2)
+    norm_dist = dist / max_r
+    angle = backend.arctan2(Y, X)
+    angle = angle % (2 * backend.pi)
+
+    mask = backend.zeros((ny, nx), dtype=backend.float64)
+    radial_condition = (norm_dist >= inner_radius) & (norm_dist <= outer_radius)
+    if angle_min <= angle_max:
+        angle_condition = (angle >= angle_min) & (angle <= angle_max)
+    else:
+        angle_condition = (angle >= angle_min) | (angle <= angle_max)
+    mask[radial_condition & angle_condition] = 1.0
+    return mask
+
+
+def _create_smooth_bandlimit_gpu(shape: Tuple[int, int],
+                                 inner_radius: float,
+                                 outer_radius: float,
+                                 order: int):
+    backend = get_backend()
+    ny, nx = shape
+    cy, cx = ny // 2, nx // 2
+    max_r = backend.sqrt(cy**2 + cx**2)
+    if max_r <= 0:
+        max_r = 1.0
+
+    y = backend.arange(ny) - cy
+    x = backend.arange(nx) - cx
+    X, Y = backend.meshgrid(x, y)
+    dist = backend.sqrt(Y**2 + X**2)
+    norm_dist = dist / max_r
+
+    mask = backend.zeros((ny, nx), dtype=backend.float64)
+
+    valid = norm_dist <= outer_radius
+    if inner_radius <= 1e-10:
+        denom = 1.0 + (norm_dist[valid] / outer_radius) ** (2 * order)
+    else:
+        width = outer_radius - inner_radius
+        if width <= 1e-10:
+            mid = (inner_radius + outer_radius) / 2
+            denom = 1.0 + ((norm_dist[valid] - mid) / inner_radius) ** (2 * order)
+        else:
+            mid = (inner_radius + outer_radius) / 2
+            denom = 1.0 + ((norm_dist[valid] - mid) / (width / 2)) ** (2 * order)
+    mask[valid] = 1.0 / denom
+
+    return mask
+
+
 def create_bandlimit_mask(shape: Tuple[int, int],
                        bandlimit_type: Union[BandlimitType, str] = BandlimitType.LOWPASS,
                        inner_radius: Optional[float] = 0.0,
@@ -681,6 +857,8 @@ def create_bandlimit_mask(shape: Tuple[int, int],
     Returns:
         频域带限掩模（0-1值）
     """
+    backend = get_backend()
+
     if isinstance(bandlimit_type, str):
         bandlimit_type = BandlimitType(bandlimit_type.lower())
 
@@ -689,7 +867,7 @@ def create_bandlimit_mask(shape: Tuple[int, int],
             raise ValueError("custom_mask 不能为空")
         if custom_mask.shape != tuple(shape):
             raise ValueError(f"custom_mask 形状 {custom_mask.shape} 与目标形状 {shape} 不匹配")
-        return custom_mask.astype(np.float64)
+        return _tonumpy(_asarray(custom_mask).astype(backend.float64))
 
     if bandlimit_type == BandlimitType.LOWPASS:
         inner, outer = 0.0, outer_radius
@@ -699,29 +877,50 @@ def create_bandlimit_mask(shape: Tuple[int, int],
         inner, outer = inner_radius, outer_radius
     elif bandlimit_type == BandlimitType.BANDSTOP:
         if smooth:
-            lowpass = _create_smooth_cosine_butterworth_bandlimit(
-                shape, 0.0, inner_radius, order)
-            highpass = _create_smooth_cosine_butterworth_bandlimit(
-                shape, outer_radius, 1.0, order)
-            return np.clip(lowpass + highpass, 0.0, 1.0)
+            if _use_gpu():
+                lowpass = _create_smooth_bandlimit_gpu(shape, 0.0, inner_radius, order)
+                highpass = _create_smooth_bandlimit_gpu(shape, outer_radius, 1.0, order)
+            else:
+                lowpass = _create_smooth_cosine_butterworth_bandlimit(shape, 0.0, inner_radius, order)
+                highpass = _create_smooth_cosine_butterworth_bandlimit(shape, outer_radius, 1.0, order)
+            return _tonumpy(backend.clip(lowpass + highpass, 0.0, 1.0))
         else:
-            inner_part = _create_circular_bandlimit(shape, 0.0, inner_radius)
-            outer_part = _create_circular_bandlimit(shape, outer_radius, 1.0)
-            return np.clip(inner_part + outer_part, 0.0, 1.0)
+            if _use_gpu():
+                inner_part = _create_circular_bandlimit_gpu(shape, 0.0, inner_radius)
+                outer_part = _create_circular_bandlimit_gpu(shape, outer_radius, 1.0)
+            else:
+                inner_part = _create_circular_bandlimit(shape, 0.0, inner_radius)
+                outer_part = _create_circular_bandlimit(shape, outer_radius, 1.0)
+            return _tonumpy(backend.clip(inner_part + outer_part, 0.0, 1.0))
     elif bandlimit_type == BandlimitType.RECTANGULAR:
         fx_low, fx_high = fx_range if fx_range is not None else (0.0, 0.5)
         fy_low, fy_high = fy_range if fy_range is not None else (0.0, 0.5)
-        return _create_rectangular_bandlimit(shape, fx_low, fx_high, fy_low, fy_high)
+        if _use_gpu():
+            result = _create_rectangular_bandlimit_gpu(shape, fx_low, fx_high, fy_low, fy_high)
+        else:
+            result = _create_rectangular_bandlimit(shape, fx_low, fx_high, fy_low, fy_high)
+        return _tonumpy(result)
     elif bandlimit_type == BandlimitType.DIRECTIONAL:
         a_min, a_max = angle_range if angle_range is not None else (0.0, 2 * np.pi)
-        return _create_directional_bandlimit(shape, inner_radius, outer_radius, a_min, a_max)
+        if _use_gpu():
+            result = _create_directional_bandlimit_gpu(shape, inner_radius, outer_radius, a_min, a_max)
+        else:
+            result = _create_directional_bandlimit(shape, inner_radius, outer_radius, a_min, a_max)
+        return _tonumpy(result)
     else:
         raise ValueError(f"未知的带限类型: {bandlimit_type}")
 
     if smooth:
-        return _create_smooth_cosine_butterworth_bandlimit(shape, inner, outer, order)
+        if _use_gpu():
+            result = _create_smooth_bandlimit_gpu(shape, inner, outer, order)
+        else:
+            result = _create_smooth_cosine_butterworth_bandlimit(shape, inner, outer, order)
     else:
-        return _create_circular_bandlimit(shape, inner, outer)
+        if _use_gpu():
+            result = _create_circular_bandlimit_gpu(shape, inner, outer)
+        else:
+            result = _create_circular_bandlimit(shape, inner, outer)
+    return _tonumpy(result)
 
 
 def bandlimit_projection(mask: np.ndarray,
@@ -744,25 +943,30 @@ def bandlimit_projection(mask: np.ndarray,
     Returns:
         投影后的掩模图案（空域，实数值）
     """
+    backend = get_backend()
+
     if mask.shape != bandlimit_mask.shape:
         raise ValueError(
             f"掩模形状 {mask.shape} 与频域掩模形状 {bandlimit_mask.shape} 不匹配"
         )
 
-    spectrum = fft2d(mask, shift=True, normalize=True)
+    m = _asarray(mask)
+    bl_mask = _asarray(bandlimit_mask)
+
+    spectrum = backend.fftshift(backend.fft2(m)) / m.size
 
     if preserve_dc:
-        ny, nx = mask.shape
+        ny, nx = m.shape
         cy, cx = ny // 2, nx // 2
         dc_value = spectrum[cy, cx]
-        filtered_spectrum = spectrum * bandlimit_mask
+        filtered_spectrum = spectrum * bl_mask
         filtered_spectrum[cy, cx] = dc_value
     else:
-        filtered_spectrum = spectrum * bandlimit_mask
+        filtered_spectrum = spectrum * bl_mask
 
-    projected = ifft2d(filtered_spectrum, shifted=True, was_normalized=True)
+    projected = backend.ifft2(backend.ifftshift(filtered_spectrum)) * m.size
 
-    return np.real(projected).astype(np.float64)
+    return _tonumpy(backend.real(projected).astype(backend.float64))
 
 
 def bandlimit_projection_simple(mask: np.ndarray,
@@ -838,12 +1042,17 @@ def compute_spectral_energy_ratio(mask: np.ndarray,
         - stopband_energy_ratio: 阻带能量占比 (0-1)
         - total_energy: 总能量
     """
-    spectrum = fft2d(mask, shift=True, normalize=True)
-    power = np.abs(spectrum) ** 2
-    total_energy = float(np.sum(power))
+    backend = get_backend()
+
+    m = _asarray(mask)
+    bl_mask = _asarray(bandlimit_mask)
+
+    spectrum = backend.fftshift(backend.fft2(m)) / m.size
+    power = backend.abs(spectrum) ** 2
+    total_energy = float(backend.sum(power))
     if total_energy < 1e-20:
         return 1.0, 0.0, 0.0
-    pass_energy = float(np.sum(power * bandlimit_mask))
+    pass_energy = float(backend.sum(power * bl_mask))
     pass_ratio = pass_energy / total_energy
     stop_ratio = 1.0 - pass_ratio
     return pass_ratio, stop_ratio, total_energy

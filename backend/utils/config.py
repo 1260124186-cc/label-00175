@@ -17,14 +17,15 @@ import yaml
 logger = logging.getLogger(__name__)
 
 
-def load_config(config_path: Union[str, Path]) -> Dict[str, Any]:
+def load_config(config_path: Union[str, Path], apply_device: bool = True) -> Dict[str, Any]:
     """
     加载配置文件
 
-    支持YAML和JSON格式。
+    支持YAML和JSON格式。如果配置中指定了 device，会自动设置计算后端。
 
     Args:
         config_path: 配置文件路径
+        apply_device: 是否应用 device 配置设置计算后端
 
     Returns:
         配置字典
@@ -45,6 +46,16 @@ def load_config(config_path: Union[str, Path]) -> Dict[str, Any]:
             raise ValueError(f"不支持的配置文件格式: {suffix}")
 
     logger.info(f"加载配置文件: {config_path}")
+
+    if apply_device:
+        system_config = config.get('system', {})
+        device = system_config.get('device', 'cpu')
+        try:
+            from core.array_backend import set_backend
+            set_backend(device)
+            logger.info(f"已设置计算后端: {device}")
+        except Exception as e:
+            logger.warning(f"设置计算后端失败: {e}")
 
     return config
 
@@ -196,6 +207,9 @@ def create_default_config() -> Dict[str, Any]:
         默认配置字典
     """
     return {
+        'system': {
+            'device': 'cpu',
+        },
         'optical_system': {
             'wavelength': 193.0,
             'na': 1.35,
@@ -262,6 +276,14 @@ def validate_config(config: Dict[str, Any]) -> bool:
         if key not in config:
             logger.error(f"配置缺少必要字段: {key}")
             return False
+
+    # 验证系统配置（device）
+    system_config = config.get('system', {})
+    device = system_config.get('device', 'cpu')
+    valid_devices = ['cpu', 'cuda']
+    if device not in valid_devices:
+        logger.error(f"device 必须为以下之一: {valid_devices}")
+        return False
 
     # 验证光学系统参数
     optics = config.get('optical_system', {})

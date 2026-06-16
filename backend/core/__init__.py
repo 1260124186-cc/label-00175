@@ -93,8 +93,26 @@ from core.rigorous_sim import (
     export_comparison_csv,
     make_simulate_fn_for_optimizer,
 )
+from core.array_backend import (
+    DeviceType,
+    ArrayBackend,
+    NumpyBackend,
+    CupyBackend,
+    get_backend,
+    set_backend,
+    get_device,
+    is_gpu_available,
+)
 
 __all__ = [
+    'DeviceType',
+    'ArrayBackend',
+    'NumpyBackend',
+    'CupyBackend',
+    'get_backend',
+    'set_backend',
+    'get_device',
+    'is_gpu_available',
     'OpticalSystem',
     'PartialCoherentImaging',
     'simulate_wafer_image',

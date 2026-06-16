@@ -21,6 +21,28 @@ from core.fft import (
     apply_zero_padding,
     remove_padding,
 )
+from core.array_backend import get_backend, DeviceType
+
+
+def _use_gpu() -> bool:
+    """检查当前是否使用 GPU 后端"""
+    return get_backend().device == DeviceType.CUDA
+
+
+def _asarray(arr):
+    """确保数组为当前后端的数组类型"""
+    backend = get_backend()
+    if isinstance(arr, np.ndarray) and _use_gpu():
+        return backend.from_numpy(arr)
+    return arr
+
+
+def _tonumpy(arr):
+    """确保返回 numpy 数组（用于对外 API 兼容）"""
+    backend = get_backend()
+    if _use_gpu():
+        return backend.to_numpy(arr)
+    return np.asarray(arr)
 
 
 class AberrationType(Enum):
@@ -628,20 +650,24 @@ def generate_source(fx: np.ndarray, fy: np.ndarray,
     Returns:
         归一化的光源分布
     """
-    ny, nx = fx.shape
-    source = np.zeros((ny, nx), dtype=np.float64)
+    backend = get_backend()
+    fx_b = _asarray(fx)
+    fy_b = _asarray(fy)
+
+    ny, nx = fx_b.shape
+    source = backend.zeros((ny, nx), dtype=backend.float64)
 
     if illumination_type == IlluminationType.CUSTOM and custom_source is not None:
         if custom_source.shape == (ny, nx):
-            source = custom_source.astype(np.float64)
+            source = _asarray(custom_source).astype(backend.float64)
         else:
             raise ValueError(f"自定义光源形状 {custom_source.shape} 与频率网格形状 {(ny, nx)} 不匹配")
     else:
         sigma_inner = source_params.get('sigma_inner', 0.0)
         sigma_outer = source_params.get('sigma_outer', source_params.get('sigma', 0.75))
 
-        rho = np.sqrt(fx**2 + fy**2) / cutoff
-        theta = np.arctan2(fy, fx)
+        rho = backend.sqrt(fx_b**2 + fy_b**2) / cutoff
+        theta = backend.arctan2(fy_b, fx_b)
 
         if illumination_type == IlluminationType.CONVENTIONAL:
             mask = (rho >= sigma_inner) & (rho <= sigma_outer)
@@ -656,9 +682,9 @@ def generate_source(fx: np.ndarray, fy: np.ndarray,
             opening_angle = np.deg2rad(source_params.get('opening_angle', 60.0))
 
             radial_mask = (rho >= sigma_inner) & (rho <= sigma_outer)
-            angle_diff = np.abs(np.mod(theta - angle + np.pi, 2 * np.pi) - np.pi)
+            angle_diff = backend.abs((theta - angle + backend.pi) % (2 * backend.pi) - backend.pi)
             angle_mask1 = angle_diff <= opening_angle / 2
-            angle_mask2 = angle_diff >= (np.pi - opening_angle / 2)
+            angle_mask2 = angle_diff >= (backend.pi - opening_angle / 2)
 
             mask = radial_mask & (angle_mask1 | angle_mask2)
             source[mask] = 1.0
@@ -670,20 +696,20 @@ def generate_source(fx: np.ndarray, fy: np.ndarray,
             radial_mask = (rho >= sigma_inner) & (rho <= sigma_outer)
 
             pole_angles = [angle, angle + np.pi/2, angle + np.pi, angle + 3*np.pi/2]
-            angle_mask = np.zeros_like(rho, dtype=bool)
+            angle_mask = backend.zeros_like(rho, dtype=bool)
 
             for pole_angle in pole_angles:
-                angle_diff = np.abs(np.mod(theta - pole_angle + np.pi, 2 * np.pi) - np.pi)
-                angle_mask |= (angle_diff <= opening_angle / 2)
+                angle_diff = backend.abs((theta - pole_angle + backend.pi) % (2 * backend.pi) - backend.pi)
+                angle_mask = angle_mask | (angle_diff <= opening_angle / 2)
 
             mask = radial_mask & angle_mask
             source[mask] = 1.0
 
-    total = np.sum(source)
+    total = backend.sum(source)
     if total > 0:
         source = source / total
 
-    return source
+    return _tonumpy(source)
 
 
 def _zernike_radial(n: int, m: int, rho: np.ndarray) -> np.ndarray:
@@ -935,6 +961,9 @@ def compute_zernike_phase(fx: np.ndarray, fy: np.ndarray,
     其中 c_j 为 Zernike 系数（单位为波长 λ），
     最终相位 = 2π * W(ρ, θ)。
 
+    注意：Zernike 多项式计算在 CPU 上进行（仅初始化时执行一次），
+         结果会自动转换为当前后端的数组类型。
+
     Args:
         fx: x方向频率网格
         fy: y方向频率网格
@@ -945,14 +974,17 @@ def compute_zernike_phase(fx: np.ndarray, fy: np.ndarray,
     Returns:
         像差相位数组（弧度），形状与 fx 相同
     """
-    ny, nx = fx.shape
+    fx_np = np.asarray(fx)
+    fy_np = np.asarray(fy)
+
+    ny, nx = fx_np.shape
     phase = np.zeros((ny, nx), dtype=np.float64)
 
     if not zernike_coefficients:
         return phase
 
-    rho = np.sqrt(fx ** 2 + fy ** 2) / cutoff
-    theta = np.arctan2(fy, fx)
+    rho = np.sqrt(fx_np ** 2 + fy_np ** 2) / cutoff
+    theta = np.arctan2(fy_np, fx_np)
 
     pupil_mask = rho <= 1.0
 
@@ -992,19 +1024,24 @@ def _compute_pupil_with_aberrations(fx: np.ndarray, fy: np.ndarray,
     Returns:
         复数光瞳函数
     """
-    ny, nx = fx.shape
-    pupil = np.zeros((ny, nx), dtype=np.complex128)
+    backend = get_backend()
+    fx_b = _asarray(fx)
+    fy_b = _asarray(fy)
+    zernike_phase_b = _asarray(zernike_phase)
 
-    rho_sq = (fx ** 2 + fy ** 2) / (cutoff ** 2)
+    ny, nx = fx_b.shape
+    pupil = backend.zeros((ny, nx), dtype=backend.complex128)
+
+    rho_sq = (fx_b ** 2 + fy_b ** 2) / (cutoff ** 2)
     pupil_mask = rho_sq <= 1.0
 
-    defocus_phase = np.pi * defocus / wavelength * rho_sq
+    defocus_phase = backend.pi * defocus / wavelength * rho_sq
 
-    total_phase = defocus_phase + zernike_phase
+    total_phase = defocus_phase + zernike_phase_b
 
-    pupil[pupil_mask] = np.exp(1j * total_phase[pupil_mask])
+    pupil[pupil_mask] = backend.exp(1j * total_phase[pupil_mask])
 
-    return pupil
+    return _tonumpy(pupil)
 
 
 @jit(nopython=True, parallel=True, cache=True)
@@ -1039,8 +1076,8 @@ def _compute_pupil_function(fx: np.ndarray, fy: np.ndarray,
     return pupil
 
 
-def _shift_pupil(pupil: np.ndarray, shift_fx: float,
-                 shift_fy: float, dfx: float, dfy: float) -> np.ndarray:
+def _shift_pupil(pupil, shift_fx: float,
+                 shift_fy: float, dfx: float, dfy: float):
     """
     对光瞳函数进行频移
 
@@ -1054,16 +1091,17 @@ def _shift_pupil(pupil: np.ndarray, shift_fx: float,
     Returns:
         频移后的光瞳函数
     """
+    backend = get_backend()
     ny, nx = pupil.shape
 
     shift_x = int(round(shift_fx / dfx))
     shift_y = int(round(shift_fy / dfy))
 
     if shift_x == 0 and shift_y == 0:
-        return pupil.copy()
+        return backend.copy(pupil)
 
-    shifted = np.roll(pupil, shift=shift_y, axis=0)
-    shifted = np.roll(shifted, shift=shift_x, axis=1)
+    shifted = backend.roll(pupil, shift=shift_y, axis=0)
+    shifted = backend.roll(shifted, shift=shift_x, axis=1)
 
     return shifted
 
@@ -1075,6 +1113,9 @@ def compute_tcc_full(fx: np.ndarray, fy: np.ndarray,
     基于光源积分计算完整的 TCC 矩阵 (四维)
 
     TCC(f1, f2) = ∫ S(fs) * P(f1 - fs) * P*(f2 - fs) dfs
+
+    注意：完整 TCC 矩阵计算量很大，建议仅用于小型系统验证。
+         对于大规模计算，请使用 SOCS 或 KERNEL_2D 模式。
 
     Args:
         fx: x方向频率网格
@@ -1088,24 +1129,30 @@ def compute_tcc_full(fx: np.ndarray, fy: np.ndarray,
     Returns:
         TCC矩阵，形状为 (ny, nx, ny, nx)
     """
-    ny, nx = pupil.shape
-    tcc = np.zeros((ny, nx, ny, nx), dtype=np.complex128)
+    backend = get_backend()
+    fx_b = _asarray(fx)
+    fy_b = _asarray(fy)
+    pupil_b = _asarray(pupil)
+    source_b = _asarray(source)
 
-    source_indices = np.where(source > 1e-10)
-    source_values = source[source_indices]
+    ny, nx = pupil_b.shape
+    tcc = backend.zeros((ny, nx, ny, nx), dtype=backend.complex128)
+
+    source_indices = backend.where_idx(source_b > 1e-10)
+    source_values = source_b[source_indices]
 
     for idx in range(len(source_indices[0])):
-        sy, sx = source_indices[0][idx], source_indices[1][idx]
+        sy, sx = int(source_indices[0][idx]), int(source_indices[1][idx])
         src_val = source_values[idx]
 
-        fs_x = fx[sy, sx]
-        fs_y = fy[sy, sx]
+        fs_x = fx_b[sy, sx]
+        fs_y = fy_b[sy, sx]
 
-        if np.sqrt(fs_x**2 + fs_y**2) > cutoff:
+        if backend.sqrt(fs_x**2 + fs_y**2) > cutoff:
             continue
 
-        pupil_shifted = _shift_pupil(pupil, fs_x, fs_y, dfx, dfy)
-        pupil_conj_shifted = np.conj(pupil_shifted)
+        pupil_shifted = _shift_pupil(pupil_b, fs_x, fs_y, dfx, dfy)
+        pupil_conj_shifted = backend.conj(pupil_shifted)
 
         for i in range(ny):
             for j in range(nx):
@@ -1119,7 +1166,7 @@ def compute_tcc_full(fx: np.ndarray, fy: np.ndarray,
                             continue
                         tcc[i, j, k, l] += src_val * p1 * p2
 
-    return tcc
+    return _tonumpy(tcc)
 
 
 def compute_tcc_kernel_2d(fx: np.ndarray, fy: np.ndarray,
@@ -1142,30 +1189,36 @@ def compute_tcc_kernel_2d(fx: np.ndarray, fy: np.ndarray,
     Returns:
         二维 TCC 核
     """
-    ny, nx = pupil.shape
-    tcc_kernel = np.zeros((ny, nx), dtype=np.float64)
+    backend = get_backend()
+    fx_b = _asarray(fx)
+    fy_b = _asarray(fy)
+    pupil_b = _asarray(pupil)
+    source_b = _asarray(source)
 
-    source_indices = np.where(source > 1e-10)
-    source_values = source[source_indices]
+    ny, nx = pupil_b.shape
+    tcc_kernel = backend.zeros((ny, nx), dtype=backend.float64)
+
+    source_indices = backend.where_idx(source_b > 1e-10)
+    source_values = source_b[source_indices]
 
     for idx in range(len(source_indices[0])):
-        sy, sx = source_indices[0][idx], source_indices[1][idx]
+        sy, sx = int(source_indices[0][idx]), int(source_indices[1][idx])
         src_val = source_values[idx]
 
-        fs_x = fx[sy, sx]
-        fs_y = fy[sy, sx]
+        fs_x = fx_b[sy, sx]
+        fs_y = fy_b[sy, sx]
 
-        if np.sqrt(fs_x**2 + fs_y**2) > cutoff:
+        if backend.sqrt(fs_x**2 + fs_y**2) > cutoff:
             continue
 
-        pupil_shifted = _shift_pupil(pupil, fs_x, fs_y, dfx, dfy)
-        tcc_kernel += src_val * np.abs(pupil_shifted)**2
+        pupil_shifted = _shift_pupil(pupil_b, fs_x, fs_y, dfx, dfy)
+        tcc_kernel = tcc_kernel + src_val * backend.abs(pupil_shifted)**2
 
-    total = np.sum(tcc_kernel)
+    total = backend.sum(tcc_kernel)
     if total > 0:
         tcc_kernel = tcc_kernel / total
 
-    return tcc_kernel
+    return _tonumpy(tcc_kernel)
 
 
 def socs_decomposition(fx: np.ndarray, fy: np.ndarray,
@@ -1192,30 +1245,36 @@ def socs_decomposition(fx: np.ndarray, fy: np.ndarray,
             eigenvalues: 形状为 (num_terms,)
             eigenfunctions: 形状为 (num_terms, ny, nx)
     """
-    ny, nx = pupil.shape
+    backend = get_backend()
+    fx_b = _asarray(fx)
+    fy_b = _asarray(fy)
+    pupil_b = _asarray(pupil)
+    source_b = _asarray(source)
+
+    ny, nx = pupil_b.shape
     N = ny * nx
 
-    source_indices = np.where(source > 1e-10)
-    source_values = source[source_indices]
+    source_indices = backend.where_idx(source_b > 1e-10)
+    source_values = source_b[source_indices]
 
     M = len(source_indices[0])
-    V = np.zeros((M, N), dtype=np.complex128)
+    V = backend.zeros((M, N), dtype=backend.complex128)
 
     for idx in range(M):
-        sy, sx = source_indices[0][idx], source_indices[1][idx]
-        src_val = np.sqrt(source_values[idx])
+        sy, sx = int(source_indices[0][idx]), int(source_indices[1][idx])
+        src_val = backend.sqrt(source_values[idx])
 
-        fs_x = fx[sy, sx]
-        fs_y = fy[sy, sx]
+        fs_x = fx_b[sy, sx]
+        fs_y = fy_b[sy, sx]
 
-        pupil_shifted = _shift_pupil(pupil, fs_x, fs_y, dfx, dfy)
+        pupil_shifted = _shift_pupil(pupil_b, fs_x, fs_y, dfx, dfy)
         V[idx, :] = src_val * pupil_shifted.flatten()
 
     if M <= N:
         VVh = V @ V.conj().T
-        eigenvalues, eigenvectors = np.linalg.eigh(VVh)
+        eigenvalues, eigenvectors = backend.eigh(VVh)
 
-        idx_sorted = np.argsort(eigenvalues)[::-1]
+        idx_sorted = backend.argsort(eigenvalues)[::-1]
         eigenvalues = eigenvalues[idx_sorted]
         eigenvectors = eigenvectors[:, idx_sorted]
 
@@ -1223,18 +1282,18 @@ def socs_decomposition(fx: np.ndarray, fy: np.ndarray,
         eigenvalues = eigenvalues[:num_terms]
         eigenvectors = eigenvectors[:, :num_terms]
 
-        eigenfunctions = np.zeros((num_terms, ny, nx), dtype=np.complex128)
+        eigenfunctions = backend.zeros((num_terms, ny, nx), dtype=backend.complex128)
         for i in range(num_terms):
             phi_flat = V.conj().T @ eigenvectors[:, i]
-            norm = np.sqrt(np.sum(np.abs(phi_flat)**2))
+            norm = backend.sqrt(backend.sum(backend.abs(phi_flat)**2))
             if norm > 1e-10:
                 phi_flat = phi_flat / norm
             eigenfunctions[i, :, :] = phi_flat.reshape(ny, nx)
     else:
         VhV = V.conj().T @ V
-        eigenvalues, eigenvectors = np.linalg.eigh(VhV)
+        eigenvalues, eigenvectors = backend.eigh(VhV)
 
-        idx_sorted = np.argsort(eigenvalues)[::-1]
+        idx_sorted = backend.argsort(eigenvalues)[::-1]
         eigenvalues = eigenvalues[idx_sorted]
         eigenvectors = eigenvectors[:, idx_sorted]
 
@@ -1242,16 +1301,16 @@ def socs_decomposition(fx: np.ndarray, fy: np.ndarray,
         eigenvalues = eigenvalues[:num_terms]
         eigenvectors = eigenvectors[:, :num_terms]
 
-        eigenfunctions = np.zeros((num_terms, ny, nx), dtype=np.complex128)
+        eigenfunctions = backend.zeros((num_terms, ny, nx), dtype=backend.complex128)
         for i in range(num_terms):
             eigenfunctions[i, :, :] = eigenvectors[:, i].reshape(ny, nx)
 
-    eigenvalues = np.real(eigenvalues)
-    total_energy = np.sum(eigenvalues)
+    eigenvalues = backend.real(eigenvalues)
+    total_energy = backend.sum(eigenvalues)
     if total_energy > 0:
         eigenvalues = eigenvalues / total_energy
 
-    return eigenvalues, eigenfunctions
+    return _tonumpy(eigenvalues), _tonumpy(eigenfunctions)
 
 
 @jit(nopython=True, parallel=True, cache=True)
@@ -1368,14 +1427,17 @@ class PartialCoherentImaging:
 
     def _setup_frequency_grid(self):
         """设置频率网格"""
+        backend = get_backend()
         ny, nx = self._effective_size
 
         self.dfx = 1.0 / (nx * self.optics.pixel_size)
         self.dfy = 1.0 / (ny * self.optics.pixel_size)
 
-        fx = np.fft.fftfreq(nx, self.optics.pixel_size)
-        fy = np.fft.fftfreq(ny, self.optics.pixel_size)
-        self.fx, self.fy = np.meshgrid(fx, fy)
+        fx = backend.fftfreq(nx, self.optics.pixel_size)
+        fy = backend.fftfreq(ny, self.optics.pixel_size)
+        fx_grid, fy_grid = backend.meshgrid(fx, fy)
+        self.fx = _tonumpy(fx_grid)
+        self.fy = _tonumpy(fy_grid)
 
     def _compute_source_and_pupil(self):
         """计算光源分布和光瞳函数（含离焦和Zernike像差）"""
@@ -1440,57 +1502,68 @@ class PartialCoherentImaging:
         如果初始化时指定了窗函数和/或零填充，会在FFT前对掩模
         做加窗和零填充处理，计算完成后裁剪回原始尺寸。
 
+        支持 CPU/GPU 透明切换，通过 ArrayBackend 统一调度。
+
         Args:
             mask: 掩模图案 (2D numpy数组, 0-1值)
 
         Returns:
             空间像光强分布（原始掩模尺寸）
         """
+        backend = get_backend()
         processed_mask = self._preprocess_mask(mask)
-        mask_c = processed_mask.astype(np.complex128)
+        mask_c = _asarray(processed_mask).astype(backend.complex128)
         ny_eff, nx_eff = processed_mask.shape
         mode = self.optics.tcc_mode
 
         if mode == TCCMode.SOCS and self.socs_eigenvalues is not None:
-            intensity = np.zeros((ny_eff, nx_eff), dtype=np.float64)
-            mask_spectrum = np.fft.fft2(mask_c)
+            intensity = backend.zeros((ny_eff, nx_eff), dtype=backend.float64)
+            mask_spectrum = backend.fft2(mask_c)
+            eigenvalues = _asarray(self.socs_eigenvalues)
+            eigenfunctions = _asarray(self.socs_eigenfunctions)
 
-            for lam, phi in zip(self.socs_eigenvalues, self.socs_eigenfunctions):
+            for i in range(len(eigenvalues)):
+                lam = eigenvalues[i]
                 if lam < 1e-10:
                     continue
+                phi = eigenfunctions[i]
                 filtered = mask_spectrum * phi
-                field_i = np.fft.ifft2(filtered)
-                intensity += lam * np.abs(field_i)**2
+                field_i = backend.ifft2(filtered)
+                intensity = intensity + lam * backend.abs(field_i)**2
         elif mode == TCCMode.KERNEL_2D and self.tcc_kernel is not None:
-            mask_spectrum = np.fft.fft2(mask_c)
-            effective_pupil = np.sqrt(np.maximum(self.tcc_kernel, 0.0))
+            mask_spectrum = backend.fft2(mask_c)
+            tcc_kernel = _asarray(self.tcc_kernel)
+            effective_pupil = backend.sqrt(backend.maximum(tcc_kernel, 0.0))
             filtered = mask_spectrum * effective_pupil
-            field = np.fft.ifft2(filtered)
-            intensity = np.abs(field)**2
+            field = backend.ifft2(filtered)
+            intensity = backend.abs(field)**2
         else:
-            intensity = np.zeros((ny_eff, nx_eff), dtype=np.float64)
-            mask_spectrum = np.fft.fft2(mask_c)
+            intensity = backend.zeros((ny_eff, nx_eff), dtype=backend.float64)
+            mask_spectrum = backend.fft2(mask_c)
             cutoff = self.optics.cutoff_frequency
 
-            source_indices = np.where(self.source > 1e-10)
-            source_values = self.source[source_indices]
+            source = _asarray(self.source)
+            fx = _asarray(self.fx)
+            fy = _asarray(self.fy)
+            pupil = _asarray(self.pupil)
+
+            source_indices = backend.where_idx(source > 1e-10)
+            source_values = source[source_indices]
 
             for idx in range(len(source_indices[0])):
-                sy, sx = source_indices[0][idx], source_indices[1][idx]
+                sy, sx = int(source_indices[0][idx]), int(source_indices[1][idx])
                 src_val = source_values[idx]
 
-                fs_x = self.fx[sy, sx]
-                fs_y = self.fy[sy, sx]
+                fs_x = fx[sy, sx]
+                fs_y = fy[sy, sx]
 
-                if np.sqrt(fs_x**2 + fs_y**2) > cutoff:
+                if backend.sqrt(fs_x**2 + fs_y**2) > cutoff:
                     continue
 
-                pupil_shifted = _shift_pupil(
-                    self.pupil, fs_x, fs_y, self.dfx, self.dfy
-                )
+                pupil_shifted = _shift_pupil(pupil, fs_x, fs_y, self.dfx, self.dfy)
                 filtered = mask_spectrum * pupil_shifted
-                field_i = np.fft.ifft2(filtered)
-                intensity += src_val * np.abs(field_i)**2
+                field_i = backend.ifft2(filtered)
+                intensity = intensity + src_val * backend.abs(field_i)**2
 
         if self.pad_width is not None:
             if isinstance(self.pad_width, int):
@@ -1502,7 +1575,7 @@ class PartialCoherentImaging:
         if intensity.max() > 0:
             intensity = intensity / intensity.max()
 
-        return intensity.astype(np.float64)
+        return _tonumpy(intensity.astype(backend.float64))
 
     def compute_image_gradient(self, mask: np.ndarray) -> np.ndarray:
         """
@@ -1512,55 +1585,66 @@ class PartialCoherentImaging:
 
         如果启用了窗函数，梯度会自动乘以窗函数以保持链式法则一致性。
 
+        支持 CPU/GPU 透明切换，通过 ArrayBackend 统一调度。
+
         Args:
             mask: 掩模图案
 
         Returns:
             梯度数组（原始掩模尺寸）
         """
+        backend = get_backend()
         processed_mask = self._preprocess_mask(mask)
-        mask_c = processed_mask.astype(np.complex128)
+        mask_c = _asarray(processed_mask).astype(backend.complex128)
         ny_eff, nx_eff = processed_mask.shape
-        gradient = np.zeros((ny_eff, nx_eff), dtype=np.float64)
-        mask_spectrum = np.fft.fft2(mask_c)
+        gradient = backend.zeros((ny_eff, nx_eff), dtype=backend.float64)
+        mask_spectrum = backend.fft2(mask_c)
         cutoff = self.optics.cutoff_frequency
         mode = self.optics.tcc_mode
 
         if mode == TCCMode.SOCS and self.socs_eigenvalues is not None:
-            for lam, phi in zip(self.socs_eigenvalues, self.socs_eigenfunctions):
+            eigenvalues = _asarray(self.socs_eigenvalues)
+            eigenfunctions = _asarray(self.socs_eigenfunctions)
+            for i in range(len(eigenvalues)):
+                lam = eigenvalues[i]
                 if lam < 1e-10:
                     continue
+                phi = eigenfunctions[i]
                 filtered = mask_spectrum * phi
-                field_i = np.fft.ifft2(filtered)
-                grad_field_i = np.fft.ifft2(phi)
-                gradient += 2 * lam * np.real(np.conj(field_i) * grad_field_i)
+                field_i = backend.ifft2(filtered)
+                grad_field_i = backend.ifft2(phi)
+                gradient = gradient + 2 * lam * backend.real(backend.conj(field_i) * grad_field_i)
         elif mode == TCCMode.KERNEL_2D and self.tcc_kernel is not None:
-            effective_pupil = np.sqrt(np.maximum(self.tcc_kernel, 0.0))
+            tcc_kernel = _asarray(self.tcc_kernel)
+            effective_pupil = backend.sqrt(backend.maximum(tcc_kernel, 0.0))
             filtered = mask_spectrum * effective_pupil
-            field = np.fft.ifft2(filtered)
-            grad_field = np.fft.ifft2(effective_pupil)
-            gradient = 2.0 * np.real(np.conj(field) * grad_field)
+            field = backend.ifft2(filtered)
+            grad_field = backend.ifft2(effective_pupil)
+            gradient = 2.0 * backend.real(backend.conj(field) * grad_field)
         else:
-            source_indices = np.where(self.source > 1e-10)
-            source_values = self.source[source_indices]
+            source = _asarray(self.source)
+            fx = _asarray(self.fx)
+            fy = _asarray(self.fy)
+            pupil = _asarray(self.pupil)
+
+            source_indices = backend.where_idx(source > 1e-10)
+            source_values = source[source_indices]
 
             for idx in range(len(source_indices[0])):
-                sy, sx = source_indices[0][idx], source_indices[1][idx]
+                sy, sx = int(source_indices[0][idx]), int(source_indices[1][idx])
                 src_val = source_values[idx]
 
-                fs_x = self.fx[sy, sx]
-                fs_y = self.fy[sy, sx]
+                fs_x = fx[sy, sx]
+                fs_y = fy[sy, sx]
 
-                if np.sqrt(fs_x**2 + fs_y**2) > cutoff:
+                if backend.sqrt(fs_x**2 + fs_y**2) > cutoff:
                     continue
 
-                pupil_shifted = _shift_pupil(
-                    self.pupil, fs_x, fs_y, self.dfx, self.dfy
-                )
+                pupil_shifted = _shift_pupil(pupil, fs_x, fs_y, self.dfx, self.dfy)
                 filtered = mask_spectrum * pupil_shifted
-                field_i = np.fft.ifft2(filtered)
-                grad_field_i = np.fft.ifft2(pupil_shifted)
-                gradient += 2 * src_val * np.real(np.conj(field_i) * grad_field_i)
+                field_i = backend.ifft2(filtered)
+                grad_field_i = backend.ifft2(pupil_shifted)
+                gradient = gradient + 2 * src_val * backend.real(backend.conj(field_i) * grad_field_i)
 
         if self.pad_width is not None:
             if isinstance(self.pad_width, int):
@@ -1570,17 +1654,22 @@ class PartialCoherentImaging:
             gradient = gradient[py:py + self.image_size[0], px:px + self.image_size[1]]
 
         if self._window_2d is not None:
-            gradient = gradient * self._window_2d
+            window = _asarray(self._window_2d)
+            gradient = gradient * window
 
-        return gradient.astype(np.float64)
+        return _tonumpy(gradient.astype(backend.float64))
 
     def get_source_image(self) -> np.ndarray:
         """获取光源分布图像（fftshift后便于可视化）"""
-        return np.fft.fftshift(self.source)
+        backend = get_backend()
+        source = _asarray(self.source)
+        return _tonumpy(backend.fftshift(source))
 
     def get_pupil_image(self) -> np.ndarray:
         """获取光瞳函数图像（fftshift后便于可视化）"""
-        return np.fft.fftshift(np.abs(self.pupil))
+        backend = get_backend()
+        pupil = _asarray(self.pupil)
+        return _tonumpy(backend.fftshift(backend.abs(pupil)))
 
     def get_tcc_image(self) -> Optional[np.ndarray]:
         """获取TCC核图像（fftshift后便于可视化）
@@ -1588,7 +1677,9 @@ class PartialCoherentImaging:
         返回 2D TCC 核对角近似（fftshift 后）。所有模式下均可用。
         """
         if self.tcc_kernel is not None:
-            return np.fft.fftshift(self.tcc_kernel)
+            backend = get_backend()
+            tcc = _asarray(self.tcc_kernel)
+            return _tonumpy(backend.fftshift(tcc))
         return None
 
     def update_source(self, new_source: np.ndarray) -> None:
@@ -1598,17 +1689,19 @@ class PartialCoherentImaging:
         Args:
             new_source: 新的光源分布，形状需与频率网格一致
         """
+        backend = get_backend()
         if new_source.shape != self.source.shape:
             raise ValueError(
                 f"新光源形状 {new_source.shape} 与当前形状 {self.source.shape} 不匹配"
             )
 
-        new_source = np.clip(new_source, 0.0, None)
-        total = np.sum(new_source)
+        new_src = _asarray(new_source)
+        new_src = backend.clip(new_src, 0.0, None)
+        total = backend.sum(new_src)
         if total > 0:
-            new_source = new_source / total
+            new_src = new_src / total
 
-        self.source = new_source.astype(np.float64)
+        self.source = _tonumpy(new_src.astype(backend.float64))
         self._compute_transfer_functions()
 
     def compute_source_gradient(self, mask: np.ndarray,
@@ -1629,6 +1722,8 @@ class PartialCoherentImaging:
         KERNEL_2D 模式下不支持光源梯度计算（2D核对角近似下光源信息已被积分掉），
         将返回全零数组。
 
+        支持 CPU/GPU 透明切换，通过 ArrayBackend 统一调度。
+
         Args:
             mask: 掩模图案 (H, W)
             dLoss_dAerial: 损失对空间像的梯度 (H, W)，可选
@@ -1636,22 +1731,23 @@ class PartialCoherentImaging:
         Returns:
             梯度数组，形状与 self.source 相同（频率网格尺寸）
         """
+        backend = get_backend()
         processed_mask = self._preprocess_mask(mask)
-        mask_c = processed_mask.astype(np.complex128)
-        mask_spectrum = np.fft.fft2(mask_c)
+        mask_c = _asarray(processed_mask).astype(backend.complex128)
+        mask_spectrum = backend.fft2(mask_c)
         ny_eff, nx_eff = mask_spectrum.shape
         cutoff = self.optics.cutoff_frequency
         mode = self.optics.tcc_mode
 
-        gradient = np.zeros_like(self.source, dtype=np.float64)
+        gradient = backend.zeros_like(_asarray(self.source), dtype=backend.float64)
 
         if mode == TCCMode.KERNEL_2D:
-            return gradient
+            return _tonumpy(gradient)
 
         if dLoss_dAerial is None:
-            dLoss_dI = np.ones(self.image_size, dtype=np.float64)
+            dLoss_dI = backend.ones(self.image_size, dtype=backend.float64)
         else:
-            dLoss_dI = np.asarray(dLoss_dAerial, dtype=np.float64)
+            dLoss_dI = _asarray(dLoss_dAerial).astype(backend.float64)
             if dLoss_dI.shape != self.image_size:
                 raise ValueError(
                     f"dLoss_dAerial 形状 {dLoss_dI.shape} 与 image_size {self.image_size} 不匹配"
@@ -1662,42 +1758,41 @@ class PartialCoherentImaging:
                 py, px = self.pad_width, self.pad_width
             else:
                 py, px = self.pad_width
-            dLoss_dI_padded = np.zeros((ny_eff, nx_eff), dtype=np.float64)
+            dLoss_dI_padded = backend.zeros((ny_eff, nx_eff), dtype=backend.float64)
             dLoss_dI_padded[py:py + self.image_size[0], px:px + self.image_size[1]] = dLoss_dI
             dLoss_dI = dLoss_dI_padded
 
-        source_indices = np.where(self.source > 1e-12)
+        source = _asarray(self.source)
+        fx = _asarray(self.fx)
+        fy = _asarray(self.fy)
+        pupil = _asarray(self.pupil)
+
+        source_indices = backend.where_idx(source > 1e-12)
         num_points = len(source_indices[0])
         if num_points == 0:
-            return gradient
+            return _tonumpy(gradient)
 
         max_points_per_batch = 64
         for batch_start in range(0, num_points, max_points_per_batch):
             batch_end = min(batch_start + max_points_per_batch, num_points)
-            batch_idx = slice(batch_start, batch_end)
 
-            sy_batch = source_indices[0][batch_idx]
-            sx_batch = source_indices[1][batch_idx]
+            for bi in range(batch_start, batch_end):
+                sy = int(source_indices[0][bi])
+                sx = int(source_indices[1][bi])
 
-            for bi in range(len(sy_batch)):
-                sy = int(sy_batch[bi])
-                sx = int(sx_batch[bi])
-
-                fs_x = self.fx[sy, sx]
-                fs_y = self.fy[sy, sx]
-                if cutoff is not None and np.sqrt(fs_x ** 2 + fs_y ** 2) > cutoff:
+                fs_x = fx[sy, sx]
+                fs_y = fy[sy, sx]
+                if cutoff is not None and backend.sqrt(fs_x ** 2 + fs_y ** 2) > cutoff:
                     continue
 
-                pupil_shifted = _shift_pupil(
-                    self.pupil, fs_x, fs_y, self.dfx, self.dfy
-                )
+                pupil_shifted = _shift_pupil(pupil, fs_x, fs_y, self.dfx, self.dfy)
                 filtered = mask_spectrum * pupil_shifted
-                field_i = np.fft.ifft2(filtered)
-                intensity_i = np.abs(field_i) ** 2
+                field_i = backend.ifft2(filtered)
+                intensity_i = backend.abs(field_i) ** 2
 
-                gradient[sy, sx] = float(np.sum(dLoss_dI * intensity_i))
+                gradient[sy, sx] = float(backend.sum(dLoss_dI * intensity_i))
 
-        return gradient.astype(np.float64)
+        return _tonumpy(gradient.astype(backend.float64))
 
 
 class ResistType(Enum):

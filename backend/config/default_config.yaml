@@ -1,6 +1,10 @@
 # 计算光刻仿真框架默认配置文件
 # Default Configuration for Lithography Simulation Framework
 
+# 系统配置
+system:
+  device: cpu                     # 计算设备: cpu 或 cuda (GPU加速，需要安装CuPy)
+
 # 光学系统参数
 optical_system:
   wavelength: 193.0      # 光源波长 (nm), ArF光源
