@@ -11,8 +11,10 @@ import type {
   TaskSubmitResponse,
   TaskListResponse,
   GdsFileInfo,
+  GdsLayersResponse,
   WorkflowType,
   TaskStatus,
+  TaskResultResponse,
 } from '@/types/workflow'
 
 const service: AxiosInstance = axios.create({
@@ -161,8 +163,8 @@ export const taskApi = {
   getStatus: (taskId: string): Promise<WorkflowTask> =>
     service.get<any, WorkflowTask>(`/api/tasks/${taskId}`),
 
-  getResult: (taskId: string): Promise<any> =>
-    service.get<any, any>(`/api/tasks/${taskId}/result`),
+  getResult: (taskId: string): Promise<TaskResultResponse> =>
+    service.get<any, TaskResultResponse>(`/api/tasks/${taskId}/result`),
 
   download: (taskId: string): Promise<Blob> =>
     service.get<any, Blob>(`/api/tasks/${taskId}/download`, { responseType: 'blob' }),
@@ -172,20 +174,20 @@ export const gdsApi = {
   upload: (file: File): Promise<GdsFileInfo> => {
     const formData = new FormData()
     formData.append('file', file)
-    return service.post<any, GdsFileInfo>('/api/gds/upload', formData, {
+    return service.post<any, { success: boolean; message: string; file: GdsFileInfo }>('/api/gds/upload', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
       timeout: 60000,
-    })
+    }).then(res => res.file)
   },
 
-  list: (): Promise<{ files: GdsFileInfo[] }> =>
-    service.get<any, { files: GdsFileInfo[] }>('/api/gds/files'),
+  list: (): Promise<{ count: number; files: GdsFileInfo[] }> =>
+    service.get<any, { count: number; files: GdsFileInfo[] }>('/api/gds/list'),
 
-  getLayers: (filename: string): Promise<GdsFileInfo> =>
-    service.get<any, GdsFileInfo>(`/api/gds/files/${encodeURIComponent(filename)}`),
+  getLayers: (fileId: string): Promise<GdsLayersResponse> =>
+    service.get<any, GdsLayersResponse>(`/api/gds/${encodeURIComponent(fileId)}/layers`),
 
-  delete: (filename: string): Promise<any> =>
-    service.delete<any, any>(`/api/gds/files/${encodeURIComponent(filename)}`),
+  delete: (fileId: string): Promise<any> =>
+    service.delete<any, any>(`/api/gds/${encodeURIComponent(fileId)}`),
 }
 
 export default service

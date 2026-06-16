@@ -179,7 +179,7 @@ import {
   Histogram, Refresh, Clock, Document, Pointer, DataLine, Trophy
 } from '@element-plus/icons-vue'
 import { taskApi } from '@/api'
-import type { WorkflowTask, WorkflowType } from '@/types/workflow'
+import type { WorkflowTask, WorkflowType, TaskResultResponse } from '@/types/workflow'
 
 interface ExperimentRecord {
   id: string
@@ -189,6 +189,8 @@ interface ExperimentRecord {
   result_metrics: Record<string, any>
   config_snapshot: Record<string, any>
   tags?: string[]
+  detail?: TaskResultResponse
+  loadingDetail?: boolean
 }
 
 const loading = ref(false)
@@ -312,7 +314,7 @@ function flattenObject(obj: Record<string, any>, prefix = ''): Record<string, an
 async function refreshList() {
   loading.value = true
   try {
-    const res: any = await taskApi.list(filterType.value || undefined)
+    const res = await taskApi.list(filterType.value || undefined)
     const tasks: WorkflowTask[] = res.tasks || []
     experiments.value = tasks.map(t => ({
       id: t.task_id,
@@ -321,53 +323,35 @@ async function refreshList() {
       created_at: t.created_at || Date.now() / 1000,
       result_metrics: t.result_summary || {},
       config_snapshot: {},
-      tags: [t.task_type],
+      tags: [t.task_type, t.status],
     }))
-
-    if (experiments.value.length === 0) {
-      generateMockExperiments()
-    }
   } catch (e) {
-    generateMockExperiments()
+    experiments.value = []
   } finally {
     loading.value = false
   }
 }
 
-function generateMockExperiments() {
-  const types: WorkflowType[] = ['opc', 'smo', 'ilt', 'simulation']
-  const mockData: ExperimentRecord[] = []
-
-  for (let i = 0; i < 12; i++) {
-    const type = types[i % types.length]
-    mockData.push({
-      id: `exp_${(i + 1).toString().padStart(4, '0')}`,
-      name: `实验-${type.toUpperCase()}-${i + 1}`,
-      workflow_type: type,
-      created_at: Date.now() / 1000 - i * 3600,
-      result_metrics: {
-        mse: 0.001 + Math.random() * 0.02,
-        ssim: 0.85 + Math.random() * 0.14,
-        iterations: 50 + Math.floor(Math.random() * 150),
-        final_loss: 0.0005 + Math.random() * 0.01,
-      },
-      config_snapshot: {
-        optical_system: {
-          wavelength: 193,
-          na: 1.35,
-          sigma: 0.7 + Math.random() * 0.1,
-        },
-        optimization: {
-          max_iter: 100 + Math.floor(Math.random() * 100),
-          learning_rate: 0.005 + Math.random() * 0.01,
-          optimizer_type: ['gradient_descent', 'adam', 'bfgs'][i % 3],
-        },
-      },
-      tags: [type, i % 2 === 0 ? 'baseline' : 'optimized'],
-    })
+async function loadTaskDetail(taskId: string): Promise<TaskResultResponse | null> {
+  const exp = experiments.value.find(e => e.id === taskId)
+  if (!exp) return null
+  if (exp.detail) return exp.detail
+  if (exp.loadingDetail) return null
+  try {
+    exp.loadingDetail = true
+    const detail = await taskApi.getResult(taskId)
+    exp.detail = detail
+    exp.config_snapshot = detail.payload || {}
+    if (detail.result_summary) {
+      exp.result_metrics = { ...exp.result_metrics, ...detail.result_summary }
+    }
+    return detail
+  } catch (e) {
+    console.error('加载任务详情失败:', e)
+    return null
+  } finally {
+    exp.loadingDetail = false
   }
-
-  experiments.value = mockData
 }
 
 function toggleSelect(id: string) {
@@ -476,7 +460,14 @@ watch(filterType, () => {
   selectAll.value = false
 })
 
-watch(selectedExperiments, (exps) => {
+watch(selectedExperiments, async (exps) => {
+  if (exps.length > 0) {
+    for (const exp of exps) {
+      if (!exp.detail && !exp.loadingDetail) {
+        await loadTaskDetail(exp.id)
+      }
+    }
+  }
   if (compareMode.value === 'chart' && exps.length > 0) {
     nextTick(() => drawCompareChart())
   }
@@ -499,7 +490,7 @@ function drawCompareChart() {
   canvas.style.height = height + 'px'
   ctx.scale(dpr, dpr)
 
-  const padding = { top: 30, right: 30, bottom: 50, left: 60 }
+  const padding = { top: 30, right: 30, bottom: 60, left: 60 }
   const plotW = width - padding.left - padding.right
   const plotH = height - padding.top - padding.bottom
 
@@ -507,26 +498,48 @@ function drawCompareChart() {
 
   ctx.clearRect(0, 0, width, height)
 
-  const metricKey = 'mse'
-  const data = selectedExperiments.value.map(exp => {
-    const vals: number[] = []
-    const n = 20
-    const startVal = (exp.result_metrics[metricKey] as number) || 0.01
-    for (let i = 0; i < n; i++) {
-      vals.push(startVal * Math.exp(-i / 8) + startVal * 0.1 * Math.random())
+  const metricKeys = ['mse', 'ssim', 'avg_mse', 'avg_ssim', 'depth_of_focus', 'max_exposure_latitude', 'process_window_area']
+  const availableMetrics: string[] = []
+  for (const key of metricKeys) {
+    const hasMetric = selectedExperiments.value.some(exp =>
+      exp.result_metrics[key] !== undefined && exp.result_metrics[key] !== null
+    )
+    if (hasMetric) {
+      availableMetrics.push(key)
     }
-    return vals
-  })
+  }
+
+  if (availableMetrics.length === 0) {
+    ctx.fillStyle = '#909399'
+    ctx.font = '13px sans-serif'
+    ctx.textAlign = 'center'
+    ctx.fillText('暂无指标数据可对比', width / 2, height / 2)
+    return
+  }
+
+  const nMetrics = availableMetrics.length
+  const nExps = selectedExperiments.value.length
+  const groupWidth = plotW / nMetrics
+  const barWidth = Math.min(groupWidth * 0.7 / nExps, 40)
+  const groupGap = groupWidth * 0.15
 
   let maxVal = 0
   let minVal = Infinity
-  data.forEach(d => d.forEach(v => {
-    if (v > maxVal) maxVal = v
-    if (v < minVal) minVal = v
-  }))
-  if (maxVal === minVal) { maxVal = minVal + 1 }
+  for (const key of availableMetrics) {
+    for (const exp of selectedExperiments.value) {
+      const v = exp.result_metrics[key]
+      if (typeof v === 'number' && isFinite(v)) {
+        if (v > maxVal) maxVal = v
+        if (v < minVal) minVal = v
+      }
+    }
+  }
 
-  const xScale = (i: number) => padding.left + (i / (data[0].length - 1)) * plotW
+  if (maxVal === minVal) { maxVal = minVal + 1 }
+  const valueRange = maxVal - minVal
+  minVal = Math.max(0, minVal - valueRange * 0.1)
+  maxVal = maxVal + valueRange * 0.1
+
   const yScale = (v: number) => padding.top + plotH - ((v - minVal) / (maxVal - minVal)) * plotH
 
   ctx.strokeStyle = '#e4e7ed'
@@ -547,57 +560,59 @@ function drawCompareChart() {
   }
 
   ctx.strokeStyle = '#909399'
+  ctx.lineWidth = 1
   ctx.strokeRect(padding.left, padding.top, plotW, plotH)
 
-  data.forEach((series, idx) => {
-    ctx.strokeStyle = colors[idx % colors.length]
-    ctx.lineWidth = 2
-    ctx.beginPath()
-    series.forEach((v, i) => {
-      const x = xScale(i)
-      const y = yScale(v)
-      if (i === 0) ctx.moveTo(x, y)
-      else ctx.lineTo(x, y)
-    })
-    ctx.stroke()
+  availableMetrics.forEach((metricKey, mi) => {
+    const groupX = padding.left + mi * groupWidth + groupGap / 2
 
-    series.forEach((v, i) => {
-      const x = xScale(i)
-      const y = yScale(v)
-      ctx.fillStyle = colors[idx % colors.length]
-      ctx.beginPath()
-      ctx.arc(x, y, 3, 0, Math.PI * 2)
-      ctx.fill()
+    selectedExperiments.value.forEach((exp, ei) => {
+      const v = exp.result_metrics[metricKey]
+      if (typeof v !== 'number' || !isFinite(v)) return
+
+      const barX = groupX + ei * barWidth + (groupWidth - groupGap - nExps * barWidth) / 2
+      const barY = yScale(v)
+      const barH = padding.top + plotH - barY
+
+      ctx.fillStyle = colors[ei % colors.length]
+      ctx.fillRect(barX, barY, barWidth, barH)
+
+      ctx.strokeStyle = colors[ei % colors.length]
+      ctx.lineWidth = 1
+      ctx.strokeRect(barX, barY, barWidth, barH)
     })
+
+    ctx.fillStyle = '#606266'
+    ctx.font = '11px sans-serif'
+    ctx.textAlign = 'center'
+    const labelX = groupX + (groupWidth - groupGap) / 2
+    ctx.save()
+    ctx.translate(labelX, padding.top + plotH + 16)
+    ctx.rotate(-Math.PI / 6)
+    ctx.fillText(metricLabel(metricKey), 0, 0)
+    ctx.restore()
   })
 
-  ctx.fillStyle = '#606266'
+  ctx.fillStyle = '#303133'
   ctx.font = '12px sans-serif'
   ctx.textAlign = 'center'
-  ctx.fillText('迭代次数', padding.left + plotW / 2, height - 12)
-
-  ctx.save()
-  ctx.translate(18, padding.top + plotH / 2)
-  ctx.rotate(-Math.PI / 2)
-  ctx.textAlign = 'center'
-  ctx.fillText('MSE (损失值)', 0, 0)
-  ctx.restore()
+  ctx.fillText('指标对比', padding.left + plotW / 2, height - 4)
 
   const legendY = 10
-  const legendX = width - padding.right - 100
+  const legendX = width - padding.right - 120
   selectedExperiments.value.forEach((exp, idx) => {
     const y = legendY + idx * 20
     ctx.fillStyle = colors[idx % colors.length]
-    ctx.fillRect(legendX, y, 16, 3)
+    ctx.fillRect(legendX, y, 16, 12)
     ctx.fillStyle = '#606266'
     ctx.font = '11px sans-serif'
     ctx.textAlign = 'left'
-    ctx.fillText(exp.name.slice(0, 12), legendX + 22, y + 6)
+    ctx.fillText(exp.name.slice(0, 16), legendX + 22, y + 10)
   })
 }
 
 onMounted(() => {
-  generateMockExperiments()
+  refreshList()
 })
 </script>
 

@@ -157,11 +157,11 @@
             stripe
           >
             <el-table-column type="index" label="#" width="50" align="center" />
-            <el-table-column prop="name" label="Cell 名称" min-width="160">
+            <el-table-column prop="cell_name" label="Cell 名称" min-width="160">
               <template #default="{ row }">
                 <div class="cell-name">
                   <el-icon size="14" color="#409eff"><Grid /></el-icon>
-                  <span>{{ row.name || 'Unknown' }}</span>
+                  <span>{{ row.cell_name || 'Unknown' }}</span>
                 </div>
               </template>
             </el-table-column>
@@ -175,32 +175,32 @@
             <el-table-column label="进度" min-width="140">
               <template #default="{ row }">
                 <el-progress
-                  :percentage="Math.round(row.progress || 0)"
+                  :percentage="subTaskProgress(row)"
                   :stroke-width="6"
                   :status="progressStatus(row.status)"
                   :text-inside="false"
                 />
               </template>
             </el-table-column>
-            <el-table-column prop="mse" label="MSE" width="100" align="center">
+            <el-table-column label="MSE" width="100" align="center">
               <template #default="{ row }">
-                <span v-if="row.mse !== undefined" :class="metricClass(row.mse)">
-                  {{ formatNumber(row.mse) }}
+                <span v-if="row.final_mse !== undefined" :class="metricClass(row.final_mse)">
+                  {{ formatNumber(row.final_mse) }}
                 </span>
                 <span v-else>—</span>
               </template>
             </el-table-column>
-            <el-table-column prop="ssim" label="SSIM" width="100" align="center">
+            <el-table-column label="SSIM" width="100" align="center">
               <template #default="{ row }">
-                <span v-if="row.ssim !== undefined" :class="ssimClass(row.ssim)">
-                  {{ formatNumber(row.ssim) }}
+                <span v-if="row.final_ssim !== undefined" :class="ssimClass(row.final_ssim)">
+                  {{ formatNumber(row.final_ssim) }}
                 </span>
                 <span v-else>—</span>
               </template>
             </el-table-column>
-            <el-table-column prop="duration" label="耗时" width="90" align="center">
+            <el-table-column label="耗时" width="90" align="center">
               <template #default="{ row }">
-                {{ row.duration ? formatDuration(row.duration) : '—' }}
+                {{ row.elapsed_sec ? formatDuration(row.elapsed_sec) : '—' }}
               </template>
             </el-table-column>
             <el-table-column label="操作" width="80" align="center" fixed="right">
@@ -224,7 +224,7 @@
             <div class="title">
               <el-icon size="18" color="#409eff"><DataBoard /></el-icon>
               <span>任务详情</span>
-              <el-tag size="small">{{ selectedTask.name }}</el-tag>
+              <el-tag size="small">{{ selectedTask.cell_name }}</el-tag>
             </div>
             <el-button type="primary" link size="small" @click="selectedTask = null">
               关闭
@@ -237,20 +237,32 @@
                 {{ statusLabel(selectedTask.status) }}
               </el-tag>
             </el-descriptions-item>
-            <el-descriptions-item label="进度">
-              {{ Math.round(selectedTask.progress || 0) }}%
+            <el-descriptions-item label="迭代次数" v-if="selectedTask.iterations !== undefined">
+              {{ selectedTask.iterations }}
             </el-descriptions-item>
-            <el-descriptions-item label="MSE" v-if="selectedTask.mse !== undefined">
-              <span :class="metricClass(selectedTask.mse)">{{ formatNumber(selectedTask.mse) }}</span>
+            <el-descriptions-item label="初始 MSE" v-if="selectedTask.initial_mse !== undefined">
+              <span :class="metricClass(selectedTask.initial_mse)">{{ formatNumber(selectedTask.initial_mse) }}</span>
             </el-descriptions-item>
-            <el-descriptions-item label="SSIM" v-if="selectedTask.ssim !== undefined">
-              <span :class="ssimClass(selectedTask.ssim)">{{ formatNumber(selectedTask.ssim) }}</span>
+            <el-descriptions-item label="最终 MSE" v-if="selectedTask.final_mse !== undefined">
+              <span :class="metricClass(selectedTask.final_mse)">{{ formatNumber(selectedTask.final_mse) }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="初始 SSIM" v-if="selectedTask.initial_ssim !== undefined">
+              <span :class="ssimClass(selectedTask.initial_ssim)">{{ formatNumber(selectedTask.initial_ssim) }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="最终 SSIM" v-if="selectedTask.final_ssim !== undefined">
+              <span :class="ssimClass(selectedTask.final_ssim)">{{ formatNumber(selectedTask.final_ssim) }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="耗时" v-if="selectedTask.elapsed_sec !== undefined">
+              {{ formatDuration(selectedTask.elapsed_sec) }}
+            </el-descriptions-item>
+            <el-descriptions-item label="是否收敛" v-if="selectedTask.converged !== undefined">
+              {{ selectedTask.converged ? '是' : '否' }}
             </el-descriptions-item>
           </el-descriptions>
 
           <el-alert
-            v-if="selectedTask.error"
-            :title="selectedTask.error"
+            v-if="selectedTask.error_message"
+            :title="selectedTask.error_message"
             type="error"
             :closable="false"
             show-icon
@@ -273,7 +285,7 @@ import { useConfigStore } from '@/stores/config'
 import { workflowApi, taskApi } from '@/api'
 import taskWs from '@/api/websocket'
 import GdsUploader from './GdsUploader.vue'
-import type { BatchOptimizationConfig, WorkflowTask } from '@/types/workflow'
+import type { BatchOptimizationConfig, WorkflowTask, BatchSubTask, TaskResultResponse } from '@/types/workflow'
 
 const configStore = useConfigStore()
 
@@ -296,7 +308,7 @@ const batchConfig = reactive({
   output_dir_value: '',
 })
 
-const queueTasks = ref<any[]>([])
+const queueTasks = ref<BatchSubTask[]>([])
 
 const stats = computed(() => {
   const result = { pending: 0, running: 0, completed: 0, failed: 0 }
@@ -315,7 +327,12 @@ const completedCount = computed(() => stats.value.completed + stats.value.failed
 
 const overallProgress = computed(() => {
   if (totalTasks.value === 0) return 0
-  const totalProgress = queueTasks.value.reduce((sum, t) => sum + (t.progress || 0), 0)
+  const totalProgress = queueTasks.value.reduce((sum, t) => {
+    let p = 0
+    if (t.status === 'completed' || t.status === 'failed') p = 100
+    else if (t.status === 'running') p = 50
+    return sum + p
+  }, 0)
   return totalProgress / totalTasks.value
 })
 
@@ -331,26 +348,7 @@ let pollTimer: ReturnType<typeof setInterval> | null = null
 
 function onGdsSelect(file: any, layer: number, datatype: number) {
   selectedLayer.value = layer
-  generateMockQueue(file.filename)
-}
-
-function generateMockQueue(filename: string) {
-  const mockCells = [
-    'AND2_X1', 'NAND2_X1', 'NOR2_X1', 'INV_X1',
-    'DFF_X1', 'MUX2_X1', 'XOR2_X1', 'AOI21_X1',
-    'OAI21_X1', 'ADD_HALF', 'ADD_FULL', 'COMP_X1',
-  ]
-  queueTasks.value = mockCells.map((name, i) => ({
-    id: `${filename.replace('.gds', '')}_${name}`,
-    name,
-    status: i < 3 ? 'running' : i < 6 ? 'completed' : 'pending',
-    progress: i < 3 ? 20 + i * 25 : i < 6 ? 100 : 0,
-    mse: i < 6 ? 0.001 + Math.random() * 0.01 : undefined,
-    ssim: i < 6 ? 0.9 + Math.random() * 0.09 : undefined,
-    duration: i < 6 ? 30 + Math.random() * 60 : undefined,
-    error: i === 4 ? '收敛失败' : undefined,
-  }))
-  queueTasks.value[4].status = 'failed'
+  queueTasks.value = []
 }
 
 async function handleRun() {
@@ -418,14 +416,29 @@ async function refreshQueue() {
   if (!currentBatchId.value) return
   loading.value = true
   try {
-    const res: any = await taskApi.getStatus(currentBatchId.value)
-    if (res.status === 'completed' || res.status === 'failed') {
+    const statusRes: WorkflowTask = await taskApi.getStatus(currentBatchId.value)
+    if (statusRes.status === 'completed' || statusRes.status === 'failed') {
+      try {
+        const resultRes: TaskResultResponse = await taskApi.getResult(currentBatchId.value)
+        const detail = resultRes.result_detail
+        if (detail && detail.sub_tasks && Array.isArray(detail.sub_tasks)) {
+          queueTasks.value = detail.sub_tasks
+        }
+      } catch (e) {
+        console.error('获取子任务明细失败:', e)
+      }
       stopPolling()
     }
   } catch (e) {
   } finally {
     loading.value = false
   }
+}
+
+function subTaskProgress(task: BatchSubTask): number {
+  if (task.status === 'completed' || task.status === 'failed') return 100
+  if (task.status === 'running') return 50
+  return 0
 }
 
 function viewTask(task: any) {
@@ -494,9 +507,6 @@ function formatDuration(seconds: number): string {
 }
 
 onMounted(() => {
-  if (queueTasks.value.length === 0) {
-    generateMockQueue('sample.gds')
-  }
 })
 
 onUnmounted(() => {

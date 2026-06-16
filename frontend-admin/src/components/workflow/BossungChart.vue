@@ -189,7 +189,7 @@ import {
 import { useConfigStore } from '@/stores/config'
 import { workflowApi, taskApi } from '@/api'
 import taskWs from '@/api/websocket'
-import type { ProcessWindowConfig, ProcessWindowMetrics, WorkflowTask } from '@/types/workflow'
+import type { ProcessWindowConfig, ProcessWindowMetrics, WorkflowTask, TaskResultResponse } from '@/types/workflow'
 
 const configStore = useConfigStore()
 
@@ -348,9 +348,10 @@ async function pollTaskStatus() {
 async function fetchTaskResult() {
   if (!taskId.value) return
   try {
-    const res: any = await taskApi.getResult(taskId.value)
-    if (res.result) {
-      generateBossungData()
+    const res: TaskResultResponse = await taskApi.getResult(taskId.value)
+    const detail = res.result_detail
+    if (detail && detail.focus_values && detail.dose_values && detail.cd_matrix) {
+      parseBossungData(detail)
       hasData.value = true
       nextTick(() => drawBossungChart())
     }
@@ -359,24 +360,22 @@ async function fetchTaskResult() {
   }
 }
 
-function generateBossungData() {
-  const nFocus = pwConfig.focus_range[2]
-  const nDose = pwConfig.dose_range[2]
+function parseBossungData(detail: Record<string, any>) {
+  const focusValues: number[] = detail.focus_values || []
+  const doseValues: number[] = detail.dose_values || []
+  const cdMatrix: number[][] = detail.cd_matrix || []
+  const cdTolerance = pwConfig.cd_tolerance
+  const nominalCd = detail.nominal_cd || (cdMatrix.length > 0 && cdMatrix[0].length > 0 ? cdMatrix[0][Math.floor(cdMatrix[0].length / 2)] : 45)
+
   const data: any[][] = []
-
-  for (let i = 0; i < nFocus; i++) {
+  for (let i = 0; i < focusValues.length; i++) {
     const row: any[] = []
-    const focus = pwConfig.focus_range[0] + (pwConfig.focus_range[1] - pwConfig.focus_range[0]) * i / (nFocus - 1)
-    for (let j = 0; j < nDose; j++) {
-      const dose = pwConfig.dose_range[0] + (pwConfig.dose_range[1] - pwConfig.dose_range[0]) * j / (nDose - 1)
-
-      const focusFactor = 1 - Math.abs(focus) / 200
-      const doseFactor = dose
-      const cd = 45 * (0.8 + 0.4 * doseFactor) * (0.7 + 0.3 * focusFactor)
-      const nominalCd = 45
-      const cdDiff = Math.abs(cd - nominalCd) / nominalCd
-      const valid = cdDiff <= pwConfig.cd_tolerance
-
+    const focus = focusValues[i]
+    for (let j = 0; j < doseValues.length; j++) {
+      const dose = doseValues[j]
+      const cd = cdMatrix[i]?.[j] ?? 0
+      const cdDiff = nominalCd > 0 ? Math.abs(cd - nominalCd) / nominalCd : 0
+      const valid = cdDiff <= cdTolerance
       row.push({
         focus,
         dose,

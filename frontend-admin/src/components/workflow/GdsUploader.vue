@@ -120,7 +120,7 @@
           <el-select v-model="selectedDatatype" placeholder="自动 (0)" style="width: 100%">
             <el-option :value="0" label="0 - 默认" />
             <el-option
-              v-for="layer in selectedGds.layers.filter(l => l.layer === selectedLayer)"
+              v-for="layer in (selectedGds.layers || []).filter(l => l.layer === selectedLayer)"
               :key="layer.datatype"
               :value="layer.datatype"
               :label="String(layer.datatype)"
@@ -201,6 +201,7 @@ const emit = defineEmits<{
 const uploading = ref(false)
 const uploadPercent = ref(0)
 const loading = ref(false)
+const loadingLayers = ref(false)
 const selectedFile = ref<File | null>(null)
 const gdsFiles = ref<GdsFileInfo[]>([])
 const selectedGds = ref<GdsFileInfo | null>(null)
@@ -213,10 +214,11 @@ onMounted(() => {
 })
 
 watch(() => props.modelValue, (val) => {
-  if (val && selectedGds.value?.filename !== val) {
-    const found = gdsFiles.value.find(f => f.filename === val)
+  if (val && selectedGds.value?.file_id !== val) {
+    const found = gdsFiles.value.find(f => f.file_id === val)
     if (found) {
       selectedGds.value = found
+      loadGdsLayers(found)
     }
   }
 })
@@ -243,6 +245,20 @@ function refreshFiles() {
   loadGdsFiles()
 }
 
+async function loadGdsLayers(file: GdsFileInfo) {
+  if (file.layers && file.layers.length > 0) return
+  loadingLayers.value = true
+  try {
+    const res = await gdsApi.getLayers(file.file_id)
+    file.layers = res.layers
+    file.cells = res.cells
+  } catch (e) {
+    console.error('加载 GDS 层信息失败:', e)
+  } finally {
+    loadingLayers.value = false
+  }
+}
+
 function handleFileChange(file: any) {
   if (!file.raw) return
   selectedFile.value = file.raw
@@ -253,15 +269,13 @@ async function doUpload(file: File) {
   uploading.value = true
   uploadPercent.value = 10
   try {
-    const res: any = await gdsApi.upload(file)
+    const uploadedFile = await gdsApi.upload(file)
     uploadPercent.value = 100
-    ElMessage.success(`上传成功：${res.filename || file.name}`)
+    ElMessage.success(`上传成功：${uploadedFile.filename || file.name}`)
     await loadGdsFiles()
-    if (res.filename) {
-      const found = gdsFiles.value.find(f => f.filename === res.filename)
-      if (found) {
-        selectGdsFile(found)
-      }
+    const found = gdsFiles.value.find(f => f.file_id === uploadedFile.file_id)
+    if (found) {
+      selectGdsFile(found)
     }
   } catch (e: any) {
     ElMessage.error(e?.message || '上传失败')
@@ -277,11 +291,13 @@ function clearFile() {
 
 function selectGdsFile(file: GdsFileInfo) {
   selectedGds.value = file
-  emit('update:modelValue', file.filename)
-  if (file.layers?.length && selectedLayer.value === null) {
-    selectedLayer.value = file.layers[0].layer
-  }
-  emit('select', file, selectedLayer.value || 0, selectedDatatype.value)
+  emit('update:modelValue', file.file_id)
+  loadGdsLayers(file).then(() => {
+    if (file.layers?.length && selectedLayer.value === null) {
+      selectedLayer.value = file.layers[0].layer
+    }
+    emit('select', file, selectedLayer.value || 0, selectedDatatype.value)
+  })
 }
 
 async function deleteGdsFile(file: GdsFileInfo) {
@@ -291,10 +307,10 @@ async function deleteGdsFile(file: GdsFileInfo) {
       confirmButtonText: '删除',
       cancelButtonText: '取消',
     })
-    await gdsApi.delete(file.filename)
+    await gdsApi.delete(file.file_id)
     ElMessage.success('删除成功')
     await loadGdsFiles()
-    if (selectedGds.value?.filename === file.filename) {
+    if (selectedGds.value?.file_id === file.file_id) {
       selectedGds.value = null
       emit('update:modelValue', '')
     }

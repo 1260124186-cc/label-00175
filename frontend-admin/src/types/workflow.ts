@@ -149,12 +149,20 @@ export interface GdsLayerInfo {
 }
 
 export interface GdsFileInfo {
+  file_id: string
   filename: string
-  path: string
   size: number
   uploaded_at: number
+  layers?: GdsLayerInfo[]
+  cells?: string[]
+}
+
+export interface GdsLayersResponse {
+  file_id: string
   layers: GdsLayerInfo[]
   cells: string[]
+  layer_count: number
+  cell_count: number
 }
 
 export interface BossungDataPoint {
@@ -163,6 +171,31 @@ export interface BossungDataPoint {
   cd: number
   epe?: number
   valid: boolean
+}
+
+export interface ProcessWindowDetail {
+  focus_values?: number[]
+  dose_values?: number[]
+  cd_matrix?: number[][]
+  cd_error_matrix?: number[][]
+  epe_matrix?: number[][]
+  mse_matrix?: number[][]
+  ssim_matrix?: number[][]
+  printability_mask?: boolean[][]
+  best_focus?: number
+  best_dose?: number
+  nominal_cd?: number
+  ellipse_approx?: {
+    center: [number, number]
+    width: number
+    height: number
+    angle: number
+  }
+  rect_approx?: {
+    center: [number, number]
+    width: number
+    height: number
+  }
 }
 
 export interface ProcessWindowMetrics {
@@ -175,6 +208,25 @@ export interface ProcessWindowMetrics {
   dose_points?: number
 }
 
+export interface BatchSubTask {
+  task_id?: string
+  cell_name: string
+  status: TaskStatus
+  initial_mse?: number
+  final_mse?: number
+  initial_ssim?: number
+  final_ssim?: number
+  iterations?: number
+  converged?: boolean
+  elapsed_sec?: number
+  error_message?: string
+}
+
+export interface BatchResultDetail {
+  sub_tasks?: BatchSubTask[]
+  total_sub_tasks?: number
+}
+
 export interface BatchTaskSummary {
   total: number
   succeeded: number
@@ -183,6 +235,17 @@ export interface BatchTaskSummary {
   avg_mse?: number
   avg_ssim?: number
   elapsed_seconds?: number
+}
+
+export interface TaskResultResponse {
+  task_id: string
+  task_type?: WorkflowType
+  status: TaskStatus
+  result?: Record<string, any>
+  result_summary?: Record<string, any>
+  result_detail?: Record<string, any>
+  payload?: Record<string, any>
+  error?: string
 }
 
 export interface ExperimentRecord {

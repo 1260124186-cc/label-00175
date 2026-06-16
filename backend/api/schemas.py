@@ -395,3 +395,80 @@ class BatchOptimizationRequest(BaseModel):
     save_optimized_masks: bool = Field(True, description="是否保存每个 cell 优化后的掩模")
     output_dir: Optional[str] = Field(None, description="输出目录")
     stop_on_first_failure: bool = Field(False, description="是否遇到第一个失败就停止整批")
+
+
+class GdsLayerInfo(BaseModel):
+    layer: int
+    datatype: int = 0
+
+
+class GdsFileInfo(BaseModel):
+    file_id: str
+    filename: str
+    size: int
+    uploaded_at: float
+
+
+class GdsUploadResponse(BaseModel):
+    success: bool = True
+    message: str = "上传成功"
+    file: Optional[GdsFileInfo] = None
+
+
+class GdsListResponse(BaseModel):
+    count: int
+    files: List[GdsFileInfo]
+
+
+class GdsLayersResponse(BaseModel):
+    file_id: str
+    layers: List[GdsLayerInfo]
+    cells: List[str]
+    layer_count: int
+    cell_count: int
+
+
+class BatchSubTask(BaseModel):
+    task_id: Optional[str] = None
+    cell_name: str
+    status: str
+    initial_mse: Optional[float] = None
+    final_mse: Optional[float] = None
+    initial_ssim: Optional[float] = None
+    final_ssim: Optional[float] = None
+    iterations: Optional[int] = None
+    converged: Optional[bool] = None
+    elapsed_sec: Optional[float] = None
+    error_message: Optional[str] = None
+
+
+class ProcessWindowDetail(BaseModel):
+    focus_values: Optional[List[float]] = None
+    dose_values: Optional[List[float]] = None
+    cd_matrix: Optional[List[List[float]]] = None
+    cd_error_matrix: Optional[List[List[float]]] = None
+    epe_matrix: Optional[List[List[float]]] = None
+    mse_matrix: Optional[List[List[float]]] = None
+    ssim_matrix: Optional[List[List[float]]] = None
+    printability_mask: Optional[List[List[bool]]] = None
+    best_focus: Optional[float] = None
+    best_dose: Optional[float] = None
+    nominal_cd: Optional[float] = None
+    ellipse_approx: Optional[Dict[str, Any]] = None
+    rect_approx: Optional[Dict[str, Any]] = None
+
+
+class BatchResultDetail(BaseModel):
+    sub_tasks: Optional[List[BatchSubTask]] = None
+    total_sub_tasks: Optional[int] = None
+
+
+class TaskResultResponse(BaseModel):
+    task_id: str
+    task_type: Optional[str] = None
+    status: str
+    result: Optional[Dict[str, Any]] = None
+    result_summary: Optional[Dict[str, Any]] = None
+    result_detail: Optional[Dict[str, Any]] = None
+    payload: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None

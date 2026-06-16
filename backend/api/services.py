@@ -26,6 +26,9 @@ API_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 TASK_RESULTS_DIR = Path(__file__).resolve().parent / "task_results"
 TASK_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+GDS_UPLOAD_DIR = Path(__file__).resolve().parent / "gds_uploads"
+GDS_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
 RUNNING_TASKS: Dict[str, Dict[str, Any]] = {}
 
 _ws_event_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -218,13 +221,15 @@ def _start_task(task_id: str):
     _push_stage_change_ws(task_id, "running", "任务开始执行")
 
 
-def _finish_task(task_id: str, result: Any = None, summary: Optional[Dict[str, Any]] = None):
+def _finish_task(task_id: str, result: Any = None, summary: Optional[Dict[str, Any]] = None,
+                 detail: Optional[Dict[str, Any]] = None):
     task = RUNNING_TASKS.get(task_id)
     if task:
         task["status"] = "completed"
         task["progress"] = 100.0
         task["result"] = result
         task["result_summary"] = summary
+        task["result_detail"] = detail
         task["finished_at"] = time.time()
         _persist_task_result(task_id, task)
     _push_task_complete_ws(task_id, summary or {})
@@ -287,6 +292,8 @@ def _persist_task_result(task_id: str, task: Dict[str, Any]):
             "message": task.get("message"),
             "error": task.get("error"),
             "result_summary": task.get("result_summary"),
+            "result_detail": task.get("result_detail"),
+            "payload": task.get("payload"),
             "created_at": task.get("created_at"),
             "started_at": task.get("started_at"),
             "finished_at": task.get("finished_at"),
@@ -865,6 +872,7 @@ def _execute_process_window(task_id: str):
 
         _set_progress(task_id, 85, "整理工艺窗口分析结果")
         summary = {}
+        detail = {}
         try:
             if isinstance(result, dict):
                 pw_metrics = result.get("pw_metrics")
@@ -877,6 +885,47 @@ def _execute_process_window(task_id: str):
                                 summary[k] = float(v)
                             except (TypeError, ValueError):
                                 pass
+                    for k in ["best_focus", "best_dose", "nominal_cd", "cd_variation",
+                              "epe_nominal", "mse_nominal", "ssim_nominal"]:
+                        v = getattr(pw_metrics, k, None)
+                        if v is not None:
+                            try:
+                                detail[k] = float(v)
+                            except (TypeError, ValueError):
+                                pass
+                    try:
+                        detail["ellipse_approx"] = {
+                            "center": [float(v) for v in pw_metrics.ellipse_approx.center],
+                            "width": float(pw_metrics.ellipse_approx.width),
+                            "height": float(pw_metrics.ellipse_approx.height),
+                            "angle": float(pw_metrics.ellipse_approx.angle),
+                        }
+                    except Exception:
+                        pass
+                    try:
+                        detail["rect_approx"] = {
+                            "center": [float(v) for v in pw_metrics.rect_approx.center],
+                            "width": float(pw_metrics.rect_approx.width),
+                            "height": float(pw_metrics.rect_approx.height),
+                        }
+                    except Exception:
+                        pass
+                scan_result = result.get("scan_result")
+                if scan_result is not None:
+                    import numpy as np
+                    detail["focus_values"] = [float(v) for v in scan_result.focus]
+                    detail["dose_values"] = [float(v) for v in scan_result.dose]
+                    detail["cd_matrix"] = scan_result.cd.tolist() if hasattr(scan_result.cd, "tolist") else np.array(scan_result.cd).tolist()
+                    detail["cd_error_matrix"] = scan_result.cd_error.tolist() if hasattr(scan_result.cd_error, "tolist") else np.array(scan_result.cd_error).tolist()
+                    detail["epe_matrix"] = scan_result.epe.tolist() if hasattr(scan_result.epe, "tolist") else np.array(scan_result.epe).tolist()
+                    detail["mse_matrix"] = scan_result.mse.tolist() if hasattr(scan_result.mse, "tolist") else np.array(scan_result.mse).tolist()
+                    detail["ssim_matrix"] = scan_result.ssim.tolist() if hasattr(scan_result.ssim, "tolist") else np.array(scan_result.ssim).tolist()
+                    detail["focus_points"] = len(scan_result.focus)
+                    detail["dose_points"] = len(scan_result.dose)
+                printability = result.get("printability")
+                if printability is not None:
+                    import numpy as np
+                    detail["printability_mask"] = printability.tolist() if hasattr(printability, "tolist") else np.array(printability).tolist()
                 for k in ["focus_points", "dose_points"]:
                     v = result.get(k)
                     if v is not None:
@@ -887,7 +936,7 @@ def _execute_process_window(task_id: str):
         except Exception as e:
             logger.warning(f"工艺窗口结果摘要提取失败: {e}")
 
-        _finish_task(task_id, result={"task_id": task_id, **summary}, summary=summary)
+        _finish_task(task_id, result={"task_id": task_id, **summary}, summary=summary, detail=detail)
     except Exception as e:
         logger.exception(f"工艺窗口任务失败: {task_id}")
         _fail_task(task_id, f"{type(e).__name__}: {e}")
@@ -914,6 +963,11 @@ def _execute_batch(task_id: str):
         source = payload.get("source")
         if not source:
             raise ValueError("批处理必须提供 source 参数")
+        
+        gds_path = GDS_UPLOAD_DIR / source
+        if gds_path.exists() and gds_path.is_file():
+            source = str(gds_path)
+        
         layer = payload.get("layer", None)
         if layer is not None:
             layer = int(layer)
@@ -958,6 +1012,7 @@ def _execute_batch(task_id: str):
 
         _set_progress(task_id, 85, "整理批处理结果")
         summary = {}
+        detail = {}
         try:
             summary["total"] = int(getattr(summary_obj, "total", 0) or 0)
             summary["succeeded"] = int(getattr(summary_obj, "succeeded", 0) or 0)
@@ -972,10 +1027,30 @@ def _execute_batch(task_id: str):
             elapsed = getattr(summary_obj, "elapsed_seconds", None)
             if elapsed is not None:
                 summary["elapsed_seconds"] = float(elapsed)
+            if task_results:
+                sub_tasks = []
+                for tr in task_results:
+                    sub_task = {}
+                    for attr in ["cell_name", "status", "error_message", "iterations",
+                                 "converged", "elapsed_sec"]:
+                        v = getattr(tr, attr, None)
+                        if v is not None:
+                            sub_task[attr] = v
+                    for attr in ["initial_mse", "final_mse", "initial_ssim", "final_ssim"]:
+                        v = getattr(tr, attr, None)
+                        if v is not None:
+                            try:
+                                sub_task[attr] = float(v)
+                            except (TypeError, ValueError):
+                                pass
+                    sub_task["task_id"] = getattr(tr, "task_id", None) or sub_task.get("cell_name")
+                    sub_tasks.append(sub_task)
+                detail["sub_tasks"] = sub_tasks
+                detail["total_sub_tasks"] = len(sub_tasks)
         except Exception as e:
             logger.warning(f"批处理结果摘要提取失败: {e}")
 
-        _finish_task(task_id, result={"task_id": task_id, **summary}, summary=summary)
+        _finish_task(task_id, result={"task_id": task_id, **summary}, summary=summary, detail=detail)
     except Exception as e:
         logger.exception(f"批处理任务失败: {task_id}")
         _fail_task(task_id, f"{type(e).__name__}: {e}")
@@ -1017,7 +1092,16 @@ def get_task_result(task_id: str) -> Dict[str, Any]:
             try:
                 with open(persisted, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    return {"task_id": task_id, "status": data.get("status"), "result": data.get("result_summary")}
+                    return {
+                        "task_id": task_id,
+                        "task_type": data.get("task_type"),
+                        "status": data.get("status"),
+                        "result": data.get("result_summary"),
+                        "result_summary": data.get("result_summary"),
+                        "result_detail": data.get("result_detail"),
+                        "payload": data.get("payload"),
+                        "error": data.get("error"),
+                    }
             except Exception as e:
                 logger.warning(f"读取持久化任务结果失败 {task_id}: {e}")
         raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
@@ -1029,6 +1113,8 @@ def get_task_result(task_id: str) -> Dict[str, Any]:
         "status": task.get("status"),
         "result": task.get("result"),
         "result_summary": task.get("result_summary"),
+        "result_detail": task.get("result_detail"),
+        "payload": task.get("payload"),
         "error": task.get("error"),
     }
 
@@ -1103,3 +1189,96 @@ def list_tasks(task_type: Optional[str] = None, status: Optional[str] = None) ->
             logger.warning(f"读取持久化任务列表失败 {pf.name}: {e}")
     tasks.sort(key=lambda t: t.get("created_at") or 0.0, reverse=True)
     return {"count": len(tasks), "tasks": tasks}
+
+
+def upload_gds_file(file_bytes: bytes, filename: str) -> Dict[str, Any]:
+    safe_name = Path(filename).name
+    if not safe_name.lower().endswith((".gds", ".gdsii", ".oas", ".oasis")):
+        raise HTTPException(status_code=400, detail="仅支持 GDS/GDSII/OASIS 格式文件")
+    file_id = f"{int(time.time() * 1000)}_{safe_name}"
+    dest = GDS_UPLOAD_DIR / file_id
+    with open(dest, "wb") as f:
+        f.write(file_bytes)
+    return {
+        "file_id": file_id,
+        "filename": safe_name,
+        "size": len(file_bytes),
+        "uploaded_at": time.time(),
+    }
+
+
+def list_gds_files() -> Dict[str, Any]:
+    files = []
+    for pf in GDS_UPLOAD_DIR.glob("*"):
+        if pf.is_file():
+            st = pf.stat()
+            files.append({
+                "file_id": pf.name,
+                "filename": pf.name.split("_", 1)[1] if "_" in pf.name else pf.name,
+                "size": st.st_size,
+                "uploaded_at": st.st_mtime,
+            })
+    files.sort(key=lambda f: f.get("uploaded_at") or 0.0, reverse=True)
+    return {"count": len(files), "files": files}
+
+
+def get_gds_layers(file_id: str) -> Dict[str, Any]:
+    fpath = GDS_UPLOAD_DIR / file_id
+    if not fpath.exists():
+        raise HTTPException(status_code=404, detail=f"GDS 文件不存在: {file_id}")
+    try:
+        add_backend_to_path()
+        from utils.data_io import _read_gds_polygons
+        layers_set = set()
+        cells_set = set()
+        try:
+            import gdstk
+            lib = gdstk.read_gds(str(fpath))
+            for cell in lib.cells:
+                cells_set.add(cell.name)
+                for poly in cell.polygons:
+                    layers_set.add((int(poly.layer), int(poly.datatype)))
+                for ref in cell.references:
+                    if hasattr(ref, "ref_cell") and hasattr(ref.ref_cell, "name"):
+                        pass
+        except Exception:
+            try:
+                import gdspy
+                lib = gdspy.GdsLibrary(infile=str(fpath))
+                for cell_name, cell in lib.cells.items():
+                    cells_set.add(cell_name)
+                    for poly in cell.polygons:
+                        layers_set.add((int(poly.layers[0]), int(poly.datatypes[0])))
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"无法读取 GDS 文件: {e}")
+        layers = [{"layer": l, "datatype": d} for l, d in sorted(layers_set)]
+        cells = sorted(cells_set)
+        return {
+            "file_id": file_id,
+            "layers": layers,
+            "cells": cells,
+            "layer_count": len(layers),
+            "cell_count": len(cells),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"读取 GDS 层信息失败: {e}")
+
+
+def delete_gds_file(file_id: str) -> Dict[str, Any]:
+    fpath = GDS_UPLOAD_DIR / file_id
+    if not fpath.exists():
+        raise HTTPException(status_code=404, detail=f"GDS 文件不存在: {file_id}")
+    try:
+        fpath.unlink()
+        return {"success": True, "file_id": file_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"删除 GDS 文件失败: {e}")
+
+
+def get_gds_file_path(file_id: str) -> Path:
+    fpath = GDS_UPLOAD_DIR / file_id
+    if not fpath.exists():
+        raise HTTPException(status_code=404, detail=f"GDS 文件不存在: {file_id}")
+    return fpath
