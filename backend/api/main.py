@@ -17,6 +17,7 @@ from routers.config import router as config_router
 from routers.simulation import router as simulation_router
 from routers.workflows import router as workflows_router
 from routers.tasks import router as tasks_router
+from routers.websocket import router as websocket_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,6 +43,7 @@ app.include_router(config_router)
 app.include_router(simulation_router)
 app.include_router(workflows_router)
 app.include_router(tasks_router)
+app.include_router(websocket_router)
 
 
 @app.get("/", summary="根路径 - 跳转到 API 文档")

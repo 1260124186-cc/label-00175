@@ -245,6 +245,12 @@
               <span>任务详情</span>
               <code class="task-id-small">{{ currentTask.task_id }}</code>
             </div>
+            <div class="ws-status" v-if="['starting', 'running', 'pending'].includes(currentTask.status)">
+              <el-tag :type="wsConnected ? 'success' : 'info'" size="small" effect="light">
+                <el-icon size="12"><Connection /></el-icon>
+                {{ wsConnected ? '实时连接' : '连接中...' }}
+              </el-tag>
+            </div>
           </div>
 
           <el-descriptions :column="2" border size="small" class="desc-base">
@@ -263,7 +269,35 @@
                 :status="progressStatus(currentTask.status)"
               />
             </el-descriptions-item>
+            <el-descriptions-item label="当前阶段" v-if="currentStage || currentTask.stage">
+              <span class="stage-label">{{ currentStage || currentTask.stage }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="迭代次数" v-if="currentIteration !== null || currentTask.iteration !== undefined">
+              <span class="iteration-label">
+                第 {{ currentIteration ?? currentTask.iteration }} 次
+              </span>
+            </el-descriptions-item>
+            <el-descriptions-item label="当前损失" v-if="currentLoss !== null || currentTask.current_loss !== undefined" :span="2">
+              <span class="loss-value">
+                {{ formatNumber(currentLoss ?? currentTask.current_loss) }}
+              </span>
+            </el-descriptions-item>
           </el-descriptions>
+
+          <!-- 掩模缩略图 -->
+          <div v-if="maskThumbnail" class="mask-thumbnail-section">
+            <div class="section-title">
+              <el-icon size="14"><Picture /></el-icon>
+              <span>当前掩模预览</span>
+            </div>
+            <div class="mask-thumbnail-wrapper">
+              <img
+                :src="'data:image/png;base64,' + maskThumbnail"
+                alt="Mask Thumbnail"
+                class="mask-thumbnail"
+              />
+            </div>
+          </div>
 
           <!-- 错误 -->
           <el-alert
@@ -309,14 +343,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import {
   VideoPlay, RefreshRight, List, DataBoard,
-  InfoFilled, Warning
+  InfoFilled, Warning, Connection, Picture
 } from '@element-plus/icons-vue'
 import { useConfigStore } from '@/stores/config'
 import { simulationApi } from '@/api'
+import taskWs, { type TaskProgressMessage } from '@/api/websocket'
 
 const configStore = useConfigStore()
 
@@ -324,6 +359,13 @@ const isRunning = ref(false)
 const taskLoading = ref(false)
 const taskList = ref<any[]>([])
 const currentTask = ref<any>(null)
+const wsConnected = ref(false)
+const currentLoss = ref<number | null>(null)
+const currentIteration = ref<number | null>(null)
+const currentStage = ref('')
+const maskThumbnail = ref('')
+
+let wsUnsubscribe: (() => void) | null = null
 
 const runningCount = computed(() =>
   taskList.value.filter(t => ['starting', 'running'].includes(t.status)).length
@@ -369,7 +411,6 @@ async function handleRun() {
     if (res.success) {
       ElMessage.success(`仿真任务已提交：${res.task_id}`)
       await fetchTasks()
-      pollTask(res.task_id)
       // 自动打开详情
       const t = taskList.value.find(x => x.task_id === res.task_id)
       if (t) viewTask(t)
@@ -395,39 +436,126 @@ async function fetchTasks() {
   }
 }
 
-function pollTask(taskId: string) {
-  const interval = setInterval(async () => {
-    try {
-      const res: any = await simulationApi.getTaskStatus(taskId)
-      const idx = taskList.value.findIndex((t) => t.task_id === taskId)
-      if (idx >= 0) {
-        taskList.value[idx] = res
-      } else {
-        taskList.value.unshift(res)
-      }
-      if (currentTask.value?.task_id === taskId) {
-        currentTask.value = res
-      }
-      if (['completed', 'failed'].includes(res.status)) {
-        clearInterval(interval)
-        if (res.status === 'completed') {
-          ElMessage.success(`任务 ${taskId} 完成 ✅`)
-        } else {
-          ElMessage.error(`任务 ${taskId} 失败：${res.error || '未知错误'}`)
-        }
-      }
-    } catch (e) {
-      clearInterval(interval)
+function handleWebSocketMessage(msg: TaskProgressMessage) {
+  const taskId = msg.task_id
+
+  // 更新任务列表中的任务
+  const idx = taskList.value.findIndex((t) => t.task_id === taskId)
+
+  if (msg.type === 'progress') {
+    const updateData: any = {}
+    if (msg.progress !== undefined) updateData.progress = msg.progress
+    if (msg.message !== undefined) updateData.message = msg.message
+    if (msg.stage !== undefined) updateData.stage = msg.stage
+    if (msg.loss !== undefined) updateData.current_loss = msg.loss
+    if (msg.iteration !== undefined) updateData.iteration = msg.iteration
+
+    if (idx >= 0) {
+      taskList.value[idx] = { ...taskList.value[idx], ...updateData }
     }
-  }, 1500)
+
+    // 更新当前查看的任务
+    if (currentTask.value?.task_id === taskId) {
+      currentTask.value = { ...currentTask.value, ...updateData }
+      if (msg.loss !== undefined) currentLoss.value = msg.loss
+      if (msg.iteration !== undefined) currentIteration.value = msg.iteration
+      if (msg.stage !== undefined) currentStage.value = msg.stage
+      if (msg.mask_thumbnail !== undefined) maskThumbnail.value = msg.mask_thumbnail
+    }
+  } else if (msg.type === 'task_complete') {
+    if (idx >= 0) {
+      taskList.value[idx].status = 'completed'
+      taskList.value[idx].progress = 100
+      taskList.value[idx].result_summary = msg.result
+    }
+    if (currentTask.value?.task_id === taskId) {
+      currentTask.value.status = 'completed'
+      currentTask.value.progress = 100
+      currentTask.value.result = msg.result
+      currentTask.value.result_summary = msg.result
+    }
+    ElMessage.success(`任务 ${taskId} 完成 ✅`)
+    disconnectWebSocket()
+    fetchTasks()
+  } else if (msg.type === 'task_failed') {
+    if (idx >= 0) {
+      taskList.value[idx].status = 'failed'
+      taskList.value[idx].error = msg.error
+    }
+    if (currentTask.value?.task_id === taskId) {
+      currentTask.value.status = 'failed'
+      currentTask.value.error = msg.error
+    }
+    ElMessage.error(`任务 ${taskId} 失败：${msg.error || '未知错误'}`)
+    disconnectWebSocket()
+    fetchTasks()
+  } else if (msg.type === 'stage_change') {
+    if (idx >= 0 && msg.stage !== undefined) {
+      taskList.value[idx].stage = msg.stage
+      if (msg.message !== undefined) {
+        taskList.value[idx].message = msg.message
+      }
+    }
+    if (currentTask.value?.task_id === taskId) {
+      if (msg.stage !== undefined) {
+        currentTask.value.stage = msg.stage
+        currentStage.value = msg.stage
+      }
+      if (msg.message !== undefined) {
+        currentTask.value.message = msg.message
+      }
+    }
+  } else if (msg.type === 'connected') {
+    wsConnected.value = true
+  }
+}
+
+function connectWebSocket(taskId: string) {
+  disconnectWebSocket()
+
+  try {
+    taskWs.connect(taskId)
+    wsUnsubscribe = taskWs.onMessage(handleWebSocketMessage)
+    wsConnected.value = taskWs.isConnected.value
+  } catch (e) {
+    console.error('WebSocket 连接失败:', e)
+  }
+}
+
+function disconnectWebSocket() {
+  if (wsUnsubscribe) {
+    try {
+      wsUnsubscribe()
+    } catch (e) {}
+    wsUnsubscribe = null
+  }
+  wsConnected.value = false
+  currentLoss.value = null
+  currentIteration.value = null
+  currentStage.value = ''
+  maskThumbnail.value = ''
 }
 
 function viewTask(task: any) {
   currentTask.value = JSON.parse(JSON.stringify(task))
-  if (['starting', 'running'].includes(task.status)) {
-    pollTask(task.task_id)
+
+  // 更新详情页的显示数据
+  currentStage.value = task.stage || ''
+  currentLoss.value = task.current_loss ?? null
+  currentIteration.value = task.iteration ?? null
+  maskThumbnail.value = ''
+
+  // 如果任务正在运行，建立 WebSocket 连接
+  if (['starting', 'running', 'pending'].includes(task.status)) {
+    connectWebSocket(task.task_id)
+  } else {
+    disconnectWebSocket()
   }
 }
+
+onUnmounted(() => {
+  disconnectWebSocket()
+})
 
 function statusType(s: string) {
   switch (s) {
@@ -599,6 +727,70 @@ function formatNumber(v: any) {
   }
 
   .desc-base { margin-top: 4px; }
+
+  .card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .ws-status {
+    :deep(.el-tag) {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+  }
+
+  .stage-label {
+    font-weight: 500;
+    color: #409eff;
+  }
+
+  .iteration-label {
+    font-family: 'SF Mono', Consolas, monospace;
+    font-weight: 600;
+    color: #606266;
+  }
+
+  .loss-value {
+    font-family: 'SF Mono', Consolas, monospace;
+    font-size: 14px;
+    font-weight: 600;
+    color: #e6a23c;
+  }
+
+  .mask-thumbnail-section {
+    margin-top: 16px;
+
+    .section-title {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      color: #606266;
+      margin-bottom: 10px;
+    }
+
+    .mask-thumbnail-wrapper {
+      display: flex;
+      justify-content: center;
+      padding: 12px;
+      background: #f5f7fa;
+      border-radius: 8px;
+      border: 1px solid #e4e7ed;
+    }
+
+    .mask-thumbnail {
+      max-width: 128px;
+      max-height: 128px;
+      image-rendering: pixelated;
+      border: 1px solid #dcdfe6;
+      border-radius: 4px;
+      background: #fff;
+    }
+  }
 
   .metric-good {
     color: #67c23a;

@@ -5,8 +5,12 @@ import yaml
 import json
 import time
 import logging
+import asyncio
+import base64
+import threading
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Union
+from io import BytesIO
 
 from fastapi import HTTPException
 
@@ -23,6 +27,168 @@ TASK_RESULTS_DIR = Path(__file__).resolve().parent / "task_results"
 TASK_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 RUNNING_TASKS: Dict[str, Dict[str, Any]] = {}
+
+_ws_event_loop: Optional[asyncio.AbstractEventLoop] = None
+_ws_loop_lock = threading.Lock()
+
+
+def _get_ws_event_loop() -> asyncio.AbstractEventLoop:
+    """
+    获取或创建用于 WebSocket 推送的事件循环
+
+    在单独的线程中运行事件循环，以便从同步任务线程中推送消息。
+    """
+    global _ws_event_loop
+
+    with _ws_loop_lock:
+        if _ws_event_loop is None:
+            loop = asyncio.new_event_loop()
+            _ws_event_loop = loop
+
+            def run_loop():
+                asyncio.set_event_loop(loop)
+                loop.run_forever()
+
+            thread = threading.Thread(target=run_loop, daemon=True, name="ws-push-loop")
+            thread.start()
+            logger.info("WebSocket 推送事件循环已启动")
+
+        return _ws_event_loop
+
+
+def _run_async(coro):
+    """
+    在 WebSocket 事件循环中异步执行协程（从同步线程调用）
+
+    Args:
+        coro: 要执行的协程
+    """
+    loop = _get_ws_event_loop()
+    try:
+        asyncio.run_coroutine_threadsafe(coro, loop)
+    except Exception as e:
+        logger.debug(f"WebSocket 推送失败: {e}")
+
+
+def _generate_mask_thumbnail(mask: Any, max_size: int = 64) -> Optional[str]:
+    """
+    生成掩模缩略图的 base64 编码
+
+    Args:
+        mask: 掩模数组
+        max_size: 最大尺寸
+
+    Returns:
+        base64 编码的 PNG 图像字符串，失败则返回 None
+    """
+    try:
+        import numpy as np
+        from PIL import Image
+
+        if not hasattr(mask, 'shape') or mask.ndim != 2:
+            return None
+
+        # 缩放到缩略图尺寸
+        h, w = mask.shape
+        scale = min(max_size / h, max_size / w, 1.0)
+        new_h, new_w = max(1, int(h * scale)), max(1, int(w * scale))
+
+        # 归一化到 0-255
+        mask_norm = np.clip(mask, 0.0, 1.0)
+        mask_uint8 = (mask_norm * 255).astype(np.uint8)
+
+        # 缩放
+        from scipy.ndimage import zoom
+        mask_small = zoom(mask_uint8, (new_h / h, new_w / w), order=1)
+        mask_small = np.clip(mask_small, 0, 255).astype(np.uint8)
+
+        # 生成 PNG
+        img = Image.fromarray(mask_small, mode='L')
+        buffer = BytesIO()
+        img.save(buffer, format='PNG')
+        img_bytes = buffer.getvalue()
+
+        return base64.b64encode(img_bytes).decode('ascii')
+    except Exception as e:
+        logger.debug(f"生成掩模缩略图失败: {e}")
+        return None
+
+
+def _push_progress_ws(
+    task_id: str,
+    progress: float,
+    message: Optional[str] = None,
+    stage: Optional[str] = None,
+    loss: Optional[float] = None,
+    iteration: Optional[int] = None,
+    mask_thumbnail: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None
+):
+    """
+    通过 WebSocket 推送进度更新（同步接口，内部异步执行）
+
+    Args:
+        task_id: 任务 ID
+        progress: 进度百分比
+        message: 消息
+        stage: 阶段
+        loss: 损失值
+        iteration: 迭代次数
+        mask_thumbnail: 掩模缩略图 base64
+        extra: 额外数据
+    """
+    from websocket_manager import broadcast_progress
+
+    _run_async(broadcast_progress(
+        task_id=task_id,
+        progress=progress,
+        message=message,
+        stage=stage,
+        loss=loss,
+        iteration=iteration,
+        mask_thumbnail=mask_thumbnail,
+        extra=extra,
+    ))
+
+
+def _push_stage_change_ws(task_id: str, stage: str, message: Optional[str] = None):
+    """
+    通过 WebSocket 推送阶段变化
+
+    Args:
+        task_id: 任务 ID
+        stage: 新阶段
+        message: 消息
+    """
+    from websocket_manager import broadcast_stage_change
+
+    _run_async(broadcast_stage_change(task_id, stage, message))
+
+
+def _push_task_complete_ws(task_id: str, result: Optional[Dict[str, Any]] = None):
+    """
+    通过 WebSocket 推送任务完成
+
+    Args:
+        task_id: 任务 ID
+        result: 结果摘要
+    """
+    from websocket_manager import broadcast_task_complete
+
+    _run_async(broadcast_task_complete(task_id, result))
+
+
+def _push_task_failed_ws(task_id: str, error: str):
+    """
+    通过 WebSocket 推送任务失败
+
+    Args:
+        task_id: 任务 ID
+        error: 错误信息
+    """
+    from websocket_manager import broadcast_task_failed
+
+    _run_async(broadcast_task_failed(task_id, error))
 
 
 def _register_task(task_type: str, payload: Dict[str, Any]) -> str:
@@ -49,6 +215,7 @@ def _start_task(task_id: str):
     if task:
         task["status"] = "running"
         task["started_at"] = time.time()
+    _push_stage_change_ws(task_id, "running", "任务开始执行")
 
 
 def _finish_task(task_id: str, result: Any = None, summary: Optional[Dict[str, Any]] = None):
@@ -60,6 +227,7 @@ def _finish_task(task_id: str, result: Any = None, summary: Optional[Dict[str, A
         task["result_summary"] = summary
         task["finished_at"] = time.time()
         _persist_task_result(task_id, task)
+    _push_task_complete_ws(task_id, summary or {})
 
 
 def _fail_task(task_id: str, error: str):
@@ -69,14 +237,43 @@ def _fail_task(task_id: str, error: str):
         task["error"] = error
         task["finished_at"] = time.time()
         _persist_task_result(task_id, task)
+    _push_task_failed_ws(task_id, error)
 
 
-def _set_progress(task_id: str, progress: float, message: Optional[str] = None):
+def _set_progress(task_id: str, progress: float, message: Optional[str] = None,
+                  stage: Optional[str] = None, loss: Optional[float] = None,
+                  iteration: Optional[int] = None, mask: Optional[Any] = None,
+                  extra: Optional[Dict[str, Any]] = None):
     task = RUNNING_TASKS.get(task_id)
     if task:
         task["progress"] = max(0.0, min(100.0, float(progress)))
         if message is not None:
             task["message"] = message
+        if stage is not None:
+            task["stage"] = stage
+        if loss is not None:
+            task["current_loss"] = loss
+        if iteration is not None:
+            task["iteration"] = iteration
+
+    # 生成掩模缩略图（如果有掩模且有 WebSocket 连接）
+    mask_thumbnail = None
+    if mask is not None:
+        from websocket_manager import manager
+        if manager.has_connections(task_id):
+            mask_thumbnail = _generate_mask_thumbnail(mask, max_size=64)
+
+    # 推送 WebSocket 消息
+    _push_progress_ws(
+        task_id=task_id,
+        progress=max(0.0, min(100.0, float(progress))),
+        message=message,
+        stage=stage,
+        loss=loss,
+        iteration=iteration,
+        mask_thumbnail=mask_thumbnail,
+        extra=extra,
+    )
 
 
 def _persist_task_result(task_id: str, task: Dict[str, Any]):
@@ -802,6 +999,9 @@ def get_task_status(task_id: str) -> Dict[str, Any]:
         "progress": task.get("progress", 0.0),
         "message": task.get("message"),
         "error": task.get("error"),
+        "stage": task.get("stage"),
+        "current_loss": task.get("current_loss"),
+        "iteration": task.get("iteration"),
         "created_at": task.get("created_at"),
         "started_at": task.get("started_at"),
         "finished_at": task.get("finished_at"),
@@ -863,6 +1063,9 @@ def list_tasks(task_type: Optional[str] = None, status: Optional[str] = None) ->
             "progress": task.get("progress", 0.0),
             "message": task.get("message"),
             "error": task.get("error"),
+            "stage": task.get("stage"),
+            "current_loss": task.get("current_loss"),
+            "iteration": task.get("iteration"),
             "created_at": task.get("created_at"),
             "started_at": task.get("started_at"),
             "finished_at": task.get("finished_at"),
@@ -888,6 +1091,9 @@ def list_tasks(task_type: Optional[str] = None, status: Optional[str] = None) ->
                 "progress": data.get("progress", 0.0),
                 "message": data.get("message"),
                 "error": data.get("error"),
+                "stage": data.get("stage"),
+                "current_loss": data.get("current_loss"),
+                "iteration": data.get("iteration"),
                 "created_at": data.get("created_at"),
                 "started_at": data.get("started_at"),
                 "finished_at": data.get("finished_at"),
