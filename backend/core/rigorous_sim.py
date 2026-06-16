@@ -45,6 +45,7 @@ from core.imaging import (
     simulate_multi_process,
     MultiProcessSimulationResult,
     _apply_threshold,
+    _zernike_polynomial,
 )
 from core.litho_metrics import (
     compute_cd,
@@ -109,13 +110,46 @@ class RCWAConfig:
 
 @dataclass
 class FDTDConfig:
-    """FDTD 求解器配置（占位实现，可对接 meep 等开源库）"""
+    """
+    FDTD 求解器配置（基于 meep 的严格 3D 矢量电磁仿真）
+
+    包含 3D 掩模结构建模、倾斜照明注入、近场到远场传播的完整参数配置。
+    当 meep 不可用时自动退化为标量 Hopkins  phenomenological 修正。
+    """
     grid_resolution_nm: float = 0.5
     pml_thickness_nm: float = 200.0
     total_time_steps: int = 2000
     courant_factor: float = 0.9
     use_meep_if_available: bool = True
     extra_material_params: Dict[str, Any] = field(default_factory=dict)
+
+    n_substrate: complex = 1.56 + 0.0j
+    n_absorber: complex = 3.28 - 4.32j
+    n_superstrate: complex = 1.44 + 0.0j
+
+    mask_thickness_nm: float = 70.0
+    substrate_thickness_nm: float = 500.0
+    superstrate_thickness_nm: float = 500.0
+
+    illumination_theta_deg: float = 0.0
+    illumination_phi_deg: float = 0.0
+    polarization: Polarization = Polarization.UNPOLARIZED
+
+    source_width_nm: float = 300.0
+    ntff_distance_nm: float = 100.0
+
+    pupil_filter: bool = True
+    max_far_field_orders: int = 50
+
+    def __post_init__(self):
+        if isinstance(self.polarization, str):
+            try:
+                self.polarization = Polarization(self.polarization)
+            except ValueError as e:
+                raise ValueError(
+                    f"Invalid polarization '{self.polarization}'. "
+                    f"Must be one of: {[p.value for p in Polarization]}"
+                ) from e
 
 
 @dataclass
@@ -554,42 +588,464 @@ def _try_solve_with_meent(
 
 
 # =============================================================================
-# FDTD 占位求解器
+# 严格 FDTD 求解器（基于 meep）
 # =============================================================================
-class _FDTDPlaceholderSolver:
+class MeepFDTDSolver:
     """
-    FDTD 占位实现。
+    基于 meep 的严格 3D FDTD 求解器。
 
-    当用户未安装 meep 等 FDTD 仿真库时，退化为：
-        1. 对标量 Hopkins 结果做一个 phenomenological 矢量修正；
-        2. 在 extra 字段中标记 "fdtd_fallback=True"。
+    实现完整的光刻掩模电磁仿真流程：
+        1. 3D 掩模结构建模（石英基底 + Cr 吸收层 + 浸没液）
+        2. 倾斜照明高斯光束注入（支持 TE/TM/非偏振）
+        3. 时域 FDTD 仿真求解近场分布
+        4. 近场到远场（NTFF）变换
+        5. 投影光瞳滤波 → 晶圆面空间像
+
+    当 meep 不可用时，自动退化为对标量 Hopkins 结果的 phenomenological 矢量修正。
     """
 
     def __init__(self, config: FDTDConfig):
         self.cfg = config
         self._meep_available = False
+        self._meep = None
+        self._mp = None
         try:
-            import meep  # type: ignore  # noqa
-            self._meep_available = True
+            if config.use_meep_if_available:
+                import meep as mp  # type: ignore
+                self._meep = mp
+                self._mp = mp
+                self._meep_available = True
         except Exception:
             self._meep_available = False
+
+    @property
+    def meep_available(self) -> bool:
+        return self._meep_available
 
     def simulate_aerial(
         self, mask: np.ndarray, optics: OpticalSystem
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         ny, nx = mask.shape
+        extra: Dict[str, Any] = {
+            "fdtd_fallback": not self._meep_available,
+            "theta_deg": self.cfg.illumination_theta_deg,
+            "phi_deg": self.cfg.illumination_phi_deg,
+            "polarization": self.cfg.polarization.value,
+        }
+
+        if not self._meep_available:
+            logger.warning(
+                "未检测到 meep 库，FDTD 后端使用 phenomenological 矢量修正。"
+                "请 pip install meep 以启用严格 3D FDTD 求解。"
+            )
+            return self._fallback_simulation(mask, optics), extra
+
+        try:
+            result = self._run_meep_simulation(mask, optics)
+            extra.update(result.get("extra", {}))
+            extra["fdtd_fallback"] = False
+            return result["aerial_image"], extra
+        except Exception as e:
+            logger.warning(
+                f"Meep FDTD 仿真失败 ({e})，回退到 phenomenological 修正。"
+            )
+            extra["fdtd_error"] = str(e)
+            return self._fallback_simulation(mask, optics), extra
+
+    def _fallback_simulation(
+        self, mask: np.ndarray, optics: OpticalSystem
+    ) -> np.ndarray:
+        ny, nx = mask.shape
         imaging = PartialCoherentImaging(optics, (ny, nx))
         base = imaging.compute_aerial_image(mask)
 
-        extra: Dict[str, Any] = {"fdtd_fallback": not self._meep_available}
-        if not self._meep_available:
-            logger.warning(
-                "未检测到 meep 库，FDTD 后端使用标量 Hopkins 结果占位。"
-                "请 pip install meep 以启用严格 FDTD 求解。"
+        wavelength = optics.wavelength
+        na = optics.na
+        high_na_factor = np.clip(na / 1.2, 1.0, 1.5)
+        vector_correction = 1.0 + 0.1 * (high_na_factor - 1.0)
+
+        fy = np.fft.fftfreq(ny, optics.pixel_size)
+        fx = np.fft.fftfreq(nx, optics.pixel_size)
+        FX, FY = np.meshgrid(fx, fy)
+        radial = np.sqrt(FX ** 2 + FY ** 2) / (optics.cutoff_frequency + 1e-12)
+        blend = np.clip(radial ** 2, 0.0, 1.0)
+
+        corrected = base * (1.0 + blend * (vector_correction - 1.0))
+        m = float(np.nanmax(corrected))
+        if m > 0:
+            corrected = corrected / m
+        return np.clip(corrected, 0.0, 1.0).astype(np.float64)
+
+    def _run_meep_simulation(
+        self, mask: np.ndarray, optics: OpticalSystem
+    ) -> Dict[str, Any]:
+        mp = self._mp
+
+        cfg = self.cfg
+        resolution = 1.0 / cfg.grid_resolution_nm
+
+        ny, nx = mask.shape
+        pixel_size = optics.pixel_size
+        sx = nx * pixel_size
+        sy = ny * pixel_size
+
+        z_substrate = cfg.substrate_thickness_nm
+        z_mask = cfg.mask_thickness_nm
+        z_super = cfg.superstrate_thickness_nm
+        pml_z = cfg.pml_thickness_nm
+        pml_xy = cfg.pml_thickness_nm
+
+        sz = z_substrate + z_mask + z_super + 2 * pml_z
+
+        cell_size = mp.Vector3(
+            sx + 2 * pml_xy,
+            sy + 2 * pml_xy,
+            sz
+        )
+
+        geometry = self._build_3d_mask_geometry(mask, pixel_size, z_substrate, z_mask, mp)
+
+        theta_rad = np.deg2rad(cfg.illumination_theta_deg)
+        phi_rad = np.deg2rad(cfg.illumination_phi_deg)
+
+        wavelength_um = optics.wavelength * 1e-3  # nm -> um
+        frequency = 1.0 / wavelength_um
+
+        fwidth = 0.1 * frequency
+
+        source_center_z = -sz / 2 + pml_z + z_substrate * 0.5
+
+        polarizations = []
+        if cfg.polarization == Polarization.TE:
+            polarizations = [("TE",)]
+        elif cfg.polarization == Polarization.TM:
+            polarizations = [("TM",)]
+        else:
+            polarizations = [("TE",), ("TM",)]
+
+        far_field_results = []
+        near_field_data = []
+
+        for pol_tuple in polarizations:
+            pol = pol_tuple[0]
+
+            if pol == "TE":
+                src_amplitude = mp.Vector3(
+                    np.cos(phi_rad) * np.cos(theta_rad),
+                    np.sin(phi_rad) * np.cos(theta_rad),
+                    -np.sin(theta_rad)
+                )
+            else:
+                src_amplitude = mp.Vector3(
+                    -np.sin(phi_rad),
+                    np.cos(phi_rad),
+                    0.0
+                )
+
+            k_point = mp.Vector3(
+                (2 * np.pi / wavelength_um) * np.sin(theta_rad) * np.cos(phi_rad),
+                (2 * np.pi / wavelength_um) * np.sin(theta_rad) * np.sin(phi_rad),
+                (2 * np.pi / wavelength_um) * np.cos(theta_rad)
             )
-            return base, extra
-        # TODO: 真正的 meep 3D 掩模结构建模、照明光源注入、光瞳滤波等
-        return base, extra
+
+            sources = [
+                mp.GaussianSource(
+                    frequency=frequency,
+                    fwidth=fwidth,
+                    is_integrated=True
+                )
+            ]
+
+            source_obj = mp.Source(
+                src=sources[0],
+                component=mp.Ez if pol == "TM" else mp.Ey,
+                center=mp.Vector3(0, 0, source_center_z),
+                size=mp.Vector3(sx, sy, 0),
+                amplitude=1.0,
+                amp_func=lambda x: src_amplitude
+            )
+
+            pml_layers = [
+                mp.PML(pml_xy * 1e-3, direction=mp.X),
+                mp.PML(pml_xy * 1e-3, direction=mp.Y),
+                mp.PML(pml_z * 1e-3, direction=mp.Z)
+            ]
+
+            sim = mp.Simulation(
+                cell_size=cell_size * 1e-3,
+                geometry=geometry,
+                sources=[source_obj],
+                boundary_layers=pml_layers,
+                resolution=resolution * 1e3,
+                Courant=cfg.courant_factor,
+                k_point=k_point,
+                force_complex_fields=True
+            )
+
+            near_field_mon_z = sz / 2 - pml_z - cfg.ntff_distance_nm
+            near_flux_region = mp.FluxRegion(
+                center=mp.Vector3(0, 0, near_field_mon_z * 1e-3),
+                size=mp.Vector3(sx * 1e-3, sy * 1e-3, 0),
+                direction=mp.Z
+            )
+            near_flux = sim.add_flux(
+                frequency, 0, 1, near_flux_region
+            )
+
+            dft_monitor_z = near_field_mon_z
+            sim.add_dft_fields(
+                [mp.Ex, mp.Ey, mp.Ez, mp.Hx, mp.Hy, mp.Hz],
+                frequency, 0, 1,
+                center=mp.Vector3(0, 0, dft_monitor_z * 1e-3),
+                size=mp.Vector3(sx * 1e-3, sy * 1e-3, 0)
+            )
+
+            sim.run(
+                until_after_sources=mp.stop_when_fields_decayed(
+                    cfg.total_time_steps * 0.5,
+                    mp.Ey,
+                    mp.Vector3(0, 0, near_field_mon_z * 1e-3),
+                    1e-6
+                )
+            )
+
+            near_eps = sim.get_epsilon()
+            near_ex = sim.get_dft_array(near_flux, mp.Ex, 0)
+            near_ey = sim.get_dft_array(near_flux, mp.Ey, 0)
+            near_ez = sim.get_dft_array(near_flux, mp.Ez, 0)
+
+            near_field_data.append({
+                "pol": pol,
+                "Ex": np.asarray(near_ex),
+                "Ey": np.asarray(near_ey),
+                "Ez": np.asarray(near_ez)
+            })
+
+            ff_result = self._near_to_far_field(
+                near_ex, near_ey, near_ez,
+                sx, sy, optics.wavelength, cfg
+            )
+            far_field_results.append(ff_result)
+
+        if len(far_field_results) == 2:
+            ff_te = far_field_results[0]
+            ff_tm = far_field_results[1]
+            far_field = {
+                "k_xy": ff_te["k_xy"],
+                "Efar_TE": ff_te["Efar"],
+                "Efar_TM": ff_tm["Efar"],
+                "Efar": 0.5 * (ff_te["Efar"] + ff_tm["Efar"])
+            }
+        else:
+            ff = far_field_results[0]
+            far_field = {
+                "k_xy": ff["k_xy"],
+                f"Efar_{polarizations[0][0]}": ff["Efar"],
+                "Efar": ff["Efar"]
+            }
+
+        aerial_image = self._far_field_to_aerial(
+            far_field, optics, cfg
+        )
+
+        return {
+            "aerial_image": aerial_image,
+            "extra": {
+                "far_field": far_field,
+                "near_fields": near_field_data,
+                "wavelength_nm": optics.wavelength,
+                "na": optics.na,
+                "polarization": cfg.polarization.value,
+                "theta_deg": cfg.illumination_theta_deg,
+                "phi_deg": cfg.illumination_phi_deg,
+                "fdtd_fallback": False
+            }
+        }
+
+    def _build_3d_mask_geometry(
+        self,
+        mask: np.ndarray,
+        pixel_size_nm: float,
+        z_substrate_nm: float,
+        z_mask_nm: float,
+        mp
+    ) -> list:
+        geometry = []
+
+        eps_substrate = complex(self.cfg.n_substrate) ** 2
+        eps_absorber = complex(self.cfg.n_absorber) ** 2
+        eps_superstrate = complex(self.cfg.n_superstrate) ** 2
+
+        geometry.append(
+            mp.Block(
+                size=mp.Vector3(mp.inf, mp.inf, mp.inf),
+                material=mp.Medium(
+                    epsilon=float(eps_superstrate.real),
+                    D_conductivity=2 * np.pi * (eps_superstrate.imag) if abs(eps_superstrate.imag) > 1e-10 else 0.0
+                )
+            )
+        )
+
+        substrate_z_center = -z_substrate_nm * 1e-3 / 2
+        geometry.append(
+            mp.Block(
+                size=mp.Vector3(mp.inf, mp.inf, z_substrate_nm * 1e-3),
+                center=mp.Vector3(0, 0, substrate_z_center),
+                material=mp.Medium(
+                    epsilon=float(eps_substrate.real),
+                    D_conductivity=2 * np.pi * (eps_substrate.imag) if abs(eps_substrate.imag) > 1e-10 else 0.0
+                )
+            )
+        )
+
+        mask_z_center = (z_mask_nm - z_substrate_nm) * 1e-3 / 2
+
+        ny, nx = mask.shape
+        for j in range(ny):
+            for i in range(nx):
+                if mask[j, i] > 0.5:
+                    x_pos = (i - nx / 2 + 0.5) * pixel_size_nm * 1e-3
+                    y_pos = (j - ny / 2 + 0.5) * pixel_size_nm * 1e-3
+                    geometry.append(
+                        mp.Block(
+                            size=mp.Vector3(
+                                pixel_size_nm * 1e-3,
+                                pixel_size_nm * 1e-3,
+                                z_mask_nm * 1e-3
+                            ),
+                            center=mp.Vector3(x_pos, y_pos, mask_z_center),
+                            material=mp.Medium(
+                                epsilon=float(eps_absorber.real),
+                                D_conductivity=2 * np.pi * (eps_absorber.imag) if abs(eps_absorber.imag) > 1e-10 else 0.0
+                            )
+                        )
+                    )
+
+        return geometry
+
+    def _near_to_far_field(
+        self,
+        Ex: np.ndarray,
+        Ey: np.ndarray,
+        Ez: np.ndarray,
+        sx_nm: float,
+        sy_nm: float,
+        wavelength_nm: float,
+        cfg: FDTDConfig
+    ) -> Dict[str, np.ndarray]:
+        ny, nx = Ex.shape
+
+        dx = sx_nm / nx
+        dy = sy_nm / ny
+
+        x = (np.arange(nx) - nx / 2) * dx
+        y = (np.arange(ny) - ny / 2) * dy
+        X, Y = np.meshgrid(x, y)
+
+        window = np.hanning(ny)[:, None] * np.hanning(nx)[None, :]
+
+        Ex_win = Ex * window
+        Ey_win = Ey * window
+        Ez_win = Ez * window
+
+        fft_Ex = np.fft.fft2(np.fft.fftshift(Ex_win))
+        fft_Ey = np.fft.fft2(np.fft.fftshift(Ey_win))
+        fft_Ez = np.fft.fft2(np.fft.fftshift(Ez_win))
+
+        fft_Ex = np.fft.fftshift(fft_Ex)
+        fft_Ey = np.fft.fftshift(fft_Ey)
+        fft_Ez = np.fft.fftshift(fft_Ez)
+
+        k0 = 2 * np.pi / wavelength_nm
+
+        kx = 2 * np.pi * np.fft.fftshift(np.fft.fftfreq(nx, dx))
+        ky = 2 * np.pi * np.fft.fftshift(np.fft.fftfreq(ny, dy))
+        KX, KY = np.meshgrid(kx, ky)
+
+        kz_sq = k0 ** 2 - KX ** 2 - KY ** 2
+        kz = np.lib.scimath.sqrt(kz_sq)
+        kz = np.where(np.imag(kz) < 0, -kz, kz)
+
+        radiation_mask = np.real(kz) > 0
+
+        Efar_x = fft_Ex * radiation_mask
+        Efar_y = fft_Ey * radiation_mask
+        Efar_z = fft_Ez * radiation_mask
+
+        Efar_mag = np.sqrt(
+            np.abs(Efar_x) ** 2 +
+            np.abs(Efar_y) ** 2 +
+            np.abs(Efar_z) ** 2
+        )
+
+        max_mag = float(np.nanmax(Efar_mag))
+        if max_mag > 0:
+            Efar_norm = Efar_mag / max_mag
+        else:
+            Efar_norm = Efar_mag
+
+        return {
+            "k_xy": np.sqrt(KX ** 2 + KY ** 2),
+            "KX": KX,
+            "KY": KY,
+            "kz": kz,
+            "Efar_x": Efar_x,
+            "Efar_y": Efar_y,
+            "Efar_z": Efar_z,
+            "Efar": Efar_norm
+        }
+
+    def _far_field_to_aerial(
+        self,
+        far_field: Dict[str, np.ndarray],
+        optics: OpticalSystem,
+        cfg: FDTDConfig
+    ) -> np.ndarray:
+        Efar = far_field["Efar"]
+        KX = far_field["KX"]
+        KY = far_field["KY"]
+
+        ny, nx = Efar.shape
+
+        cutoff = 2 * np.pi * optics.na / optics.wavelength
+
+        if cfg.pupil_filter:
+            pupil_mask = (KX ** 2 + KY ** 2) <= cutoff ** 2
+            Efar_filtered = Efar * pupil_mask.astype(np.float64)
+        else:
+            Efar_filtered = Efar.copy()
+
+        defocus_phase = np.zeros_like(Efar_filtered, dtype=np.complex128)
+        if abs(optics.defocus) > 1e-10:
+            kz_sq = (2 * np.pi / optics.wavelength) ** 2 - KX ** 2 - KY ** 2
+            kz = np.lib.scimath.sqrt(kz_sq)
+            kz = np.where(np.imag(kz) < 0, -kz, kz)
+            defocus_phase = np.exp(-1j * kz * optics.defocus)
+
+        zernike_phase = np.zeros_like(Efar_filtered, dtype=np.float64)
+        if optics.zernike_coefficients:
+            radial = np.sqrt(KX ** 2 + KY ** 2) / (cutoff + 1e-12)
+            theta = np.arctan2(KY, KX)
+            pupil_mask_zn = radial <= 1.0
+            for j, coeff in optics.zernike_coefficients.items():
+                if abs(coeff) < 1e-15:
+                    continue
+                zernike_val = _zernike_polynomial(j, radial, theta)
+                zernike_phase += coeff * 2.0 * np.pi * zernike_val
+            zernike_phase[~pupil_mask_zn] = 0.0
+
+        total_phase = np.exp(1j * (zernike_phase + np.angle(defocus_phase)))
+        Efar_pupil = Efar_filtered * total_phase
+
+        Efar_shifted = np.fft.ifftshift(Efar_pupil)
+        aerial_complex = np.fft.ifft2(Efar_shifted)
+        aerial = np.abs(aerial_complex) ** 2
+
+        max_val = float(np.nanmax(aerial))
+        if max_val > 0:
+            aerial = aerial / max_val
+
+        return np.clip(aerial, 0.0, 1.0).astype(np.float64)
 
 
 # =============================================================================
@@ -680,7 +1136,15 @@ def simulate(
 
     elif be == SimulationBackend.FDTD:
         cfg = fdtd_config or FDTDConfig()
-        solver = _FDTDPlaceholderSolver(cfg)
+
+        if cfg.illumination_theta_deg == 0.0 and optics.sigma > 0:
+            cfg.illumination_theta_deg = float(
+                np.rad2deg(np.arcsin(optics.sigma * optics.na / optics.n_substrate.real))
+                if hasattr(optics, 'n_substrate') else
+                np.rad2deg(np.arcsin(optics.sigma * optics.na / 1.56))
+            )
+
+        solver = MeepFDTDSolver(cfg)
         aerial, fdtd_extra = solver.simulate_aerial(mask, optics)
         extra.update(fdtd_extra)
 
@@ -1159,6 +1623,7 @@ __all__ = [
     "FDTDConfig",
     "SimulationResult",
     "RCWASolver1D",
+    "MeepFDTDSolver",
     "simulate",
     "simulate_multi_process_unified",
     "BackendComparisonReport",
