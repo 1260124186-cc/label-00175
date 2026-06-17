@@ -1,0 +1,48 @@
+# ============================================================================
+# 超参数搜索配置: 掩模优化 - MSE 单目标
+# ============================================================================
+# 基于贝叶斯优化（TPE）搜索学习率和正则化权重
+
+name: mask_opt_mse_search
+description: "掩模优化超参数搜索，最小化 MSE"
+base_experiment: experiments/exp_line_space_mse.yaml
+
+search_space:
+  params:
+    - name: optimizer.learning_rate
+      type: log_float
+      low: 1e-5
+      high: 1e-1
+      description: 优化器学习率
+
+    - name: optimizer.max_iter
+      type: int
+      low: 30
+      high: 150
+      description: 最大迭代次数
+
+    - name: optimizer.loss_weights.mse
+      type: float
+      low: 0.5
+      high: 5.0
+      description: MSE 损失权重
+
+    - name: optimizer.loss_weights.tv
+      type: float
+      low: 0.0
+      high: 1.0
+      description: TV 正则化权重
+
+objectives:
+  - name: final_mse
+    direction: minimize
+    weight: 1.0
+
+n_trials: 50
+sampler: tpe
+pruner: none
+seed: 42
+
+tracking_backend: local
+tracking_dir: ./hyperparam_tracking
+output_dir: ./hyperparam_results/mask_opt_mse

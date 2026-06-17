@@ -1,0 +1,64 @@
+# ============================================================================
+# 超参数搜索配置: OPC - EPE & 时间 双目标 Pareto 优化
+# ============================================================================
+# 同时优化 EPE 和计算时间，输出 Pareto 最优解集
+
+name: opc_epe_pareto_search
+description: "OPC 超参数 Pareto 搜索，权衡 EPE 精度与计算时间"
+base_experiment: experiments/exp_opc_epe.yaml
+
+search_space:
+  params:
+    - name: opc.epe_threshold
+      type: float
+      low: 1.0
+      high: 10.0
+      description: EPE 热点判定阈值 (nm)
+
+    - name: opc.max_iterations
+      type: int
+      low: 1
+      high: 8
+      description: OPC 最大迭代次数
+
+    - name: opc.optimizer_learning_rate
+      type: log_float
+      low: 1e-4
+      high: 1e-1
+      description: 优化器学习率
+
+    - name: opc.optimizer_epe_weight
+      type: float
+      low: 0.1
+      high: 5.0
+      description: EPE 损失权重
+
+    - name: opc.sraf_min_distance
+      type: float
+      low: 1.0
+      high: 6.0
+      description: SRAF 最小间距
+
+    - name: opc.sraf_width
+      type: float
+      low: 0.5
+      high: 2.0
+      description: SRAF 宽度
+
+objectives:
+  - name: custom_metrics.epe_mean
+    direction: minimize
+    weight: 1.0
+
+  - name: total_time
+    direction: minimize
+    weight: 1.0
+
+n_trials: 100
+sampler: tpe
+pruner: none
+seed: 42
+
+tracking_backend: local
+tracking_dir: ./hyperparam_tracking
+output_dir: ./hyperparam_results/opc_epe_pareto

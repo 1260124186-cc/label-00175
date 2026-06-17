@@ -28,6 +28,19 @@ try:
         AssertionResult,
         AssertionReport,
     )
+    from experiments.hyperparam_search import (
+        ParamType,
+        SearchParam,
+        SearchSpace,
+        SamplerType,
+        PrunerType,
+        ObjectiveConfig,
+        HyperparamSearchConfig,
+        TrialResult,
+        HyperparamSearcher,
+        get_default_search_space,
+        get_default_objectives,
+    )
 except ImportError:
     from .schema import (
         ExperimentSchema,
@@ -45,6 +58,19 @@ except ImportError:
         AssertionResult,
         AssertionReport,
     )
+    from .hyperparam_search import (
+        ParamType,
+        SearchParam,
+        SearchSpace,
+        SamplerType,
+        PrunerType,
+        ObjectiveConfig,
+        HyperparamSearchConfig,
+        TrialResult,
+        HyperparamSearcher,
+        get_default_search_space,
+        get_default_objectives,
+    )
 
 __all__ = [
     'ExperimentSchema',
@@ -60,4 +86,15 @@ __all__ = [
     'RegressionAssertions',
     'AssertionResult',
     'AssertionReport',
+    'ParamType',
+    'SearchParam',
+    'SearchSpace',
+    'SamplerType',
+    'PrunerType',
+    'ObjectiveConfig',
+    'HyperparamSearchConfig',
+    'TrialResult',
+    'HyperparamSearcher',
+    'get_default_search_space',
+    'get_default_objectives',
 ]

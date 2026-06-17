@@ -1,0 +1,64 @@
+# ============================================================================
+# 超参数搜索配置: SMO - 损失 & 时间 双目标 Pareto 优化
+# ============================================================================
+# 搜索 SMO 交替轮次、学习率、正则化权重等参数
+
+name: smo_source_pareto_search
+description: "SMO 超参数 Pareto 搜索，权衡最终损失与计算时间"
+base_experiment: experiments/exp_smo_source.yaml
+
+search_space:
+  params:
+    - name: smo.max_outer_iterations
+      type: int
+      low: 2
+      high: 12
+      description: SMO 外层交替轮次
+
+    - name: smo.source_learning_rate
+      type: log_float
+      low: 1e-5
+      high: 1e-2
+      description: 光源优化学习率
+
+    - name: smo.mask_learning_rate
+      type: log_float
+      low: 1e-4
+      high: 1e-1
+      description: 掩模优化学习率
+
+    - name: smo.source_max_iter
+      type: int
+      low: 5
+      high: 50
+      description: 每轮光源优化迭代次数
+
+    - name: smo.mask_max_iter
+      type: int
+      low: 10
+      high: 100
+      description: 每轮掩模优化迭代次数
+
+    - name: smo.source_constraints.smoothness_weight
+      type: float
+      low: 0.001
+      high: 0.1
+      description: 光源平滑正则化权重
+
+objectives:
+  - name: final_loss
+    direction: minimize
+    weight: 1.0
+
+  - name: total_time
+    direction: minimize
+    weight: 1.0
+
+n_trials: 80
+sampler: tpe
+pruner: none
+seed: 42
+
+tracking_backend: local
+tracking_dir: ./hyperparam_tracking
+output_dir: ./hyperparam_results/smo_source_pareto
