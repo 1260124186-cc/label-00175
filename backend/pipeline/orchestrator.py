@@ -45,6 +45,9 @@ from core.metrics import total_variation_isotropic
 from workflows.opc import OPCConfig, OPCWorkflowResult, run_opc_workflow
 from workflows.ilt import ILTConfig, ILTWorkflowResult, run_ilt_workflow
 from workflows.smo import SMOConfig, SMOWorkflowResult, run_smo_workflow
+from workflows.hybrid_opc_ilt import (
+    HybridOPCILTConfig, HybridOPCILTWorkflowResult, run_hybrid_opc_ilt_workflow
+)
 from analysis.process_window import (
     ProcessWindowAnalyzer, PWMetrics, PrintabilityResult,
 )
@@ -98,8 +101,11 @@ class PipelineConfig:
     enable_smo: bool = True
     enable_pw_verify: bool = True
 
+    use_hybrid_opc_ilt: bool = False
+
     opc_config: Optional[OPCConfig] = None
     ilt_config: Optional[ILTConfig] = None
+    hybrid_config: Optional[HybridOPCILTConfig] = None
     smo_config: Optional[SMOConfig] = None
     pw_verify_config: Optional[PWVerifyConfig] = None
 
@@ -114,6 +120,7 @@ class PipelineConfig:
         cfg = cls()
         stage_keys = {
             'enable_opc', 'enable_ilt', 'enable_smo', 'enable_pw_verify',
+            'use_hybrid_opc_ilt',
             'output_dir', 'save_intermediate', 'verbose',
         }
         for key, value in d.items():
@@ -123,6 +130,8 @@ class PipelineConfig:
                 cfg.opc_config = OPCConfig.from_dict(value)
             elif key == 'ilt_config':
                 cfg.ilt_config = ILTConfig.from_dict(value)
+            elif key == 'hybrid_config':
+                cfg.hybrid_config = HybridOPCILTConfig.from_dict(value)
             elif key == 'smo_config':
                 cfg.smo_config = SMOConfig.from_dict(value)
             elif key == 'pw_verify_config':
@@ -140,8 +149,10 @@ class PipelineConfig:
             'enable_ilt': self.enable_ilt,
             'enable_smo': self.enable_smo,
             'enable_pw_verify': self.enable_pw_verify,
+            'use_hybrid_opc_ilt': self.use_hybrid_opc_ilt,
             'opc_config': self.opc_config.to_dict() if self.opc_config else None,
             'ilt_config': self.ilt_config.to_dict() if self.ilt_config else None,
+            'hybrid_config': self.hybrid_config.to_dict() if self.hybrid_config else None,
             'smo_config': self.smo_config.to_dict() if self.smo_config else None,
             'pw_verify_config': self.pw_verify_config.to_dict() if self.pw_verify_config else None,
             'output_dir': self.output_dir,
@@ -190,6 +201,7 @@ class PipelineResult:
 
     opc_result: Optional[OPCWorkflowResult] = None
     ilt_result: Optional[ILTWorkflowResult] = None
+    hybrid_result: Optional[HybridOPCILTWorkflowResult] = None
     smo_result: Optional[SMOWorkflowResult] = None
     pw_metrics: Optional[PWMetrics] = None
     pw_printability: Optional[PrintabilityResult] = None
@@ -491,72 +503,108 @@ class PipelineOrchestrator:
 
         opc_result = None
         ilt_result = None
+        hybrid_result = None
         smo_result = None
         pw_metrics = None
         pw_printability = None
         optimal_source = None
 
-        if cfg.enable_opc:
+        if cfg.use_hybrid_opc_ilt and cfg.enable_opc and cfg.enable_ilt:
             if cfg.verbose:
                 logger.info("=" * 50)
-                logger.info("Stage 1/4: OPC (Optical Proximity Correction)")
+                logger.info("Stage 1-2/4: Hybrid OPC + ILT (混合精修模式)")
                 logger.info("=" * 50)
             t0 = time.time()
-            opc_config = cfg.opc_config or OPCConfig()
-            opc_result = run_opc_workflow(mask, tgt, config=opc_config, optical_system=optics)
-            mask = opc_result.corrected_mask.copy()
-            elapsed = time.time() - t0
-            sm = StageMetrics(
-                stage_name="OPC",
-                elapsed_sec=elapsed,
-                epe_before=opc_result.initial_epe,
-                epe_after=opc_result.final_epe,
+            hybrid_config = cfg.hybrid_config or HybridOPCILTConfig()
+            hybrid_result = run_hybrid_opc_ilt_workflow(
+                mask, tgt, config=hybrid_config, optical_system=optics
             )
-            stage_metrics.append(sm)
-            if cfg.verbose:
-                logger.info(f"OPC done in {elapsed:.2f}s  EPE: "
-                            f"{opc_result.initial_epe.get('epe_mean', 0):.3f} → "
-                            f"{opc_result.final_epe.get('epe_mean', 0):.3f} nm")
-            if cfg.save_intermediate and output_dir:
-                np.save(output_dir / 'mask_after_opc.npy', mask)
-        else:
-            stage_metrics.append(StageMetrics(stage_name="OPC", skipped=True))
-            if cfg.verbose:
-                logger.info("Stage OPC: skipped")
-
-        if cfg.enable_ilt:
-            if cfg.verbose:
-                logger.info("=" * 50)
-                logger.info("Stage 2/4: ILT (Inverse Lithography Technology)")
-                logger.info("=" * 50)
-            t0 = time.time()
-            ilt_config = cfg.ilt_config or ILTConfig()
-            ilt_result = run_ilt_workflow(mask, tgt, optical_system=optics, config=ilt_config)
-            mask = ilt_result.optimal_mask.copy()
+            mask = hybrid_result.final_mask.copy()
             elapsed = time.time() - t0
             sm = StageMetrics(
-                stage_name="ILT",
+                stage_name="HYBRID_OPC_ILT",
                 elapsed_sec=elapsed,
-                epe_before=ilt_result.initial_epe,
-                epe_after=ilt_result.final_epe,
+                epe_before=hybrid_result.initial_epe,
+                epe_after=hybrid_result.final_epe,
                 extra={
-                    'initial_loss': round(ilt_result.initial_loss, 6),
-                    'final_loss': round(ilt_result.final_loss, 6),
-                    'converged': ilt_result.converged,
-                    'iterations': ilt_result.num_iterations,
+                    'opc_epe_improvement': round(hybrid_result.opc_epe_improvement, 4),
+                    'ilt_epe_improvement': round(hybrid_result.ilt_epe_improvement, 4),
+                    'num_hotspots_optimized': hybrid_result.num_hotspots_optimized,
+                    'opc_time': round(hybrid_result.opc_time, 3),
+                    'ilt_time': round(hybrid_result.ilt_time, 3),
+                    'converged': hybrid_result.converged,
                 },
             )
             stage_metrics.append(sm)
             if cfg.verbose:
-                logger.info(f"ILT done in {elapsed:.2f}s  EPE: "
-                            f"{ilt_result.initial_epe.get('epe_mean', 0):.3f} → "
-                            f"{ilt_result.final_epe.get('epe_mean', 0):.3f} nm")
+                logger.info(f"Hybrid OPC+ILT done in {elapsed:.2f}s  EPE: "
+                            f"{hybrid_result.initial_epe.get('epe_mean', 0):.3f} → "
+                            f"{hybrid_result.final_epe.get('epe_mean', 0):.3f} nm  "
+                            f"({hybrid_result.num_hotspots_optimized} hotspots optimized)")
             if cfg.save_intermediate and output_dir:
-                np.save(output_dir / 'mask_after_ilt.npy', mask)
+                np.save(output_dir / 'mask_after_hybrid.npy', mask)
         else:
-            stage_metrics.append(StageMetrics(stage_name="ILT", skipped=True))
-            if cfg.verbose:
-                logger.info("Stage ILT: skipped")
+            if cfg.enable_opc:
+                if cfg.verbose:
+                    logger.info("=" * 50)
+                    logger.info("Stage 1/4: OPC (Optical Proximity Correction)")
+                    logger.info("=" * 50)
+                t0 = time.time()
+                opc_config = cfg.opc_config or OPCConfig()
+                opc_result = run_opc_workflow(mask, tgt, config=opc_config, optical_system=optics)
+                mask = opc_result.corrected_mask.copy()
+                elapsed = time.time() - t0
+                sm = StageMetrics(
+                    stage_name="OPC",
+                    elapsed_sec=elapsed,
+                    epe_before=opc_result.initial_epe,
+                    epe_after=opc_result.final_epe,
+                )
+                stage_metrics.append(sm)
+                if cfg.verbose:
+                    logger.info(f"OPC done in {elapsed:.2f}s  EPE: "
+                                f"{opc_result.initial_epe.get('epe_mean', 0):.3f} → "
+                                f"{opc_result.final_epe.get('epe_mean', 0):.3f} nm")
+                if cfg.save_intermediate and output_dir:
+                    np.save(output_dir / 'mask_after_opc.npy', mask)
+            else:
+                stage_metrics.append(StageMetrics(stage_name="OPC", skipped=True))
+                if cfg.verbose:
+                    logger.info("Stage OPC: skipped")
+
+            if cfg.enable_ilt:
+                if cfg.verbose:
+                    logger.info("=" * 50)
+                    logger.info("Stage 2/4: ILT (Inverse Lithography Technology)")
+                    logger.info("=" * 50)
+                t0 = time.time()
+                ilt_config = cfg.ilt_config or ILTConfig()
+                ilt_result = run_ilt_workflow(mask, tgt, optical_system=optics, config=ilt_config)
+                mask = ilt_result.optimal_mask.copy()
+                elapsed = time.time() - t0
+                sm = StageMetrics(
+                    stage_name="ILT",
+                    elapsed_sec=elapsed,
+                    epe_before=ilt_result.initial_epe,
+                    epe_after=ilt_result.final_epe,
+                    extra={
+                        'initial_loss': round(ilt_result.initial_loss, 6),
+                        'final_loss': round(ilt_result.final_loss, 6),
+                        'converged': ilt_result.converged,
+                        'iterations': ilt_result.num_iterations,
+                    },
+                )
+                stage_metrics.append(sm)
+                if cfg.verbose:
+                    logger.info(f"ILT done in {elapsed:.2f}s  EPE: "
+                                f"{ilt_result.initial_epe.get('epe_mean', 0):.3f} → "
+                                f"{ilt_result.final_epe.get('epe_mean', 0):.3f} nm")
+                if cfg.save_intermediate and output_dir:
+                    np.save(output_dir / 'mask_after_ilt.npy', mask)
+            else:
+                stage_metrics.append(StageMetrics(stage_name="ILT", skipped=True))
+                if cfg.verbose:
+                    logger.info("Stage ILT: skipped")
 
         if cfg.enable_smo:
             if cfg.verbose:
@@ -710,6 +758,7 @@ class PipelineOrchestrator:
             optical_system=optics,
             opc_result=opc_result,
             ilt_result=ilt_result,
+            hybrid_result=hybrid_result,
             smo_result=smo_result,
             pw_metrics=pw_metrics,
             pw_printability=pw_printability,

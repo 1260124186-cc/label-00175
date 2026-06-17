@@ -6,6 +6,7 @@
 1. OPC (Optical Proximity Correction) - 光学邻近校正工作流
 2. SMO (Source-Mask Optimization) - 光源掩模协同优化工作流
 3. ILT (Inverse Lithography Technology) - 反演光刻工作流
+4. Hybrid OPC+ILT - OPC 与 ILT 混合精修工作流
 """
 
 try:
@@ -55,6 +56,16 @@ try:
         ILTWorkflow,
         run_ilt_workflow,
     )
+
+    from workflows.hybrid_opc_ilt import (
+        HybridOPCILTConfig,
+        LocalILTResult,
+        HybridOPCILTWorkflowResult,
+        HotspotBBoxManager,
+        LocalILTOptimizer,
+        HybridOPCILTWorkflow,
+        run_hybrid_opc_ilt_workflow,
+    )
 except ImportError:
     from .opc import (
         OPCConfig,
@@ -103,6 +114,16 @@ except ImportError:
         run_ilt_workflow,
     )
 
+    from .hybrid_opc_ilt import (
+        HybridOPCILTConfig,
+        LocalILTResult,
+        HybridOPCILTWorkflowResult,
+        HotspotBBoxManager,
+        LocalILTOptimizer,
+        HybridOPCILTWorkflow,
+        run_hybrid_opc_ilt_workflow,
+    )
+
 __all__ = [
     'OPCConfig',
     'HotspotDetector',
@@ -142,4 +163,11 @@ __all__ = [
     'MultiObjectiveILT',
     'ILTWorkflow',
     'run_ilt_workflow',
+    'HybridOPCILTConfig',
+    'LocalILTResult',
+    'HybridOPCILTWorkflowResult',
+    'HotspotBBoxManager',
+    'LocalILTOptimizer',
+    'HybridOPCILTWorkflow',
+    'run_hybrid_opc_ilt_workflow',
 ]

@@ -5,6 +5,7 @@
 包含：
 1. BatchRunner: 多 cell 并行优化调度
 2. Orchestrator: OPC → ILT → SMO → PW 全流程编排
+3. Hybrid OPC+ILT: OPC 与 ILT 混合精修模式
 """
 
 try:
@@ -29,6 +30,16 @@ try:
         PipelineOrchestrator,
         run_pipeline,
     )
+
+    from workflows.hybrid_opc_ilt import (
+        HybridOPCILTConfig,
+        LocalILTResult,
+        HybridOPCILTWorkflowResult,
+        HotspotBBoxManager,
+        LocalILTOptimizer,
+        HybridOPCILTWorkflow,
+        run_hybrid_opc_ilt_workflow,
+    )
 except ImportError:
     from .batch_runner import (
         TaskStatus,
@@ -52,6 +63,16 @@ except ImportError:
         run_pipeline,
     )
 
+    from workflows.hybrid_opc_ilt import (
+        HybridOPCILTConfig,
+        LocalILTResult,
+        HybridOPCILTWorkflowResult,
+        HotspotBBoxManager,
+        LocalILTOptimizer,
+        HybridOPCILTWorkflow,
+        run_hybrid_opc_ilt_workflow,
+    )
+
 __all__ = [
     'TaskStatus',
     'TaskResult',
@@ -69,4 +90,11 @@ __all__ = [
     'PipelineResult',
     'PipelineOrchestrator',
     'run_pipeline',
+    'HybridOPCILTConfig',
+    'LocalILTResult',
+    'HybridOPCILTWorkflowResult',
+    'HotspotBBoxManager',
+    'LocalILTOptimizer',
+    'HybridOPCILTWorkflow',
+    'run_hybrid_opc_ilt_workflow',
 ]
