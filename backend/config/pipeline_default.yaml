@@ -1,0 +1,159 @@
+# ============================================================================
+# Pipeline 编排器默认配置文件
+# ============================================================================
+# 将 OPC → ILT → SMO → PW 验签串联为可配置流水线。
+# 各阶段可独立使能/禁用，跳过的阶段将透传掩模。
+#
+# 用法:
+#   cd backend
+#   python -m pipeline.orchestrator_cli --config config/pipeline_default.yaml
+#   python -m examples.run_pipeline --config config/pipeline_default.yaml
+# ============================================================================
+
+pipeline:
+  # ---------- 阶段开关 ----------
+  enable_opc: true
+  enable_ilt: true
+  enable_smo: true
+  enable_pw_verify: true
+
+  # ---------- 输出控制 ----------
+  output_dir: results/pipeline_run
+  save_intermediate: true
+  verbose: true
+
+  # ---------- OPC 阶段参数 ----------
+  opc_config:
+    epe_threshold: 3.0
+    epe_convergence_threshold: 1.0
+    max_iterations: 10
+    min_hotspot_area: 4
+    hotspot_dilation: 2
+    edge_offset_step: 0.5
+    max_edge_offset: 3.0
+    corner_bias_size: 1.0
+    line_end_extension: 2.0
+    line_end_width: 2.0
+    sraf_enable: true
+    sraf_min_distance: 2.0
+    sraf_max_distance: 5.0
+    sraf_width: 1.0
+    sraf_length: 4.0
+    sraf_spacing: 2.0
+    sraf_min_feature_size: 1.0
+    sraf_max_aspect_ratio: 10.0
+    optimizer_enable: true
+    optimizer_max_iter: 20
+    optimizer_learning_rate: 0.05
+    optimizer_epe_weight: 1.0
+    pixel_size: 1.0
+    wafer_threshold: 0.3
+    verbose: true
+
+  # ---------- ILT 阶段参数 ----------
+  ilt_config:
+    max_iter: 200
+    learning_rate: 0.01
+    optimizer_type: adam_projection
+    convergence_tol: 1.0e-6
+    convergence_patience: 20
+    transmission_level: continuous
+    quantization_start_iter: 100
+    quantization_schedule: linear
+    quantization_strength: 1.0
+    resist_steepness: 50.0
+    wafer_threshold: 0.3
+    l2_wafer_weight: 1.0
+    binary_penalty_weight: 0.0
+    tv_smooth_weight: 0.0
+    pixel_size: 1.0
+    verbose: true
+    complexity:
+      enable: false
+      target_tv: 0.0
+      tv_weight: 0.0
+
+  # ---------- SMO 阶段参数 ----------
+  smo_config:
+    strategy: alternating
+    max_outer_iterations: 20
+    source_max_iter: 50
+    mask_max_iter: 100
+    joint_max_iter: 200
+    source_learning_rate: 0.005
+    mask_learning_rate: 0.01
+    joint_learning_rate_source: 0.003
+    joint_learning_rate_mask: 0.008
+    tol: 1.0e-5
+    convergence_patience: 5
+    source_grid_size: null
+    source_init_type: conventional
+    source_init_params: {}
+    source_constraints:
+      energy_conservation: true
+      energy_target: 1.0
+      sigma_target: null
+      sigma_tolerance: 0.02
+      smoothness_weight: 0.01
+      smoothness_type: tv
+      gaussian_sigma: 1.5
+      non_negative: true
+      support_radius: null
+      support_radius_inner: null
+    wafer_threshold: 0.3
+    pixel_size: 1.0
+    use_wafer_image_loss: true
+    mask_loss_weights:
+      mse: 1.0
+      ssim: 0.0
+      pvb: 0.0
+      mask_complexity: 0.0
+      binary_penalty: 0.0
+      tv_smooth: 0.0
+      epe: 0.5
+      min_feature: 0.0
+      weighted_mse: 0.0
+      weighted_mae: 0.0
+    source_loss_weights:
+      mse: 1.0
+      epe: 0.5
+    process_conditions: null
+    pvb_weight: 0.0
+    source_snapshot_freq: 1
+    verbose: true
+
+  # ---------- PW 验签阶段参数 ----------
+  pw_verify_config:
+    focus_range: [-150, 150, 11]
+    dose_range: [0.85, 1.15, 11]
+    cd_tolerance: 0.1
+    epe_tolerance: null
+    cd_target: null
+
+# ============================================================================
+# 光学系统参数（全流水线共用）
+# ============================================================================
+optical_system:
+  wavelength: 193.0
+  na: 1.35
+  sigma: 0.75
+  pixel_size: 1.0
+  defocus: 0.0
+  magnification: 4.0
+  illumination_type: conventional
+  source_params:
+    sigma_inner: 0.0
+    sigma_outer: 0.75
+  tcc_mode: socs
+  socs_num_terms: 5
+  zernike_coefficients: {}
+
+# ============================================================================
+# 测试图案配置（示例 / CLI 使用）
+# ============================================================================
+test_pattern:
+  type: line_space
+  grid_size: [64, 64]
+  cd: 45.0
+  pitch: 90.0
+  orientation: horizontal
