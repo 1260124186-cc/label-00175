@@ -31,7 +31,7 @@ from scipy.ndimage import (
     generate_binary_structure, gaussian_filter
 )
 
-from core.imaging import OpticalSystem
+from core.imaging import OpticalSystem, simulate_wafer_image
 from core.litho_metrics import compute_epe
 
 from workflows.opc import (
@@ -69,6 +69,7 @@ class HybridOPCILTConfig:
         run_local_ilt: 是否运行局部 ILT（False 则仅输出 OPC 结果）
 
         pixel_size: 像素尺寸 (nm)
+        wafer_threshold: 晶圆成像二值化阈值（与 OPC/ILT 口径一致）
         verbose: 是否输出详细日志
     """
     opc_config: Optional[OPCConfig] = None
@@ -86,6 +87,7 @@ class HybridOPCILTConfig:
     run_local_ilt: bool = True
 
     pixel_size: float = 1.0
+    wafer_threshold: float = 0.3
     verbose: bool = True
 
     @classmethod
@@ -122,6 +124,7 @@ class HybridOPCILTConfig:
             'run_global_opc': self.run_global_opc,
             'run_local_ilt': self.run_local_ilt,
             'pixel_size': self.pixel_size,
+            'wafer_threshold': self.wafer_threshold,
             'verbose': self.verbose,
         }
 
@@ -139,8 +142,10 @@ class LocalILTResult:
         bbox: 优化区域 bbox (y_min, y_max, x_min, x_max)
         initial_mask_local: 初始局部掩模
         optimal_mask_local: 优化后局部掩模
-        initial_epe: 初始 EPE 统计
-        final_epe: 最终 EPE 统计
+        initial_wafer: 初始局部 wafer（成像后二值化结果）
+        optimal_wafer: 优化后局部 wafer（成像后二值化结果）
+        initial_epe: 初始 EPE 统计（基于成像后 wafer 计算）
+        final_epe: 最终 EPE 统计（基于成像后 wafer 计算）
         ilt_result: 完整的 ILT 工作流结果
         feather_weight: 羽化权重图（与局部掩模同尺寸）
     """
@@ -148,6 +153,8 @@ class LocalILTResult:
     bbox: Tuple[int, int, int, int]
     initial_mask_local: np.ndarray
     optimal_mask_local: np.ndarray
+    initial_wafer: np.ndarray
+    optimal_wafer: np.ndarray
     initial_epe: Dict[str, float]
     final_epe: Dict[str, float]
     ilt_result: Optional[ILTWorkflowResult] = None
@@ -178,9 +185,13 @@ class HybridOPCILTWorkflowResult:
         final_mask: 混合精修后最终掩模
         target: 目标图案
 
-        initial_epe: 初始 EPE 统计
-        opc_epe: OPC 后 EPE 统计
-        final_epe: 最终 EPE 统计
+        initial_wafer: 初始 wafer（成像后二值化结果）
+        opc_wafer: OPC 后 wafer（成像后二值化结果）
+        final_wafer: 最终 wafer（成像后二值化结果）
+
+        initial_epe: 初始 EPE 统计（基于成像后 wafer 计算）
+        opc_epe: OPC 后 EPE 统计（基于成像后 wafer 计算）
+        final_epe: 最终 EPE 统计（基于成像后 wafer 计算）
 
         opc_result: OPC 工作流完整结果
         local_ilt_results: 各热点局部 ILT 优化结果列表
@@ -199,6 +210,10 @@ class HybridOPCILTWorkflowResult:
     opc_mask: np.ndarray
     final_mask: np.ndarray
     target: np.ndarray
+
+    initial_wafer: np.ndarray
+    opc_wafer: np.ndarray
+    final_wafer: np.ndarray
 
     initial_epe: Dict[str, float]
     opc_epe: Dict[str, float]
@@ -344,6 +359,9 @@ class HotspotBBoxManager:
         """
         合并重叠或邻近的热点区域
 
+        注意：即使只有 1 个热点，也会统一执行 bbox padding/expand，
+        确保单热点和多热点场景的处理逻辑一致。
+
         Args:
             hotspots: 原始热点列表
             image_shape: 图像尺寸
@@ -351,10 +369,27 @@ class HotspotBBoxManager:
         Returns:
             合并后的热点列表
         """
-        if len(hotspots) <= 1:
+        if len(hotspots) == 0:
             return hotspots
 
         expanded = [self.expand_bbox(h.bbox, image_shape) for h in hotspots]
+
+        if len(hotspots) == 1:
+            h = hotspots[0]
+            single_expanded = expanded[0]
+            cy = (single_expanded[0] + single_expanded[1]) / 2.0
+            cx = (single_expanded[2] + single_expanded[3]) / 2.0
+            single_result = HotspotRegion(
+                bbox=single_expanded,
+                center=(cy, cx),
+                epe_mean=h.epe_mean,
+                epe_max=h.epe_max,
+                area=h.area,
+                edge_type=h.edge_type,
+                priority=h.priority
+            )
+            return [single_result]
+
         merged_indices = list(range(len(hotspots)))
 
         for i in range(len(hotspots)):
@@ -597,14 +632,20 @@ class LocalILTOptimizer:
         if self.config.verbose:
             logger.info(f"  热点 #{hotspot_idx}: bbox={bbox}, 尺寸={local_mask.shape}")
 
-        initial_epe = compute_epe(
-            (local_mask >= 0.5).astype(np.float64),
-            local_target,
-            pixel_size=self.config.pixel_size
-        )
-
         bbox_manager = HotspotBBoxManager(self.config)
         feather_weight = bbox_manager.create_feather_weight(local_mask.shape)
+
+        initial_wafer_cont = simulate_wafer_image(
+            local_mask,
+            optical_system=self.optical_system,
+            threshold=self.config.wafer_threshold,
+            apply_resist=True
+        )
+        initial_wafer = (initial_wafer_cont >= self.config.wafer_threshold).astype(np.float64)
+        initial_epe = compute_epe(
+            initial_wafer, local_target,
+            pixel_size=self.config.pixel_size
+        )
 
         ilt_config = self.ilt_config
         if self.config.verbose:
@@ -617,10 +658,12 @@ class LocalILTOptimizer:
                 config=ilt_config
             )
             optimal_local = ilt_result.optimal_mask
+            optimal_wafer = ilt_result.optimal_wafer
             final_epe = ilt_result.final_epe
         except Exception as e:
             logger.warning(f"    局部 ILT 优化失败，跳过: {e}")
             optimal_local = local_mask.copy()
+            optimal_wafer = initial_wafer.copy()
             final_epe = initial_epe
             ilt_result = None
 
@@ -634,6 +677,8 @@ class LocalILTOptimizer:
             bbox=bbox,
             initial_mask_local=local_mask.copy(),
             optimal_mask_local=optimal_local.copy(),
+            initial_wafer=initial_wafer.copy(),
+            optimal_wafer=optimal_wafer.copy(),
             initial_epe=initial_epe,
             final_epe=final_epe,
             ilt_result=ilt_result,
@@ -702,9 +747,15 @@ class HybridOPCILTWorkflow:
         target = target.astype(np.float64)
         image_shape = initial_mask.shape
 
-        wafer_initial = (initial_mask >= 0.5).astype(np.float64)
+        initial_wafer_cont = simulate_wafer_image(
+            initial_mask,
+            optical_system=self.optical_system,
+            threshold=cfg.wafer_threshold,
+            apply_resist=True
+        )
+        initial_wafer = (initial_wafer_cont >= cfg.wafer_threshold).astype(np.float64)
         initial_epe = compute_epe(
-            wafer_initial, target, pixel_size=cfg.pixel_size
+            initial_wafer, target, pixel_size=cfg.pixel_size
         )
 
         if cfg.verbose:
@@ -716,6 +767,7 @@ class HybridOPCILTWorkflow:
 
         opc_result = None
         opc_mask = initial_mask.copy()
+        opc_wafer = initial_wafer.copy()
         opc_epe = initial_epe
         opc_time = 0.0
 
@@ -733,6 +785,7 @@ class HybridOPCILTWorkflow:
                 optical_system=self.optical_system
             )
             opc_mask = opc_result.corrected_mask.copy()
+            opc_wafer = opc_result.corrected_wafer.copy()
             opc_epe = opc_result.final_epe
             opc_time = time.time() - t0
 
@@ -819,9 +872,15 @@ class HybridOPCILTWorkflow:
             logger.info("阶段 4/4: 最终评估")
             logger.info("-" * 50)
 
-        wafer_final = (final_mask >= 0.5).astype(np.float64)
+        final_wafer_cont = simulate_wafer_image(
+            final_mask,
+            optical_system=self.optical_system,
+            threshold=cfg.wafer_threshold,
+            apply_resist=True
+        )
+        final_wafer = (final_wafer_cont >= cfg.wafer_threshold).astype(np.float64)
         final_epe = compute_epe(
-            wafer_final, target, pixel_size=cfg.pixel_size
+            final_wafer, target, pixel_size=cfg.pixel_size
         )
 
         if cfg.verbose:
@@ -848,6 +907,9 @@ class HybridOPCILTWorkflow:
             opc_mask=opc_mask.copy(),
             final_mask=final_mask.copy(),
             target=target.copy(),
+            initial_wafer=initial_wafer.copy(),
+            opc_wafer=opc_wafer.copy(),
+            final_wafer=final_wafer.copy(),
             initial_epe=initial_epe,
             opc_epe=opc_epe,
             final_epe=final_epe,
