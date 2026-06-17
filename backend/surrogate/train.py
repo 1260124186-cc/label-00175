@@ -52,6 +52,29 @@ from .dataset import (
 
 
 @dataclass
+class ExportConfig:
+    """
+    模型生产化导出配置
+
+    Attributes:
+        export_onnx: 是否导出 ONNX 格式
+        export_torchscript: 是否导出 TorchScript 格式
+        onnx_opset_version: ONNX opset 版本
+        dynamic_batch: 是否支持动态 batch 维度
+        optimize: 是否对导出模型进行优化
+        validate_export: 导出后是否验证模型正确性
+        simplify_onnx: 是否使用 onnx-simplifier 简化 ONNX 模型
+    """
+    export_onnx: bool = True
+    export_torchscript: bool = True
+    onnx_opset_version: int = 17
+    dynamic_batch: bool = True
+    optimize: bool = True
+    validate_export: bool = True
+    simplify_onnx: bool = True
+
+
+@dataclass
 class TrainingConfig:
     """
     训练超参数配置
@@ -100,6 +123,9 @@ class TrainingConfig:
         # 验证
         val_batch_size: 验证批大小（默认等于 batch_size）
         log_interval: 每隔多少个 batch 打印一次训练日志
+
+        # 生产化导出
+        export: 导出配置
     """
     epochs: int = 100
     batch_size: int = 16
@@ -138,11 +164,15 @@ class TrainingConfig:
     val_batch_size: Optional[int] = None
     log_interval: int = 20
 
+    export: ExportConfig = field(default_factory=ExportConfig)
+
     def to_dict(self) -> dict:
         d = {}
         for k, v in self.__dict__.items():
             if isinstance(v, tuple):
                 d[k] = list(v)
+            elif isinstance(v, ExportConfig):
+                d[k] = asdict(v)
             else:
                 d[k] = v
         return d
@@ -152,7 +182,9 @@ class TrainingConfig:
         cfg = cls()
         for k, v in d.items():
             if hasattr(cfg, k):
-                if isinstance(getattr(cfg, k), tuple) and isinstance(v, list):
+                if k == 'export' and isinstance(v, dict):
+                    setattr(cfg, k, ExportConfig(**v))
+                elif isinstance(getattr(cfg, k), tuple) and isinstance(v, list):
                     setattr(cfg, k, tuple(v))
                 else:
                     setattr(cfg, k, v)
@@ -349,6 +381,14 @@ def _set_seed(seed: Optional[int]):
 
 
 @dataclass
+class ExportPaths:
+    """导出文件路径"""
+    onnx_path: Optional[str] = None
+    torchscript_path: Optional[str] = None
+    metadata_path: Optional[str] = None
+
+
+@dataclass
 class TrainResult:
     """训练结果封装"""
     model: nn.Module
@@ -361,14 +401,22 @@ class TrainResult:
     val_metrics_history: List[Dict[str, float]]
     total_time: float
     checkpoint_path: str
+    export_paths: ExportPaths = field(default_factory=ExportPaths)
 
     def summary(self) -> str:
-        return (
+        parts = [
             f"训练完成: 最佳 epoch={self.best_epoch}, "
             f"最佳 val_loss={self.best_val_loss:.6f}, "
             f"总耗时={self.total_time:.1f}s\n"
-            f"模型保存在: {self.checkpoint_path}"
-        )
+            f"PyTorch Checkpoint: {self.checkpoint_path}"
+        ]
+        if self.export_paths.onnx_path:
+            parts.append(f"ONNX 模型: {self.export_paths.onnx_path}")
+        if self.export_paths.torchscript_path:
+            parts.append(f"TorchScript 模型: {self.export_paths.torchscript_path}")
+        if self.export_paths.metadata_path:
+            parts.append(f"元数据: {self.export_paths.metadata_path}")
+        return "\n".join(parts)
 
 
 def _validate_one_epoch(
@@ -693,6 +741,31 @@ def train_surrogate_model(
     if not os.path.exists(best_model_path):
         torch.save(final_ckpt, best_model_path)
 
+    # ----------------------------------------------------------
+    # 生产化导出：ONNX + TorchScript + 元数据
+    # ----------------------------------------------------------
+    export_paths = ExportPaths()
+    export_cfg = train_cfg.export
+
+    if export_cfg.export_onnx or export_cfg.export_torchscript:
+        if verbose:
+            logger.info("开始生产化模型导出...")
+
+        if val_metrics_history:
+            extra_metrics = val_metrics_history[-1]
+        else:
+            extra_metrics = None
+
+        export_paths = export_trained_model(
+            model=model,
+            output_dir=train_cfg.output_dir,
+            model_config=model_cfg,
+            training_config=train_cfg,
+            grid_size=train_cfg.grid_size,
+            device=device,
+            extra_metrics=extra_metrics,
+        )
+
     result = TrainResult(
         model=model,
         model_config=model_cfg,
@@ -704,12 +777,394 @@ def train_surrogate_model(
         val_metrics_history=val_metrics_history,
         total_time=total_time,
         checkpoint_path=best_model_path,
+        export_paths=export_paths,
     )
 
     if verbose:
         logger.info(result.summary())
 
     return result
+
+
+# ======================================================================
+# 模型生产化导出
+# ======================================================================
+
+
+def export_to_onnx(
+    model: nn.Module,
+    output_path: str,
+    input_shape: Tuple[int, int, int, int] = (1, 1, 128, 128),
+    opset_version: int = 17,
+    dynamic_batch: bool = True,
+    optimize: bool = True,
+    validate: bool = True,
+    simplify: bool = True,
+    device: Optional[torch.device] = None,
+) -> Optional[str]:
+    """
+    导出 PyTorch 模型为 ONNX 格式
+
+    Args:
+        model: 训练好的 PyTorch 模型
+        output_path: 输出 .onnx 文件路径
+        input_shape: 示例输入形状 (B, C, H, W)
+        opset_version: ONNX opset 版本
+        dynamic_batch: 是否支持动态 batch 维度
+        optimize: 是否进行优化（冻结 BatchNorm 等）
+        validate: 导出后验证 ONNX 模型
+        simplify: 是否使用 onnx-simplifier 简化
+        device: 设备，None 则自动选择
+
+    Returns:
+        成功返回输出路径，失败返回 None
+    """
+    try:
+        if device is None:
+            device = select_device('cpu')
+
+        model = model.to(device)
+        model.eval()
+
+        if optimize:
+            model = _optimize_model_for_export(model)
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)) or '.', exist_ok=True)
+
+        dummy_input = torch.randn(input_shape, device=device)
+
+        dynamic_axes = None
+        if dynamic_batch:
+            dynamic_axes = {
+                'input': {0: 'batch_size'},
+                'output': {0: 'batch_size'},
+            }
+
+        with torch.no_grad():
+            torch.onnx.export(
+                model,
+                dummy_input,
+                output_path,
+                export_params=True,
+                opset_version=opset_version,
+                do_constant_folding=True,
+                input_names=['input'],
+                output_names=['output'],
+                dynamic_axes=dynamic_axes,
+                verbose=False,
+            )
+
+        if simplify:
+            try:
+                import onnx
+                import onnxsim
+                model_onnx = onnx.load(output_path)
+                model_simplified, check = onnxsim.simplify(model_onnx)
+                if check:
+                    onnx.save(model_simplified, output_path)
+                    logger.info("ONNX 模型已使用 onnx-simplifier 优化")
+                else:
+                    logger.warning("onnx-simplifier 检查失败，使用原始 ONNX 模型")
+            except ImportError:
+                logger.warning("onnx-simplifier 未安装，跳过简化步骤")
+            except Exception as e:
+                logger.warning(f"onnx-simplifier 简化失败: {e}")
+
+        if validate:
+            try:
+                import onnx
+                import onnxruntime as ort
+
+                onnx_model = onnx.load(output_path)
+                onnx.checker.check_model(onnx_model)
+                logger.info("ONNX 模型结构检查通过")
+
+                ort_session = ort.InferenceSession(
+                    output_path,
+                    providers=['CPUExecutionProvider']
+                )
+
+                with torch.no_grad():
+                    torch_output = model(dummy_input).cpu().numpy()
+
+                ort_inputs = {ort_session.get_inputs()[0].name: dummy_input.cpu().numpy()}
+                ort_outputs = ort_session.run(None, ort_inputs)
+                ort_output = ort_outputs[0]
+
+                max_diff = np.max(np.abs(torch_output - ort_output))
+                mean_diff = np.mean(np.abs(torch_output - ort_output))
+
+                if max_diff < 1e-4:
+                    logger.info(
+                        f"ONNX 推理验证通过: 最大差异={max_diff:.2e}, "
+                        f"平均差异={mean_diff:.2e}"
+                    )
+                else:
+                    logger.warning(
+                        f"ONNX 推理差异较大: 最大差异={max_diff:.2e}, "
+                        f"平均差异={mean_diff:.2e}"
+                    )
+
+            except ImportError as e:
+                logger.warning(f"ONNX 验证依赖未安装: {e}，跳过验证")
+            except Exception as e:
+                logger.warning(f"ONNX 验证失败: {e}")
+
+        logger.info(f"ONNX 模型已导出: {output_path}")
+        return output_path
+
+    except Exception as e:
+        logger.error(f"ONNX 导出失败: {e}")
+        return None
+
+
+def export_to_torchscript(
+    model: nn.Module,
+    output_path: str,
+    input_shape: Tuple[int, int, int, int] = (1, 1, 128, 128),
+    method: str = 'trace',
+    optimize: bool = True,
+    validate: bool = True,
+    device: Optional[torch.device] = None,
+) -> Optional[str]:
+    """
+    导出 PyTorch 模型为 TorchScript 格式
+
+    Args:
+        model: 训练好的 PyTorch 模型
+        output_path: 输出 .pt 文件路径
+        input_shape: 示例输入形状 (B, C, H, W)
+        method: 'trace' (使用 torch.jit.trace) 或 'script' (使用 torch.jit.script)
+        optimize: 是否进行优化
+        validate: 导出后验证 TorchScript 模型
+        device: 设备，None 则自动选择
+
+    Returns:
+        成功返回输出路径，失败返回 None
+    """
+    try:
+        if device is None:
+            device = select_device('cpu')
+
+        model = model.to(device)
+        model.eval()
+
+        if optimize:
+            model = _optimize_model_for_export(model)
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)) or '.', exist_ok=True)
+
+        dummy_input = torch.randn(input_shape, device=device)
+
+        with torch.no_grad():
+            if method == 'trace':
+                scripted_model = torch.jit.trace(model, dummy_input)
+            elif method == 'script':
+                scripted_model = torch.jit.script(model)
+            else:
+                raise ValueError(f"未知的导出方法: {method}，支持 'trace' 或 'script'")
+
+        scripted_model.save(output_path)
+
+        if validate:
+            try:
+                loaded_model = torch.jit.load(output_path, map_location=device)
+                loaded_model.eval()
+
+                with torch.no_grad():
+                    original_output = model(dummy_input)
+                    scripted_output = loaded_model(dummy_input)
+
+                max_diff = torch.max(torch.abs(original_output - scripted_output)).item()
+                mean_diff = torch.mean(torch.abs(original_output - scripted_output)).item()
+
+                if max_diff < 1e-5:
+                    logger.info(
+                        f"TorchScript 推理验证通过: 最大差异={max_diff:.2e}, "
+                        f"平均差异={mean_diff:.2e}"
+                    )
+                else:
+                    logger.warning(
+                        f"TorchScript 推理差异较大: 最大差异={max_diff:.2e}, "
+                        f"平均差异={mean_diff:.2e}"
+                    )
+
+            except Exception as e:
+                logger.warning(f"TorchScript 验证失败: {e}")
+
+        logger.info(f"TorchScript 模型已导出: {output_path}")
+        return output_path
+
+    except Exception as e:
+        logger.error(f"TorchScript 导出失败: {e}")
+        return None
+
+
+def _optimize_model_for_export(model: nn.Module) -> nn.Module:
+    """
+    优化模型以便导出：
+    1. 切换到 eval 模式（冻结 BatchNorm/Dropout 等训练专用层）
+    2. 尝试将 BatchNorm 层参数合并到卷积层中（如果可用）
+    """
+    model.eval()
+
+    try:
+        import torch
+        from torch.fx import symbolic_trace
+        from torch.ao.quantization.fuse_modules import fuse_conv_bn
+
+        model.eval()
+        for module in model.modules():
+            if isinstance(module, nn.BatchNorm2d):
+                module.eval()
+
+        return model
+    except ImportError:
+        logger.info("未安装完整量化工具，仅启用 eval 模式")
+        model.eval()
+        return model
+    except Exception as e:
+        logger.debug(f"模型优化跳过: {e}")
+        model.eval()
+        return model
+
+
+def export_metadata(
+    output_path: str,
+    model_config: SurrogateModelConfig,
+    training_config: TrainingConfig,
+    grid_size: Tuple[int, int],
+    export_paths: ExportPaths,
+    extra_info: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    导出模型元数据 JSON 文件，供推理服务使用
+
+    Args:
+        output_path: 输出 JSON 文件路径
+        model_config: 模型配置
+        training_config: 训练配置
+        grid_size: 输入图像尺寸 (H, W)
+        export_paths: 导出文件路径
+        extra_info: 额外信息（如评估指标）
+
+    Returns:
+        输出文件路径
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)) or '.', exist_ok=True)
+
+    metadata = {
+        'model': {
+            'type': model_config.model_type,
+            'input_shape': [-1, model_config.in_channels, grid_size[0], grid_size[1]],
+            'output_shape': [-1, model_config.out_channels, grid_size[0], grid_size[1]],
+            'input_dtype': 'float32',
+            'output_dtype': 'float32',
+            'input_range': [0.0, 1.0],
+            'output_range': [0.0, 1.0],
+            'num_parameters': sum(p.numel() for p in build_model(model_config).parameters()),
+            'config': model_config.to_dict(),
+        },
+        'export': {
+            'created_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'onnx_path': export_paths.onnx_path,
+            'torchscript_path': export_paths.torchscript_path,
+            'opset_version': training_config.export.onnx_opset_version,
+            'dynamic_batch': training_config.export.dynamic_batch,
+        },
+        'preprocessing': {
+            'normalize': False,
+            'mean': [0.0],
+            'std': [1.0],
+            'input_format': 'NCHW',
+            'channel_order': 'first',
+        },
+        'postprocessing': {
+            'sigmoid': model_config.final_activation == 'sigmoid',
+            'clip': [0.0, 1.0],
+        },
+        'performance_hints': {
+            'recommended_batch_size': training_config.batch_size,
+            'recommended_device': 'cpu',
+            'approx_latency_ms_per_batch': None,
+        },
+    }
+
+    if extra_info:
+        metadata['extra'] = extra_info
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+    logger.info(f"元数据已导出: {output_path}")
+    return output_path
+
+
+def export_trained_model(
+    model: nn.Module,
+    output_dir: str,
+    model_config: SurrogateModelConfig,
+    training_config: TrainingConfig,
+    grid_size: Tuple[int, int],
+    device: Optional[torch.device] = None,
+    extra_metrics: Optional[Dict[str, Any]] = None,
+) -> ExportPaths:
+    """
+    执行完整的生产化导出流程（ONNX + TorchScript + 元数据）
+
+    Args:
+        model: 训练好的 PyTorch 模型
+        output_dir: 输出目录
+        model_config: 模型配置
+        training_config: 训练配置
+        grid_size: 图像尺寸 (H, W)
+        device: 设备
+        extra_metrics: 额外的评估指标
+
+    Returns:
+        ExportPaths 包含所有导出文件路径
+    """
+    export_cfg = training_config.export
+    input_shape = (1, 1, grid_size[0], grid_size[1])
+
+    paths = ExportPaths()
+
+    if export_cfg.export_onnx:
+        onnx_path = os.path.join(output_dir, 'model.onnx')
+        paths.onnx_path = export_to_onnx(
+            model=model,
+            output_path=onnx_path,
+            input_shape=input_shape,
+            opset_version=export_cfg.onnx_opset_version,
+            dynamic_batch=export_cfg.dynamic_batch,
+            optimize=export_cfg.optimize,
+            validate=export_cfg.validate_export,
+            simplify=export_cfg.simplify_onnx,
+            device=device,
+        )
+
+    if export_cfg.export_torchscript:
+        ts_path = os.path.join(output_dir, 'model.pt')
+        paths.torchscript_path = export_to_torchscript(
+            model=model,
+            output_path=ts_path,
+            input_shape=input_shape,
+            method='trace',
+            optimize=export_cfg.optimize,
+            validate=export_cfg.validate_export,
+            device=device,
+        )
+
+    paths.metadata_path = export_metadata(
+        output_path=os.path.join(output_dir, 'metadata.json'),
+        model_config=model_config,
+        training_config=training_config,
+        grid_size=grid_size,
+        export_paths=paths,
+        extra_info=extra_metrics,
+    )
+
+    return paths
 
 
 # ======================================================================

@@ -175,12 +175,11 @@ class UpBlock(nn.Module):
         """对 x 做零填充以匹配 target 的空间尺寸"""
         diff_y = target.size()[2] - x.size()[2]
         diff_x = target.size()[3] - x.size()[3]
-        if diff_y != 0 or diff_x != 0:
-            x = F.pad(x, [
-                diff_x // 2, diff_x - diff_x // 2,
-                diff_y // 2, diff_y - diff_y // 2
-            ])
-        return x
+        pad_left = diff_x // 2
+        pad_right = diff_x - pad_left
+        pad_top = diff_y // 2
+        pad_bottom = diff_y - pad_top
+        return F.pad(x, [pad_left, pad_right, pad_top, pad_bottom])
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         x = self.up(x)
@@ -288,7 +287,7 @@ class UNet(nn.Module):
         x = self.bottleneck(x)
 
         for i, up in enumerate(self.up_blocks):
-            skip_idx = len(self.down_blocks) - i
+            skip_idx = len(self.down_blocks) - 1 - i
             x = up(x, skips[skip_idx])
 
         logits = self.outc(x)

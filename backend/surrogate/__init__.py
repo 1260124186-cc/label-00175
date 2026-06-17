@@ -39,9 +39,15 @@ try:
     )
     from surrogate.train import (
         TrainingConfig,
+        ExportConfig,
+        ExportPaths,
+        TrainResult,
         train_surrogate_model,
         evaluate_surrogate_model,
         load_trained_model,
+        export_to_onnx,
+        export_to_torchscript,
+        export_trained_model,
     )
 except ImportError:
     from .model import UNet, SurrogateModelConfig
@@ -70,9 +76,15 @@ except ImportError:
     )
     from .train import (
         TrainingConfig,
+        ExportConfig,
+        ExportPaths,
+        TrainResult,
         train_surrogate_model,
         evaluate_surrogate_model,
         load_trained_model,
+        export_to_onnx,
+        export_to_torchscript,
+        export_trained_model,
     )
 
 __all__ = [
@@ -98,7 +110,13 @@ __all__ = [
     'save_dataset_hdf5',
     'load_dataset_hdf5',
     'TrainingConfig',
+    'ExportConfig',
+    'ExportPaths',
+    'TrainResult',
     'train_surrogate_model',
     'evaluate_surrogate_model',
     'load_trained_model',
+    'export_to_onnx',
+    'export_to_torchscript',
+    'export_trained_model',
 ]
