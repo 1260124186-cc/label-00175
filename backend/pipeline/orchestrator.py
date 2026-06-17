@@ -38,7 +38,7 @@ from enum import Enum
 
 import numpy as np
 
-from core.imaging import OpticalSystem
+from core.imaging import OpticalSystem, IlluminationType
 from core.litho_metrics import compute_epe
 from core.metrics import total_variation_isotropic
 
@@ -195,6 +195,7 @@ class PipelineResult:
     pw_printability: Optional[PrintabilityResult] = None
 
     optimal_source: Optional[np.ndarray] = None
+    pw_optical_system: Optional[OpticalSystem] = None
 
     stage_metrics: List[StageMetrics] = field(default_factory=list)
     total_time: float = 0.0
@@ -293,6 +294,12 @@ class PipelineResult:
         else:
             summary['source'] = None
 
+        summary['validation'] = {
+            'pw_uses_smo_source': self.pw_uses_smo_source,
+        }
+        if self.pw_metrics is not None and self.optimal_source is not None:
+            summary['validation']['pw_source_consistency'] = self.validate_pw_source_consistency()
+
         return summary
 
     def sign_off_text(self) -> str:
@@ -348,9 +355,117 @@ class PipelineResult:
             tag = "(skipped)" if m['skipped'] else f"{m['elapsed_sec']:.2f}s"
             lines.append(f"  {m['stage_name']:12s} : {tag}")
         lines.append(f"  {'Total':12s} : {s.get('pipeline', {}).get('total_time_sec', 0):.2f}s")
+
+        validation = s.get('validation', {})
+        if validation:
+            lines.append("")
+            lines.append("[Validation]")
+            pw_src_ok = validation.get('pw_uses_smo_source', None)
+            if pw_src_ok is True:
+                lines.append(f"  PW uses SMO source: PASS")
+            elif pw_src_ok is False:
+                lines.append(f"  PW uses SMO source: FAIL  (sign-off PW metrics NOT based on SMO result!)")
+            else:
+                lines.append(f"  PW uses SMO source: N/A")
+
         lines.append("=" * 64)
 
         return "\n".join(lines)
+
+    @property
+    def pw_uses_smo_source(self) -> bool:
+        """
+        回归验证：检查 PW 验签是否使用了 SMO 优化后的光源。
+
+        当 SMO 和 PW 都启用时，PW 必须复用 SMO 产出的 optimal_source，
+        否则 sign-off 的 PW 指标不代表最终联合优化结果。
+
+        Returns:
+            True 表示 PW 使用了 SMO 光源（或 SMO/PW 未同时启用），
+            False 表示存在 Bug：SMO 启用但 PW 未使用其光源。
+        """
+        if self.optimal_source is None:
+            return True
+        if self.pw_metrics is None:
+            return True
+        if self.pw_optical_system is None:
+            return False
+        if self.pw_optical_system.illumination_type != IlluminationType.CUSTOM:
+            return False
+        if self.pw_optical_system.custom_source is None:
+            return False
+        smo_src = self.optimal_source
+        pw_src = self.pw_optical_system.custom_source
+        if smo_src.shape != pw_src.shape:
+            return False
+        return bool(np.allclose(smo_src, pw_src, atol=1e-10))
+
+    def validate_pw_source_consistency(self) -> Dict[str, Any]:
+        """
+        回归验证：详细检查 PW 验签光源与 SMO 最优光源的一致性。
+
+        用于确保 sign-off 的 PW 指标基于最终 SMO 联合优化结果，
+        而不是默认光源或中间态光源。
+
+        Returns:
+            包含验证结果的字典：passed、checks、details
+        """
+        checks: Dict[str, Any] = {}
+        details: Dict[str, Any] = {}
+
+        smo_enabled = self.optimal_source is not None
+        pw_enabled = self.pw_metrics is not None
+
+        checks['smo_enabled'] = smo_enabled
+        checks['pw_enabled'] = pw_enabled
+
+        if not smo_enabled or not pw_enabled:
+            return {
+                'passed': True,
+                'reason': 'SMO and PW are not both enabled, no consistency check needed',
+                'checks': checks,
+                'details': details,
+            }
+
+        checks['pw_optical_system_present'] = self.pw_optical_system is not None
+        if self.pw_optical_system is None:
+            return {
+                'passed': False,
+                'reason': 'PW optical system not saved in result',
+                'checks': checks,
+                'details': details,
+            }
+
+        pw_opt = self.pw_optical_system
+        checks['illumination_type_is_custom'] = pw_opt.illumination_type == IlluminationType.CUSTOM
+        checks['custom_source_not_none'] = pw_opt.custom_source is not None
+
+        if pw_opt.custom_source is not None:
+            smo_src = self.optimal_source
+            pw_src = pw_opt.custom_source
+            checks['shape_match'] = smo_src.shape == pw_src.shape
+            if smo_src.shape == pw_src.shape:
+                max_diff = float(np.max(np.abs(smo_src - pw_src)))
+                mean_diff = float(np.mean(np.abs(smo_src - pw_src)))
+                total_energy_smo = float(np.sum(smo_src))
+                total_energy_pw = float(np.sum(pw_src))
+                checks['values_match'] = bool(np.allclose(smo_src, pw_src, atol=1e-10))
+                details['max_source_diff'] = round(max_diff, 10)
+                details['mean_source_diff'] = round(mean_diff, 10)
+                details['smo_source_total_energy'] = round(total_energy_smo, 8)
+                details['pw_source_total_energy'] = round(total_energy_pw, 8)
+            else:
+                details['smo_source_shape'] = list(smo_src.shape)
+                details['pw_source_shape'] = list(pw_src.shape)
+
+        details['smo_illumination_type'] = str(pw_opt.illumination_type)
+
+        all_passed = all(v for k, v in checks.items() if k not in ('smo_enabled', 'pw_enabled'))
+        return {
+            'passed': all_passed,
+            'checks': checks,
+            'details': details,
+        }
 
 
 class PipelineOrchestrator:
@@ -498,7 +613,7 @@ class PipelineOrchestrator:
                     pixel_size=optics.pixel_size,
                     defocus=optics.defocus,
                     magnification=optics.magnification,
-                    illumination_type=optics.illumination_type,
+                    illumination_type=IlluminationType.CUSTOM,
                     source_params=dict(optics.source_params),
                     tcc_mode=optics.tcc_mode,
                     socs_num_terms=optics.socs_num_terms,
@@ -599,6 +714,7 @@ class PipelineOrchestrator:
             pw_metrics=pw_metrics,
             pw_printability=pw_printability,
             optimal_source=optimal_source,
+            pw_optical_system=pw_optics if cfg.enable_pw_verify else None,
             stage_metrics=stage_metrics,
             total_time=total_time,
         )
