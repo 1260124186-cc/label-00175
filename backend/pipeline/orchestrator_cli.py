@@ -162,6 +162,46 @@ def build_pipeline_config_from_yaml(yaml_path: str,
     return cfg
 
 
+def build_smoke_config_from_yaml(yaml_path: Optional[str] = None,
+                                 enable_opc: bool = True,
+                                 enable_ilt: bool = True,
+                                 enable_smo: bool = True,
+                                 enable_pw: bool = True,
+                                 output_dir: Optional[str] = None) -> PipelineConfig:
+    """smoke 模式：从 YAML 读完整配置形成闭环，再覆盖迭代数/SRAF/中间产物保存"""
+    if yaml_path is None:
+        yaml_path = resolve_config_path('pipeline_default.yaml')
+
+    cfg = build_pipeline_config_from_yaml(
+        yaml_path,
+        enable_opc=enable_opc,
+        enable_ilt=enable_ilt,
+        enable_smo=enable_smo,
+        enable_pw=enable_pw,
+        output_dir=output_dir,
+        save_intermediate=False,
+    )
+
+    if cfg.opc_config is not None:
+        cfg.opc_config.max_iterations = 3
+        cfg.opc_config.optimizer_max_iter = 5
+        cfg.opc_config.sraf_enable = False
+        cfg.opc_config.verbose = True
+    if cfg.ilt_config is not None:
+        cfg.ilt_config.max_iter = 30
+        cfg.ilt_config.convergence_patience = 5
+        cfg.ilt_config.verbose = True
+    if cfg.smo_config is not None:
+        cfg.smo_config.max_outer_iterations = 2
+        cfg.smo_config.source_max_iter = 10
+        cfg.smo_config.mask_max_iter = 20
+        cfg.smo_config.verbose = True
+
+    cfg.save_intermediate = False
+    cfg.verbose = True
+    return cfg
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Litho Pipeline Orchestrator: OPC → ILT → SMO → PW Verify'
@@ -247,24 +287,15 @@ def main():
 
     # --- Pipeline 配置 ---
     if args.smoke:
-        from pipeline.orchestrator import PWVerifyConfig
-        from workflows.opc import OPCConfig
-        from workflows.ilt import ILTConfig
-        from workflows.smo import SMOConfig
-
-        pipeline_config = PipelineConfig(
+        if cfg_path is None:
+            cfg_path = resolve_config_path('pipeline_default.yaml')
+        pipeline_config = build_smoke_config_from_yaml(
+            cfg_path,
             enable_opc=not args.no_opc,
             enable_ilt=not args.no_ilt,
             enable_smo=not args.no_smo,
-            enable_pw_verify=not args.no_pw,
-            opc_config=OPCConfig(max_iterations=3, optimizer_max_iter=5, sraf_enable=False, verbose=True),
-            ilt_config=ILTConfig(max_iter=30, convergence_patience=5, verbose=True),
-            smo_config=SMOConfig(strategy='alternating', max_outer_iterations=2, source_max_iter=10,
-                                 mask_max_iter=20, verbose=True),
-            pw_verify_config=None,
-            save_intermediate=not args.no_intermediate,
+            enable_pw=not args.no_pw,
             output_dir=args.output,
-            verbose=True,
         )
     elif cfg_path is not None:
         pipeline_config = build_pipeline_config_from_yaml(

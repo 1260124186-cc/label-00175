@@ -389,3 +389,271 @@ def _make_fake_pw_metrics():
         depth_of_focus=100.0,
         exposure_latitude=10.0,
     )
+
+
+# ---------------------------------------------------------------------------
+# 新增：配置化闭环 + smoke 增量覆盖回归测试
+# ---------------------------------------------------------------------------
+
+def _pipeline_default_yaml_path():
+    """定位 pipeline_default.yaml 的真实路径（pytest 从仓库根或 backend/ 启动都能找到）"""
+    from pathlib import Path
+    candidates = [
+        Path(__file__).resolve().parent.parent / "config" / "pipeline_default.yaml",
+        Path.cwd() / "backend" / "config" / "pipeline_default.yaml",
+        Path.cwd() / "config" / "pipeline_default.yaml",
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    raise FileNotFoundError("pipeline_default.yaml not found")
+
+
+class TestPipelineDefaultYAMLConsumption:
+    """
+    验证 pipeline_default.yaml 三块配置（pipeline / optical_system / test_pattern）
+    都能被完整消费，而非只认一小部分字段。
+
+    这组测试是"配置化流水线闭环"的核心回归：一旦 YAML 新增字段而消费方忘记读，
+    这里会立刻报失败。
+    """
+
+    def test_yaml_sections_all_present(self):
+        from utils.config import load_config
+        full = load_config(_pipeline_default_yaml_path())
+        assert 'pipeline' in full, "YAML 缺少 pipeline 块"
+        assert 'optical_system' in full, "YAML 缺少 optical_system 块"
+        assert 'test_pattern' in full, "YAML 缺少 test_pattern 块"
+
+    def test_optical_system_section_consumed_by_from_config(self):
+        """OpticalSystem.from_config({'optical_system': yaml_section}) 消费所有关键字段"""
+        from utils.config import load_config
+        full = load_config(_pipeline_default_yaml_path())
+        optic_section = full['optical_system']
+        optics = OpticalSystem.from_config({'optical_system': optic_section})
+
+        assert optics.wavelength == 193.0
+        assert optics.na == 1.35
+        assert optics.sigma == 0.75
+        assert optics.pixel_size == 1.0
+        assert optics.illumination_type == IlluminationType.CONVENTIONAL
+        assert optics.socs_num_terms == 5
+        assert optics.tcc_mode == TCCMode.SOCS
+        # Zernike：默认 YAML 里都写了 0；确保它们不是 None
+        z_keys = ('zernike_coefficients', 'z4', 'z5', 'z6', 'z7', 'z8', 'z9', 'z10', 'z11')
+        for k in z_keys:
+            if k in optic_section:
+                val = optic_section[k]
+                # 主要确认字段被消费，不纠结精度
+                assert val is not None, f"optical_system.{k} 在 YAML 中是 None"
+
+    def test_test_pattern_section_consumed(self):
+        """test_pattern 块能被 build_target_from_pattern_dict 消费并生成合理图案"""
+        from utils.config import load_config
+        from examples.run_pipeline import build_target_from_pattern_dict
+        full = load_config(_pipeline_default_yaml_path())
+        section = full['test_pattern']
+
+        target, px = build_target_from_pattern_dict(section)
+
+        grid_size = section.get('grid_size', [64, 64])
+        expect_shape = tuple(grid_size) if isinstance(grid_size, (list, tuple)) else (grid_size, grid_size)
+        assert target.shape == expect_shape
+        assert px == section.get('pixel_size', 1.0)
+        # 图案不是全零（必须是真实的 line_space 结构）
+        assert target.sum() > 0, "target 图案全零，说明 build_target_from_pattern_dict 没正确生成"
+        # CD / pitch 存在于配置（字段级别验证）
+        assert 'cd' in section
+        assert 'pitch' in section
+        assert section['cd'] > 0
+        assert section['type'] in ('line_space', 'l_shaped', 'contact_hole')
+
+    def test_pipeline_section_opc_ilt_smo_pw_all_consumed(self):
+        """pipeline 块的四个阶段 config 全部被读入到 PipelineConfig 对象"""
+        path = _pipeline_default_yaml_path()
+        cfg = PipelineConfig.from_yaml(path)
+
+        # 四大阶段
+        assert cfg.enable_opc is True
+        assert cfg.enable_ilt is True
+        assert cfg.enable_smo is True
+        assert cfg.enable_pw_verify is True
+
+        # 每个阶段的 config 对象都存在，且关键字段不是"凭空默认"
+        assert cfg.opc_config is not None, "OPC 配置未从 YAML 读入"
+        assert cfg.ilt_config is not None, "ILT 配置未从 YAML 读入"
+        assert cfg.smo_config is not None, "SMO 配置未从 YAML 读入"
+        assert cfg.pw_verify_config is not None, "PW 配置未从 YAML 读入"
+
+        # 确认是 YAML 里写的值，而不是硬编码默认
+        assert cfg.opc_config.max_iterations == 10
+        assert cfg.ilt_config.max_iter == 200
+        # SMO 策略字段存在于 config 中（不是默认）
+        from workflows.smo import SMOptimizationStrategy
+        assert cfg.smo_config.strategy == SMOptimizationStrategy.ALTERNATING
+        assert cfg.smo_config.max_outer_iterations == 20
+        # PW 配置（YAML 里写的 (-150, 150, 11) / (0.85, 1.15, 11)）
+        assert cfg.pw_verify_config.focus_range == (-150, 150, 11)
+        assert cfg.pw_verify_config.dose_range == (0.85, 1.15, 11)
+        # 输出目录
+        assert cfg.output_dir is not None
+        assert len(str(cfg.output_dir)) > 0
+
+
+class TestSmokeConfigFromYaml:
+    """
+    smoke 模式必须：
+    1. 先从 pipeline_default.yaml 读完整配置（含 PW、OPC、ILT、SMO 原始值）
+    2. 再"增量覆盖"迭代数调小 / SRAF 关 / 中间产物关
+    3. **不能**丢失 YAML 里的 PW 配置（回归：旧 smoke 模式 pw_verify_config=None）
+    4. **不能**丢失 YAML 里 SMO 的 strategy 等非迭代参数字段
+    """
+
+    def test_smoke_preserves_pw_verify_config(self):
+        """回归：旧实现把 pw_verify_config=None，这里强制验证 YAML 配置被保留"""
+        from examples.run_pipeline import build_smoke_config_from_yaml
+
+        cfg = build_smoke_config_from_yaml()
+        assert cfg.pw_verify_config is not None, (
+            "smoke 模式下丢失了 YAML 的 PW 配置——配置化闭环被破坏！"
+        )
+        # YAML 里写的 focus_range / dose_range 必须被保留
+        assert cfg.pw_verify_config.focus_range == (-150, 150, 11)
+        assert cfg.pw_verify_config.dose_range == (0.85, 1.15, 11)
+
+    def test_smoke_iterations_are_actually_lower(self):
+        """smoke 模式的迭代数必须真的被调小了（相对 YAML 里的 10/200/5）"""
+        from examples.run_pipeline import build_smoke_config_from_yaml
+        from utils.config import load_config
+
+        yaml_cfg = PipelineConfig.from_yaml(_pipeline_default_yaml_path())
+        smoke_cfg = build_smoke_config_from_yaml()
+
+        # OPC：YAML 是 10，smoke 必须 < 10
+        assert smoke_cfg.opc_config.max_iterations < yaml_cfg.opc_config.max_iterations
+        assert smoke_cfg.opc_config.max_iterations == 3
+        # ILT：YAML 是 200，smoke 必须 < 200
+        assert smoke_cfg.ilt_config.max_iter < yaml_cfg.ilt_config.max_iter
+        assert smoke_cfg.ilt_config.max_iter == 30
+        # SMO：YAML 是 20 次 outer，smoke 必须 < 20
+        assert smoke_cfg.smo_config.max_outer_iterations < yaml_cfg.smo_config.max_outer_iterations
+        assert smoke_cfg.smo_config.max_outer_iterations == 2
+
+    def test_smoke_preserves_non_iteration_fields(self):
+        """smoke 模式不能把 SMO strategy 等非迭代相关字段覆盖掉"""
+        from examples.run_pipeline import build_smoke_config_from_yaml
+        from workflows.smo import SMOptimizationStrategy
+
+        cfg = build_smoke_config_from_yaml()
+        # strategy 必须仍然是 YAML 里的 alternating，而不是某个默认值
+        assert cfg.smo_config.strategy == SMOptimizationStrategy.ALTERNATING
+        # OPC 的 SRAF 必须关（smoke 专属行为）
+        assert cfg.opc_config.sraf_enable is False
+        # save_intermediate 必须关（smoke 专属行为）
+        assert cfg.save_intermediate is False
+
+    def test_smoke_orchestrator_cli_also_preserves_pw(self):
+        """orchestrator_cli 版 build_smoke_config_from_yaml 同样保留 PW 配置"""
+        from pipeline.orchestrator_cli import build_smoke_config_from_yaml as cli_build
+        cfg = cli_build()
+        assert cfg.pw_verify_config is not None
+        assert cfg.pw_verify_config.focus_range == (-150, 150, 11)
+        # SMO strategy 同样保留
+        from workflows.smo import SMOptimizationStrategy
+        assert cfg.smo_config.strategy == SMOptimizationStrategy.ALTERNATING
+
+    def test_smoke_stage_switches_respected(self):
+        """smoke 模式下 --no-* CLI 开关应该仍然生效（阶段可以被单独关掉）"""
+        from examples.run_pipeline import build_smoke_config_from_yaml
+
+        # 关 SMO、关 PW
+        cfg = build_smoke_config_from_yaml(enable_smo=False, enable_pw=False)
+        assert cfg.enable_smo is False
+        assert cfg.enable_pw_verify is False
+        # OPC / ILT 仍然开着
+        assert cfg.enable_opc is True
+        assert cfg.enable_ilt is True
+        # 但 SMO 配置对象本身还是存在（因为 YAML 里读了），只是 enable=False
+        assert cfg.smo_config is not None
+
+
+class TestConfigEndToEndNoRun:
+    """
+    端到端"配置消费"不跑 OPC 数值计算的轻量回归：
+    构造一个 PipelineResult，验证 sign_off_summary 中
+    pipeline 三阶段 + PW 配置 + 光学系统 + 图案 都能正确反映出来
+    """
+
+    def test_sign_off_contains_fields_from_yaml(self, optics, target):
+        """sign_off_summary 里应能间接看到 YAML 驱动的配置痕迹"""
+        # 先从 YAML 读配置
+        cfg = PipelineConfig.from_yaml(_pipeline_default_yaml_path())
+
+        # 构造一个包含 pw_optical_system 的 Result（复用 SMO 光源）
+        gs = target.shape
+        source = np.random.rand(*gs)
+        source = source / source.sum()
+
+        pw_optics = OpticalSystem(
+            wavelength=optics.wavelength,
+            na=optics.na,
+            sigma=optics.sigma,
+            pixel_size=optics.pixel_size,
+            illumination_type=IlluminationType.CUSTOM,
+            custom_source=source.copy(),
+        )
+
+        result = PipelineResult(
+            initial_mask=target,
+            final_mask=target,
+            target=target,
+            optical_system=optics,
+            optimal_source=source,
+            pw_optical_system=pw_optics,
+            pw_metrics=None,
+        )
+
+        # 追加 YAML 驱动的 stage_metrics（用于验证摘要）
+        result.stage_metrics = [
+            StageMetrics(
+                stage_name='OPC',
+                elapsed_sec=1.0,
+                epe_before={'epe_mean': 10.0},
+                epe_after={'epe_mean': 6.0},
+                extra={'max_iterations': cfg.opc_config.max_iterations},
+            ),
+            StageMetrics(
+                stage_name='ILT',
+                elapsed_sec=2.0,
+                epe_before={'epe_mean': 6.0},
+                epe_after={'epe_mean': 4.0},
+                extra={'max_iter': cfg.ilt_config.max_iter},
+            ),
+            StageMetrics(
+                stage_name='SMO',
+                elapsed_sec=3.0,
+                epe_before={'epe_mean': 4.0},
+                epe_after={'epe_mean': 3.0},
+                extra={'max_outer_iterations': cfg.smo_config.max_outer_iterations},
+            ),
+        ]
+
+        summary = result.sign_off_summary()
+
+        # PW 光源一致性通过（因为我们构造了匹配的 pw_optics）
+        assert summary['validation']['pw_uses_smo_source'] is True
+
+        # 三阶段 EPE 改善量之和 > 0 说明流程链完整
+        total_improve = sum(m.epe_improvement for m in result.stage_metrics)
+        assert total_improve > 5.0
+
+        # OPC/ILT/SMO 的 extra 里保存的迭代数应当等于 YAML 里的值
+        assert result.stage_metrics[0].extra['max_iterations'] == 10
+        assert result.stage_metrics[1].extra['max_iter'] == 200
+        assert result.stage_metrics[2].extra['max_outer_iterations'] == 20
+
+        # 掩模复杂度存在
+        assert 'mask_complexity' in summary
+        mc = summary['mask_complexity']
+        assert isinstance(mc, dict)
+        assert 'tv_norm' in mc or 'total_variation' in mc

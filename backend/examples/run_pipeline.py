@@ -156,49 +156,57 @@ def create_demo_pattern(pattern_type: str = 'line_space',
     return target, pixel_size
 
 
-def _quick_opc_config():
-    from workflows.opc import OPCConfig
-    return OPCConfig(
-        max_iterations=3,
-        optimizer_max_iter=5,
-        sraf_enable=False,
-        verbose=True,
-    )
+def build_smoke_config_from_yaml(yaml_path: Optional[str] = None,
+                                 enable_opc: bool = True,
+                                 enable_ilt: bool = True,
+                                 enable_smo: bool = True,
+                                 enable_pw: bool = True,
+                                 output_dir: Optional[str] = None) -> PipelineConfig:
+    """
+    构造 smoke 测试用 PipelineConfig：先从 YAML 读完整配置形成闭环，
+    再把各阶段迭代数调低、SRAF 关闭、关闭中间产物保存。
 
+    这样 smoke 模式复用了 pipeline_default.yaml 的完整配置链路，
+    而不是手写一套与配置样例脱节的 config 对象。
+    """
+    if yaml_path is None:
+        yaml_path = resolve_config_path('pipeline_default.yaml')
 
-def _quick_ilt_config():
-    from workflows.ilt import ILTConfig
-    return ILTConfig(
-        max_iter=30,
-        convergence_patience=5,
-        verbose=True,
-    )
-
-
-def _quick_smo_config():
-    from workflows.smo import SMOConfig
-    return SMOConfig(
-        strategy='alternating',
-        max_outer_iterations=2,
-        source_max_iter=10,
-        mask_max_iter=20,
-        verbose=True,
-    )
-
-
-def make_smoke_config():
-    return PipelineConfig(
-        enable_opc=True,
-        enable_ilt=True,
-        enable_smo=True,
-        enable_pw_verify=True,
-        opc_config=_quick_opc_config(),
-        ilt_config=_quick_ilt_config(),
-        smo_config=_quick_smo_config(),
-        pw_verify_config=None,
+    cfg = build_pipeline_config_from_yaml(
+        yaml_path,
+        enable_opc=enable_opc,
+        enable_ilt=enable_ilt,
+        enable_smo=enable_smo,
+        enable_pw=enable_pw,
+        output_dir=output_dir,
         save_intermediate=False,
-        verbose=True,
     )
+
+    if cfg.opc_config is not None:
+        cfg.opc_config.max_iterations = 3
+        cfg.opc_config.optimizer_max_iter = 5
+        cfg.opc_config.sraf_enable = False
+        cfg.opc_config.verbose = True
+
+    if cfg.ilt_config is not None:
+        cfg.ilt_config.max_iter = 30
+        cfg.ilt_config.convergence_patience = 5
+        cfg.ilt_config.verbose = True
+
+    if cfg.smo_config is not None:
+        cfg.smo_config.max_outer_iterations = 2
+        cfg.smo_config.source_max_iter = 10
+        cfg.smo_config.mask_max_iter = 20
+        cfg.smo_config.verbose = True
+
+    cfg.save_intermediate = False
+    cfg.verbose = True
+    return cfg
+
+
+def make_smoke_config(yaml_path: Optional[str] = None) -> PipelineConfig:
+    """兼容别名：默认从 pipeline_default.yaml 派生"""
+    return build_smoke_config_from_yaml(yaml_path=yaml_path)
 
 
 def build_pipeline_config_from_yaml(yaml_path: str,
@@ -309,7 +317,14 @@ def main():
 
     # --- Pipeline 配置 ---
     if args.smoke:
-        pipeline_config = make_smoke_config()
+        pipeline_config = build_smoke_config_from_yaml(
+            cfg_path,
+            enable_opc=not args.no_opc,
+            enable_ilt=not args.no_ilt,
+            enable_smo=not args.no_smo,
+            enable_pw=not args.no_pw,
+            output_dir=args.output,
+        )
     elif cfg_path is not None:
         pipeline_config = build_pipeline_config_from_yaml(
             cfg_path,
