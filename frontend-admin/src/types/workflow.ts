@@ -123,6 +123,7 @@ export interface WorkflowTask {
   started_at?: number
   finished_at?: number
   result_summary?: Record<string, any>
+  result_detail?: Record<string, any>
   stage?: string
   current_loss?: number
   iteration?: number

@@ -310,6 +310,22 @@ const batchConfig = reactive({
 
 const queueTasks = ref<BatchSubTask[]>([])
 
+const BATCH_STATUS_MAP: Record<string, string> = {
+  pending: 'pending',
+  running: 'running',
+  done: 'completed',
+  completed: 'completed',
+  failed: 'failed',
+  cancelled: 'failed',
+  skipped: 'failed',
+}
+
+function normalizeSubTaskStatus(st: any): BatchSubTask {
+  const raw = st.status || 'pending'
+  const mapped = BATCH_STATUS_MAP[raw] || raw
+  return { ...st, status: mapped } as BatchSubTask
+}
+
 const stats = computed(() => {
   const result = { pending: 0, running: 0, completed: 0, failed: 0 }
   for (const t of queueTasks.value) {
@@ -387,6 +403,7 @@ async function handleRun() {
     if (res.success) {
       currentBatchId.value = res.task_id
       ElMessage.success(`批处理任务已提交：${res.task_id}`)
+      connectWs(res.task_id)
       startPolling()
     } else {
       ElMessage.error(res.message || '提交失败')
@@ -398,11 +415,29 @@ async function handleRun() {
   }
 }
 
+function connectWs(tid: string) {
+  if (wsUnsubscribe) {
+    try { (wsUnsubscribe as any)() } catch (e) {}
+  }
+  taskWs.connect(tid)
+  wsUnsubscribe = taskWs.onMessage((msg) => {
+    if (msg.type === 'progress' && msg.sub_tasks) {
+      queueTasks.value = (msg.sub_tasks as any[]).map(normalizeSubTaskStatus)
+    } else if (msg.type === 'task_complete') {
+      stopPolling()
+      refreshQueue()
+    } else if (msg.type === 'task_failed') {
+      stopPolling()
+      refreshQueue()
+    }
+  })
+}
+
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer)
   pollTimer = setInterval(() => {
     refreshQueue()
-  }, 3000)
+  }, 5000)
 }
 
 function stopPolling() {
@@ -417,15 +452,18 @@ async function refreshQueue() {
   loading.value = true
   try {
     const statusRes: WorkflowTask = await taskApi.getStatus(currentBatchId.value)
+    const detail = statusRes.result_detail
+    if (detail && detail.sub_tasks && Array.isArray(detail.sub_tasks)) {
+      queueTasks.value = detail.sub_tasks.map(normalizeSubTaskStatus)
+    }
     if (statusRes.status === 'completed' || statusRes.status === 'failed') {
       try {
         const resultRes: TaskResultResponse = await taskApi.getResult(currentBatchId.value)
-        const detail = resultRes.result_detail
-        if (detail && detail.sub_tasks && Array.isArray(detail.sub_tasks)) {
-          queueTasks.value = detail.sub_tasks
+        const rDetail = resultRes.result_detail
+        if (rDetail && rDetail.sub_tasks && Array.isArray(rDetail.sub_tasks)) {
+          queueTasks.value = rDetail.sub_tasks.map(normalizeSubTaskStatus)
         }
       } catch (e) {
-        console.error('获取子任务明细失败:', e)
       }
       stopPolling()
     }

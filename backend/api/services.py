@@ -1011,6 +1011,26 @@ def run_batch(payload: Dict[str, Any]) -> str:
     return task_id
 
 
+def _batch_sub_task_to_dict(tr) -> Dict[str, Any]:
+    sub_task: Dict[str, Any] = {}
+    for attr in ["cell_name", "status", "error_message", "iterations",
+                 "converged", "elapsed_sec"]:
+        v = getattr(tr, attr, None)
+        if v is not None:
+            sub_task[attr] = v
+    for attr in ["initial_mse", "final_mse", "initial_ssim", "final_ssim"]:
+        v = getattr(tr, attr, None)
+        if v is not None:
+            try:
+                sub_task[attr] = float(v)
+            except (TypeError, ValueError):
+                pass
+    sub_task["task_id"] = getattr(tr, "task_id", None) or sub_task.get("cell_name")
+    if "status" in sub_task and hasattr(sub_task["status"], "value"):
+        sub_task["status"] = sub_task["status"].value
+    return sub_task
+
+
 def _execute_batch(task_id: str):
     task = RUNNING_TASKS.get(task_id)
     if not task:
@@ -1044,7 +1064,7 @@ def _execute_batch(task_id: str):
 
         _set_progress(task_id, 20, "构造批处理配置")
         from pipeline.batch_runner import (
-            run_batch_optimization, ResourceConfig, BatchConfig,
+            run_batch_optimization, ResourceConfig, BatchConfig, TaskStatus,
         )
         resource_config = ResourceConfig()
         if max_workers is not None:
@@ -1060,6 +1080,40 @@ def _execute_batch(task_id: str):
             "optimization": opt_dict,
         }
 
+        task.setdefault("result_detail", {})
+        task["result_detail"].setdefault("sub_tasks", [])
+        task["result_detail"].setdefault("total_sub_tasks", 0)
+
+        def _on_batch_progress(batch_id: str, cell_name: str, status, progress: float, result):
+            sub_task_dict = _batch_sub_task_to_dict(result) if result else {"cell_name": cell_name, "status": status.value if hasattr(status, "value") else str(status)}
+            sub_task_dict["status"] = status.value if hasattr(status, "value") else str(status)
+
+            current_sub_tasks = task["result_detail"].get("sub_tasks", [])
+            found = False
+            for i, st in enumerate(current_sub_tasks):
+                if st.get("cell_name") == cell_name:
+                    current_sub_tasks[i] = sub_task_dict
+                    found = True
+                    break
+            if not found:
+                current_sub_tasks.append(sub_task_dict)
+
+            task["result_detail"]["sub_tasks"] = current_sub_tasks
+            task["result_detail"]["total_sub_tasks"] = len(current_sub_tasks)
+
+            done_count = sum(1 for st in current_sub_tasks if st.get("status") in ("done", "completed", "failed"))
+            total = len(current_sub_tasks)
+            pct = 35 + (50 * done_count / max(1, total))
+
+            _set_progress(
+                task_id,
+                pct,
+                f"Cell {cell_name}: {status.value if hasattr(status, 'value') else str(status)}",
+                extra={"sub_tasks": current_sub_tasks, "total_sub_tasks": total},
+            )
+
+        batch_config.progress_callback = _on_batch_progress
+
         _set_progress(task_id, 35, "执行批处理优化...")
         summary_obj, task_results, lib, queue = run_batch_optimization(
             source=source,
@@ -1073,7 +1127,7 @@ def _execute_batch(task_id: str):
 
         _set_progress(task_id, 85, "整理批处理结果")
         summary = {}
-        detail = {}
+        detail = task.get("result_detail", {})
         try:
             summary["total"] = int(getattr(summary_obj, "total", 0) or 0)
             summary["succeeded"] = int(getattr(summary_obj, "succeeded", 0) or 0)
@@ -1089,25 +1143,11 @@ def _execute_batch(task_id: str):
             if elapsed is not None:
                 summary["elapsed_seconds"] = float(elapsed)
             if task_results:
-                sub_tasks = []
+                final_sub_tasks = []
                 for tr in task_results:
-                    sub_task = {}
-                    for attr in ["cell_name", "status", "error_message", "iterations",
-                                 "converged", "elapsed_sec"]:
-                        v = getattr(tr, attr, None)
-                        if v is not None:
-                            sub_task[attr] = v
-                    for attr in ["initial_mse", "final_mse", "initial_ssim", "final_ssim"]:
-                        v = getattr(tr, attr, None)
-                        if v is not None:
-                            try:
-                                sub_task[attr] = float(v)
-                            except (TypeError, ValueError):
-                                pass
-                    sub_task["task_id"] = getattr(tr, "task_id", None) or sub_task.get("cell_name")
-                    sub_tasks.append(sub_task)
-                detail["sub_tasks"] = sub_tasks
-                detail["total_sub_tasks"] = len(sub_tasks)
+                    final_sub_tasks.append(_batch_sub_task_to_dict(tr))
+                detail["sub_tasks"] = final_sub_tasks
+                detail["total_sub_tasks"] = len(final_sub_tasks)
         except Exception as e:
             logger.warning(f"批处理结果摘要提取失败: {e}")
 
@@ -1142,6 +1182,7 @@ def get_task_status(task_id: str) -> Dict[str, Any]:
         "started_at": task.get("started_at"),
         "finished_at": task.get("finished_at"),
         "result_summary": task.get("result_summary"),
+        "result_detail": task.get("result_detail"),
     }
 
 
@@ -1167,6 +1208,18 @@ def get_task_result(task_id: str) -> Dict[str, Any]:
                 logger.warning(f"读取持久化任务结果失败 {task_id}: {e}")
         raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
     if task.get("status") not in ("completed", "failed"):
+        running_detail = task.get("result_detail")
+        if running_detail and task.get("task_type") == "batch" and running_detail.get("sub_tasks"):
+            return {
+                "task_id": task_id,
+                "task_type": task.get("task_type"),
+                "status": task.get("status"),
+                "result": None,
+                "result_summary": task.get("result_summary"),
+                "result_detail": running_detail,
+                "payload": task.get("payload"),
+                "error": None,
+            }
         raise HTTPException(status_code=400, detail=f"任务尚未完成，当前状态: {task.get('status')}")
     return {
         "task_id": task_id,
