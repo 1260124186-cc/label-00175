@@ -2121,14 +2121,22 @@ class SMOWorkflow:
         ckpt_mgr: WorkflowCheckpointManager,
         pixelated_source: PixelatedSource,
     ) -> Optional[Tuple[int, np.ndarray, np.ndarray, np.ndarray, float, int, List[SMOIterationResult],
-                         List[np.ndarray], List[np.ndarray], List[float]]]:
+                         List[np.ndarray], List[np.ndarray], List[float], str, bool]]:
         """
         尝试从最近的 checkpoint 恢复工作流状态
 
         Returns:
-            若恢复成功，返回 (start_outer_iter, current_mask, best_source, best_mask, best_loss,
-                             patience_counter, iterations, source_history, mask_history, loss_history)
+            若恢复成功，返回 (
+                start_outer_iter, current_mask, best_source, best_mask, best_loss,
+                patience_counter, iterations, source_history, mask_history, loss_history,
+                current_phase, source_first_done
+            )
             否则返回 None
+
+        Notes:
+            - current_phase: 最近一次完成的阶段 ('source' / 'mask' / 'joint' / '')
+            - source_first_done: SOURCE_FIRST 策略的"阶段 1/2（单独光源预优化）"是否已执行
+                （避免恢复时重复执行该预优化）
         """
         if self.config.checkpoint_force_restart:
             logger.info("checkpoint_force_restart=True，忽略已有 checkpoint，从头开始")
@@ -2160,6 +2168,19 @@ class SMOWorkflow:
             best_loss = state.best_loss
             patience_counter = int(state.extra_data.get('patience_counter', 0))
             start_outer_iter = int(state.outer_iteration)
+            current_phase = str(state.current_phase or '')
+
+            # SOURCE_FIRST 预优化是否已完成：
+            #   - 若 extra_data 显式记录了 source_first_done，直接使用；
+            #   - 否则根据 checkpoint 中已有的 outer_iteration 或 iterations 推断：
+            #     如果 start_outer_iter > 0 或 iterations 非空，说明 SOURCE_FIRST
+            #     的预优化已经执行过了（因为它在循环之前执行）
+            source_first_done = bool(state.extra_data.get('source_first_done', False))
+            if not source_first_done:
+                source_first_done = (
+                    start_outer_iter > 0
+                    or bool(state.extra_data.get('iterations'))
+                )
 
             iterations: List[SMOIterationResult] = list(
                 state.extra_data.get('iterations', [])
@@ -2181,10 +2202,12 @@ class SMOWorkflow:
             logger.info(
                 f"成功从 checkpoint 恢复: 外层迭代={start_outer_iter}, "
                 f"已执行迭代={len(iterations)}, best_loss={best_loss:.4e}, "
-                f"耐心计数={patience_counter}"
+                f"耐心计数={patience_counter}, 上一阶段={current_phase or 'N/A'}, "
+                f"SOURCE_FIRST预优化={'已完成' if source_first_done else '未执行'}"
             )
             return (start_outer_iter, current_mask, best_source, best_mask, best_loss,
-                    patience_counter, iterations, source_history, mask_history, loss_history)
+                    patience_counter, iterations, source_history, mask_history, loss_history,
+                    current_phase, source_first_done)
 
         except Exception as e:
             logger.warning(f"恢复 checkpoint 失败，将从头开始: {e}")
@@ -2251,6 +2274,7 @@ class SMOWorkflow:
 
         # —— 尝试从 checkpoint 恢复 ——
         start_outer_iter = 0
+        source_first_done = False
         restored = None
         if ckpt_mgr is not None:
             restored = self._try_restore_from_checkpoint(ckpt_mgr, pixelated_source)
@@ -2258,7 +2282,7 @@ class SMOWorkflow:
         if restored is not None:
             (start_outer_iter, current_mask, best_source_intensity, best_mask,
              best_loss, patience_counter, iterations, source_history,
-             mask_history, loss_history) = restored
+             mask_history, loss_history, _last_phase, source_first_done) = restored
             # 恢复后重新应用光源到成像模型
             if self._multi_cond_enabled:
                 self._imaging.update_source_all_conditions(pixelated_source)
@@ -2308,13 +2332,43 @@ class SMOWorkflow:
         reason = ''
         strategy = self.config.strategy
 
-        if strategy == SMOptimizationStrategy.SOURCE_FIRST and restored is None:
+        if strategy == SMOptimizationStrategy.SOURCE_FIRST and not source_first_done:
             if self.config.verbose:
                 logger.info(f"\n阶段 1/2: 单独优化光源 ({self.config.source_max_iter} 次迭代)...")
             pixelated_source, _ = self._source_optimizer.optimize(
                 pixelated_source, current_mask, target
             )
             source_history.append(pixelated_source.get_visualization())
+            source_first_done = True
+
+            # —— SOURCE_FIRST 预优化完成后，立即保存一个阶段性 checkpoint ——
+            #    防止刚完成预优化就崩溃导致重复计算
+            if ckpt_mgr is not None:
+                _phase_state = WorkflowCheckpointState(
+                    workflow_type='SMO',
+                    outer_iteration=0,
+                    inner_iteration=0,
+                    current_phase='source_first_done',
+                    source=pixelated_source.get_intensity(),
+                    mask=current_mask.copy(),
+                    best_loss=best_loss,
+                    best_mask=best_mask.copy(),
+                    best_source=best_source_intensity.copy(),
+                    loss_history=list(loss_history),
+                    loss_components_history=[],
+                    extra_data={
+                        'patience_counter': patience_counter,
+                        'iterations': iterations,
+                        'source_history': source_history,
+                        'mask_history': mask_history,
+                        'source_grid_size': list(source_grid),
+                        'multi_cond_enabled': self._multi_cond_enabled,
+                        'source_first_done': True,
+                    },
+                )
+                ckpt_mgr.save_checkpoint(
+                    _phase_state, outer_iteration=0, current_loss=best_loss, force=True,
+                )
 
             if self.config.verbose:
                 logger.info(f"阶段 2/2: 固定光源，优化掩模...")
@@ -2485,6 +2539,7 @@ class SMOWorkflow:
                         'mask_history': mask_history,
                         'source_grid_size': list(source_grid),
                         'multi_cond_enabled': self._multi_cond_enabled,
+                        'source_first_done': source_first_done,
                     },
                 )
                 ckpt_mgr.save_checkpoint(

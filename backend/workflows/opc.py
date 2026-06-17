@@ -1774,9 +1774,14 @@ class OPCWorkflow:
 
             # —— 更新 best 状态 ——
             current_epe = iter_result.epe_after['epe_mean']
-            if current_epe < best_epe:
+            is_best = current_epe < best_epe
+            if is_best:
                 best_epe = current_epe
                 best_loss = current_epe
+
+            # —— 更新 prev_result（在保存 checkpoint 之前）——
+            #   恢复时下一轮需要用本迭代结果作为 prev_result
+            next_prev_result = iter_result
 
             # —— 保存 checkpoint ——
             if ckpt_mgr is not None:
@@ -1788,7 +1793,7 @@ class OPCWorkflow:
                     source=None,
                     mask=iter_result.mask_after.copy(),
                     best_loss=best_loss,
-                    best_mask=iter_result.mask_after.copy() if current_epe <= best_epe else None,
+                    best_mask=iter_result.mask_after.copy() if is_best else None,
                     best_source=None,
                     loss_history=[float(r.epe_after.get('epe_mean', 0)) for r in iterations],
                     loss_components_history=[],
@@ -1796,7 +1801,7 @@ class OPCWorkflow:
                         'iterations': iterations,
                         'all_hotspots': all_hotspots,
                         'all_srafs': all_srafs,
-                        'prev_result': prev_result,
+                        'prev_result': next_prev_result,
                         'best_epe': best_epe,
                     },
                 )
@@ -1811,7 +1816,7 @@ class OPCWorkflow:
             )
 
             current_mask = iter_result.mask_after
-            prev_result = iter_result
+            prev_result = next_prev_result
 
             if converged:
                 if self.config.verbose:
