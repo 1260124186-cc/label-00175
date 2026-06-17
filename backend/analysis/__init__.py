@@ -1,6 +1,13 @@
 # -*- coding: utf-8 -*-
-from .process_window import (
-    ProcessWindowAnalyzer,
-    PWMetrics,
-    PrintabilityResult,
-)
+try:
+    from analysis.process_window import (
+        ProcessWindowAnalyzer,
+        PWMetrics,
+        PrintabilityResult,
+    )
+except ImportError:
+    from .process_window import (
+        ProcessWindowAnalyzer,
+        PWMetrics,
+        PrintabilityResult,
+    )

@@ -8,52 +8,100 @@
 3. ILT (Inverse Lithography Technology) - 反演光刻工作流
 """
 
-from workflows.opc import (
-    OPCConfig,
-    HotspotDetector,
-    SRAFRuleEngine,
-    OPCTransformType,
-    OPCTransform,
-    OPCIterationController,
-    OPCWorkflow,
-    HotspotRegion,
-    SRAFFeature,
-    OPCIterationResult,
-    OPCWorkflowResult,
-    run_opc_workflow,
-)
+try:
+    from workflows.opc import (
+        OPCConfig,
+        HotspotDetector,
+        SRAFRuleEngine,
+        OPCTransformType,
+        OPCTransform,
+        OPCIterationController,
+        OPCWorkflow,
+        HotspotRegion,
+        SRAFFeature,
+        OPCIterationResult,
+        OPCWorkflowResult,
+        run_opc_workflow,
+    )
 
-from workflows.smo import (
-    SMOptimizationStrategy,
-    SourceInitializationType,
-    SourceConstraintsConfig,
-    SMOConfig,
-    SMOIterationResult,
-    SMOWorkflowResult,
-    PixelatedSource,
-    SMOImagingModel,
-    SourceOptimizer,
-    MaskOptimizerForSMO,
-    JointGradientOptimizer,
-    SMOWorkflow,
-    run_smo_workflow,
-)
+    from workflows.smo import (
+        SMOptimizationStrategy,
+        SourceInitializationType,
+        SourceConstraintsConfig,
+        SMOConfig,
+        SMOIterationResult,
+        SMOWorkflowResult,
+        PixelatedSource,
+        SMOImagingModel,
+        SourceOptimizer,
+        MaskOptimizerForSMO,
+        JointGradientOptimizer,
+        SMOWorkflow,
+        run_smo_workflow,
+    )
 
-from workflows.ilt import (
-    TransmissionLevel,
-    ILTOptimizerType,
-    ILTLossComponent,
-    ILTComplexityConfig,
-    ILTConfig,
-    ILTIterationResult,
-    ILTWorkflowResult,
-    DifferentiableImagingChain,
-    GradientProjector,
-    MaskComplexityPenalty,
-    MultiObjectiveILT,
-    ILTWorkflow,
-    run_ilt_workflow,
-)
+    from workflows.ilt import (
+        TransmissionLevel,
+        ILTOptimizerType,
+        ILTLossComponent,
+        ILTComplexityConfig,
+        ILTConfig,
+        ILTIterationResult,
+        ILTWorkflowResult,
+        DifferentiableImagingChain,
+        GradientProjector,
+        MaskComplexityPenalty,
+        MultiObjectiveILT,
+        ILTWorkflow,
+        run_ilt_workflow,
+    )
+except ImportError:
+    from .opc import (
+        OPCConfig,
+        HotspotDetector,
+        SRAFRuleEngine,
+        OPCTransformType,
+        OPCTransform,
+        OPCIterationController,
+        OPCWorkflow,
+        HotspotRegion,
+        SRAFFeature,
+        OPCIterationResult,
+        OPCWorkflowResult,
+        run_opc_workflow,
+    )
+
+    from .smo import (
+        SMOptimizationStrategy,
+        SourceInitializationType,
+        SourceConstraintsConfig,
+        SMOConfig,
+        SMOIterationResult,
+        SMOWorkflowResult,
+        PixelatedSource,
+        SMOImagingModel,
+        SourceOptimizer,
+        MaskOptimizerForSMO,
+        JointGradientOptimizer,
+        SMOWorkflow,
+        run_smo_workflow,
+    )
+
+    from .ilt import (
+        TransmissionLevel,
+        ILTOptimizerType,
+        ILTLossComponent,
+        ILTComplexityConfig,
+        ILTConfig,
+        ILTIterationResult,
+        ILTWorkflowResult,
+        DifferentiableImagingChain,
+        GradientProjector,
+        MaskComplexityPenalty,
+        MultiObjectiveILT,
+        ILTWorkflow,
+        run_ilt_workflow,
+    )
 
 __all__ = [
     'OPCConfig',

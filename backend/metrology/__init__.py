@@ -10,40 +10,76 @@
 - metrics_report: 计量一致性报告（Uniformity、Linearity、Cp/Cpk 等）
 """
 
-from metrology.cd_extraction import (
-    CDExtractionMethod,
-    MeasurementLine,
-    CDExtractionResult,
-    extract_profile,
-    cd_threshold_crossing,
-    cd_derivative_peak,
-    cd_linear_regression,
-    cd_polynomial_fit,
-    extract_cd,
-    extract_cd_multiline,
-)
-from metrology.sem_simulation import (
-    SEMDetectorMode,
-    SEMSimConfig,
-    SEMSimResult,
-    simulate_sem_image,
-    simulate_cd_sem_line_scan,
-    apply_charging_effect,
-)
-from metrology.metrics_report import (
-    CDTarget,
-    UniformityMetrics,
-    LinearityMetrics,
-    PrecisionMetrics,
-    ProcessCapabilityMetrics,
-    CDMeasurementPoint,
-    MetrologyReport,
-    compute_uniformity,
-    compute_linearity,
-    compute_precision,
-    compute_process_capability,
-    generate_metrology_report,
-)
+try:
+    from metrology.cd_extraction import (
+        CDExtractionMethod,
+        MeasurementLine,
+        CDExtractionResult,
+        extract_profile,
+        cd_threshold_crossing,
+        cd_derivative_peak,
+        cd_linear_regression,
+        cd_polynomial_fit,
+        extract_cd,
+        extract_cd_multiline,
+    )
+    from metrology.sem_simulation import (
+        SEMDetectorMode,
+        SEMSimConfig,
+        SEMSimResult,
+        simulate_sem_image,
+        simulate_cd_sem_line_scan,
+        apply_charging_effect,
+    )
+    from metrology.metrics_report import (
+        CDTarget,
+        UniformityMetrics,
+        LinearityMetrics,
+        PrecisionMetrics,
+        ProcessCapabilityMetrics,
+        CDMeasurementPoint,
+        MetrologyReport,
+        compute_uniformity,
+        compute_linearity,
+        compute_precision,
+        compute_process_capability,
+        generate_metrology_report,
+    )
+except ImportError:
+    from .cd_extraction import (
+        CDExtractionMethod,
+        MeasurementLine,
+        CDExtractionResult,
+        extract_profile,
+        cd_threshold_crossing,
+        cd_derivative_peak,
+        cd_linear_regression,
+        cd_polynomial_fit,
+        extract_cd,
+        extract_cd_multiline,
+    )
+    from .sem_simulation import (
+        SEMDetectorMode,
+        SEMSimConfig,
+        SEMSimResult,
+        simulate_sem_image,
+        simulate_cd_sem_line_scan,
+        apply_charging_effect,
+    )
+    from .metrics_report import (
+        CDTarget,
+        UniformityMetrics,
+        LinearityMetrics,
+        PrecisionMetrics,
+        ProcessCapabilityMetrics,
+        CDMeasurementPoint,
+        MetrologyReport,
+        compute_uniformity,
+        compute_linearity,
+        compute_precision,
+        compute_process_capability,
+        generate_metrology_report,
+    )
 
 __all__ = [
     'CDExtractionMethod',

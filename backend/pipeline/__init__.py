@@ -7,27 +7,50 @@
 2. Orchestrator: OPC → ILT → SMO → PW 全流程编排
 """
 
-from pipeline.batch_runner import (
-    TaskStatus,
-    TaskResult,
-    BatchConfig,
-    ResourceConfig,
-    LocalBatchRunner,
-    DistributedBatchRunner,
-    BatchSummary,
-    run_batch_optimization,
-    save_batch_summary,
-)
+try:
+    from pipeline.batch_runner import (
+        TaskStatus,
+        TaskResult,
+        BatchConfig,
+        ResourceConfig,
+        LocalBatchRunner,
+        DistributedBatchRunner,
+        BatchSummary,
+        run_batch_optimization,
+        save_batch_summary,
+    )
 
-from pipeline.orchestrator import (
-    PipelineStage,
-    PWVerifyConfig,
-    PipelineConfig,
-    StageMetrics,
-    PipelineResult,
-    PipelineOrchestrator,
-    run_pipeline,
-)
+    from pipeline.orchestrator import (
+        PipelineStage,
+        PWVerifyConfig,
+        PipelineConfig,
+        StageMetrics,
+        PipelineResult,
+        PipelineOrchestrator,
+        run_pipeline,
+    )
+except ImportError:
+    from .batch_runner import (
+        TaskStatus,
+        TaskResult,
+        BatchConfig,
+        ResourceConfig,
+        LocalBatchRunner,
+        DistributedBatchRunner,
+        BatchSummary,
+        run_batch_optimization,
+        save_batch_summary,
+    )
+
+    from .orchestrator import (
+        PipelineStage,
+        PWVerifyConfig,
+        PipelineConfig,
+        StageMetrics,
+        PipelineResult,
+        PipelineOrchestrator,
+        run_pipeline,
+    )
 
 __all__ = [
     'TaskStatus',

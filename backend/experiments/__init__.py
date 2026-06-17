@@ -11,22 +11,40 @@
     4. CLI 入口: run_experiments.py，支持命令行批量执行与 pytest 集成
 """
 
-from experiments.schema import (
-    ExperimentSchema,
-    PatternConfig,
-    OpticalConfig,
-    OptimizerConfig,
-    AssertionConfig,
-    GoldenReference,
-    load_experiment,
-    validate_experiment,
-)
-from experiments.executor import ExperimentExecutor, ExperimentResult
-from experiments.assertions import (
-    RegressionAssertions,
-    AssertionResult,
-    AssertionReport,
-)
+try:
+    from experiments.schema import (
+        ExperimentSchema,
+        PatternConfig,
+        OpticalConfig,
+        OptimizerConfig,
+        AssertionConfig,
+        GoldenReference,
+        load_experiment,
+        validate_experiment,
+    )
+    from experiments.executor import ExperimentExecutor, ExperimentResult
+    from experiments.assertions import (
+        RegressionAssertions,
+        AssertionResult,
+        AssertionReport,
+    )
+except ImportError:
+    from .schema import (
+        ExperimentSchema,
+        PatternConfig,
+        OpticalConfig,
+        OptimizerConfig,
+        AssertionConfig,
+        GoldenReference,
+        load_experiment,
+        validate_experiment,
+    )
+    from .executor import ExperimentExecutor, ExperimentResult
+    from .assertions import (
+        RegressionAssertions,
+        AssertionResult,
+        AssertionReport,
+    )
 
 __all__ = [
     'ExperimentSchema',

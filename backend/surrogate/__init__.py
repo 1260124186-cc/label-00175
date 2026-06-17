@@ -12,21 +12,38 @@
 - imaging: SurrogateImaging 推理接口，与真实成像对比精度
 """
 
-from .model import UNet, SurrogateModelConfig
-from .imaging import SurrogateImaging
-from .dataset import (
-    SurrogateDataset,
-    DatasetConfig,
-    generate_training_data,
-    save_dataset_hdf5,
-    load_dataset_hdf5,
-)
-from .train import (
-    TrainingConfig,
-    train_surrogate_model,
-    evaluate_surrogate_model,
-    load_trained_model,
-)
+try:
+    from surrogate.model import UNet, SurrogateModelConfig
+    from surrogate.imaging import SurrogateImaging
+    from surrogate.dataset import (
+        SurrogateDataset,
+        DatasetConfig,
+        generate_training_data,
+        save_dataset_hdf5,
+        load_dataset_hdf5,
+    )
+    from surrogate.train import (
+        TrainingConfig,
+        train_surrogate_model,
+        evaluate_surrogate_model,
+        load_trained_model,
+    )
+except ImportError:
+    from .model import UNet, SurrogateModelConfig
+    from .imaging import SurrogateImaging
+    from .dataset import (
+        SurrogateDataset,
+        DatasetConfig,
+        generate_training_data,
+        save_dataset_hdf5,
+        load_dataset_hdf5,
+    )
+    from .train import (
+        TrainingConfig,
+        train_surrogate_model,
+        evaluate_surrogate_model,
+        load_trained_model,
+    )
 
 __all__ = [
     'UNet',
