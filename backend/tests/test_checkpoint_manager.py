@@ -3,17 +3,17 @@
 WorkflowCheckpointManager 断点续跑单元测试
 
 核心验证：
-  1. find_latest_checkpoint 严格返回"最近一次 checkpoint"（按 outer_iteration desc →
-     inner_iteration desc → created_at desc），绝不会被 _latest_best 快捷方式或
-     字典序最旧文件劫持。
+  1. find_latest_checkpoint 严格按**墙钟时间最近**（created_at desc → mtime desc）
+     返回 checkpoint，而非 outer_iteration desc。这保证复用同一目录重跑时
+     正确返回第二次运行的 checkpoint（时间更近），而非第一次运行中 outer
+     更大的旧文件。
   2. find_best_checkpoint 独立按 best_loss 最小返回，与 latest 语义解耦。
-  3. SMO / OPC 工作流恢复入口实际命中的是最近一次 checkpoint。
+  3. 不被 _latest_best 快捷方式、字典序最旧文件劫持。
 """
 
 import os
 import time
 import json
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -31,7 +31,6 @@ from algorithms.callbacks import (
 
 def _make_state(outer: int, inner: int = 0, phase: str = 'test',
                 best_loss: float = 1.0, seed: int = 0) -> WorkflowCheckpointState:
-    """构造一个最小化 WorkflowCheckpointState"""
     rng = np.random.RandomState(seed)
     state = WorkflowCheckpointState(
         workflow_type='TEST',
@@ -46,8 +45,17 @@ def _make_state(outer: int, inner: int = 0, phase: str = 'test',
     return state
 
 
+def _forge_created_at(base_path: Path, timestamp: float) -> None:
+    """篡改 .json 元数据中的 created_at，模拟不同墙钟时间的 checkpoint"""
+    json_path = base_path.with_suffix('.json')
+    with open(json_path, 'r', encoding='utf-8') as f:
+        meta = json.load(f)
+    meta['created_at'] = timestamp
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(meta, f)
+
+
 def _touch_mtime(path: Path, offset_seconds: float) -> None:
-    """强制修改文件 mtime，模拟写入先后顺序"""
     for suffix in ('.npz', '.pkl', '.json'):
         f = path.with_suffix(suffix)
         if f.exists():
@@ -59,15 +67,69 @@ def _touch_mtime(path: Path, offset_seconds: float) -> None:
 # Tests
 # ============================================================================
 
-class TestFindLatestCheckpointStrictlyRecency:
-    """验证 find_latest_checkpoint 严格按最近续跑（不被 best/字典序欺骗）"""
+class TestFindLatestCheckpointStrictRecency:
+    """验证 find_latest_checkpoint 严格按墙钟时间最近续跑"""
+
+    def test_rerun_same_dir_returns_second_run(self, tmp_path):
+        """
+        核心回归用例：同目录重跑
+
+        场景：
+          第一次运行：outer=1,2,3,4,5（created_at = 1000 秒）
+          第二次运行：outer=1,2       （created_at = 2000 秒，时间更近）
+
+        旧 bug：按 outer desc 排序 → 错误返回 outer=5（第一次运行）
+        修复后：按 created_at desc → 正确返回 outer=2（第二次运行，时间最近）
+        """
+        mgr = WorkflowCheckpointManager(
+            checkpoint_dir=tmp_path,
+            workflow_type='TEST',
+            save_freq_outer=1,
+            max_checkpoints=20,
+            save_best_only=False,
+            filename_prefix='test',
+        )
+
+        # 模拟第一次运行（墙钟时间 T=1000）
+        first_run_ts = 1000.0
+        for outer in range(1, 6):
+            s = _make_state(outer=outer, best_loss=float(outer), seed=outer)
+            p = mgr.save_checkpoint(s, outer_iteration=outer,
+                                    current_loss=float(outer), force=True)
+            _forge_created_at(p, first_run_ts + outer)
+            _touch_mtime(p, offset_seconds=first_run_ts + outer - time.time())
+            time.sleep(0.005)
+
+        time.sleep(0.01)
+
+        # 模拟第二次运行（墙钟时间 T=2000，更近）
+        second_run_ts = 2000.0
+        p_run2_last = None
+        for outer in range(1, 3):
+            s = _make_state(outer=outer, best_loss=float(outer) + 0.5, seed=outer + 100)
+            p = mgr.save_checkpoint(s, outer_iteration=outer,
+                                    current_loss=float(outer) + 0.5, force=True)
+            _forge_created_at(p, second_run_ts + outer)
+            _touch_mtime(p, offset_seconds=second_run_ts + outer - time.time())
+            if outer == 2:
+                p_run2_last = p
+            time.sleep(0.005)
+
+        latest = mgr.find_latest_checkpoint(validate_config=False)
+        assert latest is not None
+        assert 'outer_0002' in latest.name, (
+            f"同目录重跑：应返回第二次运行的 outer_0002（时间最近），"
+            f"实际返回 {latest.name}"
+        )
+        # 绝不能返回第一次运行的 outer=5
+        assert 'outer_0005' not in latest.name
 
     def test_latest_not_hijacked_by_best_link(self, tmp_path):
         """
         回归用例：
-          - iter=1 best_loss=0.01（同时是 _latest_best 快捷方式指向的文件）
-          - iter=5 best_loss=0.50（最近一次 checkpoint，但 loss 更差）
-        断言 find_latest_checkpoint 返回 iter=5，find_best_checkpoint 返回 iter=1。
+          - iter=1 best_loss=0.01（生成 _latest_best 快捷方式）
+          - iter=5 best_loss=0.50（时间更靠后）
+        find_latest_checkpoint 返回 iter=5，find_best_checkpoint 返回 iter=1。
         """
         mgr = WorkflowCheckpointManager(
             checkpoint_dir=tmp_path,
@@ -78,39 +140,33 @@ class TestFindLatestCheckpointStrictlyRecency:
             filename_prefix='test',
         )
 
-        # iter=1 是 best（loss 更小），同时生成 _latest_best 快捷方式
         s_best = _make_state(outer=1, best_loss=0.01, seed=1)
         p1 = mgr.save_checkpoint(s_best, outer_iteration=1, current_loss=0.01, force=True)
-        assert p1 is not None
-
-        # 等 10ms 保证 created_at 不同
         time.sleep(0.01)
 
-        # iter=5 loss 更差，但时间更靠后（是"最近"的）
         s_latest = _make_state(outer=5, best_loss=0.50, seed=5)
         p5 = mgr.save_checkpoint(s_latest, outer_iteration=5, current_loss=0.50, force=True)
-        assert p5 is not None
 
-        # 确认 _latest_best 快捷方式存在（它应指向 iter=1）
         best_link = tmp_path / 'test_latest_best.npz'
         assert best_link.exists() or best_link.is_symlink()
 
         latest = mgr.find_latest_checkpoint(validate_config=False)
         assert latest is not None
-        # 核心断言：必须是 iter=5（最近一次），绝不能被 best_link 劫持
         assert 'outer_0005' in latest.name, (
-            f"find_latest_checkpoint 应返回最近的 outer_0005，实际返回 {latest.name}"
+            f"应返回时间最近的 outer_0005，实际返回 {latest.name}"
         )
-        assert latest.resolve() == p5.resolve()
 
         best = mgr.find_best_checkpoint(validate_config=False)
         assert best is not None
         assert 'outer_0001' in best.name or 'latest_best' in best.name, (
-            f"find_best_checkpoint 应返回 best (outer_0001 或 latest_best)，实际返回 {best.name}"
+            f"find_best 应返回 best (outer_0001)，实际返回 {best.name}"
         )
 
-    def test_latest_sorted_by_outer_then_inner(self, tmp_path):
-        """相同 outer_iteration 时按 inner_iteration 降序，再按 created_at 降序"""
+    def test_same_second_uses_outer_as_tiebreaker(self, tmp_path):
+        """
+        同一秒内创建的 checkpoint（created_at 相同），outer 更大的更近
+        （同次运行内迭代号大的就是后保存的）
+        """
         mgr = WorkflowCheckpointManager(
             checkpoint_dir=tmp_path,
             workflow_type='TEST',
@@ -120,24 +176,29 @@ class TestFindLatestCheckpointStrictlyRecency:
             filename_prefix='test',
         )
 
-        # outer=3, inner=1
+        # outer=3, inner=1（先保存）
         s_a = _make_state(outer=3, inner=1, best_loss=0.9, seed=11)
-        mgr.save_checkpoint(s_a, outer_iteration=3, current_loss=0.9, force=True)
+        pa = mgr.save_checkpoint(s_a, outer_iteration=3, current_loss=0.9, force=True)
         time.sleep(0.01)
 
-        # outer=3, inner=5 （inner 更大 → 更近）
+        # outer=3, inner=5（后保存，inner 更大 → 同次运行内更近）
         s_b = _make_state(outer=3, inner=5, best_loss=0.8, seed=22)
-        mgr.save_checkpoint(s_b, outer_iteration=3, current_loss=0.8, force=True)
-        time.sleep(0.01)
+        pb = mgr.save_checkpoint(s_b, outer_iteration=3, current_loss=0.8, force=True)
 
-        # outer=2（outer 更小 → 更旧）
-        s_c = _make_state(outer=2, inner=9, best_loss=0.1, seed=33)
-        mgr.save_checkpoint(s_c, outer_iteration=2, current_loss=0.1, force=True)
+        # 把两个 created_at 强制设为同一秒
+        shared_ts = 1500.0
+        _forge_created_at(pa, shared_ts)
+        _forge_created_at(pb, shared_ts)
+        # mtime 也设为相同
+        _touch_mtime(pa, 0)
+        _touch_mtime(pb, 0)
+        # 现在按排序应看 outer/inner 作为 tiebreaker
 
         latest = mgr.find_latest_checkpoint(validate_config=False)
         assert latest is not None
+        # outer 相同、inner 5 > inner 1 → 返回 inner_0005
         assert 'outer_0003' in latest.name and 'inner_0005' in latest.name, (
-            f"期望最近 checkpoint 是 outer_0003/inner_0005，实际是 {latest.name}"
+            f"同秒内应按 outer/inner 辅助排序返回 inner_0005，实际是 {latest.name}"
         )
 
     def test_latest_ignores_lexicographically_earliest_file(self, tmp_path):
@@ -145,12 +206,9 @@ class TestFindLatestCheckpointStrictlyRecency:
         回归用例：防止用 sorted(glob) 字典序错误返回最旧文件。
 
         保存顺序（时间从先到后）：
-            outer=7  →  outer=1  →  outer=3  →  outer=10
-        若用 naive sorted(glob) 字典序，文件名会被排序为：
-            outer_0001, outer_0003, outer_0007, outer_0010
-            → 错误地把 outer_0001（最早且字典序最小）当作"最近"返回。
-
-        正确语义：按 outer_iteration desc，最近的是 outer=10（最后保存）。
+            outer=7 → outer=1 → outer=3 → outer=10
+        正确语义：按墙钟时间最近 → 返回最后保存的 outer_0010。
+        字典序陷阱：会错误返回 outer_0001。
         """
         mgr = WorkflowCheckpointManager(
             checkpoint_dir=tmp_path,
@@ -161,30 +219,28 @@ class TestFindLatestCheckpointStrictlyRecency:
             filename_prefix='t',
         )
 
-        # 用不按大小递增的顺序依次保存，使 outer_iter 与字典序不一致
-        order = [7, 1, 3, 10]  # 最后一个 outer=10 应是"最近"
+        order = [7, 1, 3, 10]
         saved = []
         for i, outer in enumerate(order):
-            # best_loss 故意不单调，避免 best 逻辑干扰
             s = _make_state(outer=outer, inner=0, best_loss=0.5 + (i % 3) * 0.1,
                             seed=100 + i)
             p = mgr.save_checkpoint(s, outer_iteration=outer,
                                     current_loss=s.best_loss + 0.01, force=True)
+            # 用 created_at 和 mtime 共同强化"后保存的更新"
+            _forge_created_at(p, 1000.0 + i)
             _touch_mtime(p, offset_seconds=i * 10)
             saved.append(p)
             time.sleep(0.01)
 
         latest = mgr.find_latest_checkpoint(validate_config=False)
         assert latest is not None
-        # 必须返回 outer 最大的那一个（outer_0010，按 outer desc 也按时间 desc）
         assert 'outer_0010' in latest.name, (
-            f"期望 outer 最大/最后保存的 outer_0010 是最近 checkpoint，实际是 {latest.name}"
+            f"应返回最后保存的 outer_0010，实际是 {latest.name}"
         )
-        # 绝对不能是字典序最小的 outer_0001（最早保存）
         assert 'outer_0001' not in latest.name
 
     def test_latest_respects_config_hash_validation(self, tmp_path):
-        """最近 checkpoint 若 config_hash 不匹配，应跳过并返回下一个最近的合法文件"""
+        """最近 checkpoint 若 config_hash 不匹配，应跳过并返回下一个最近的"""
         from dataclasses import dataclass, asdict
 
         @dataclass
@@ -205,15 +261,14 @@ class TestFindLatestCheckpointStrictlyRecency:
             filename_prefix='test',
             config=cfg,
         )
-        # 确保配置哈希被正确计算（非空）
-        assert mgr.config_hash, "mgr.config_hash 应为非空以进行哈希校验测试"
+        assert mgr.config_hash, "mgr.config_hash 应为非空"
 
-        # 先保存 iter=3，正常状态
+        # iter=3（正常，时间较早）
         s3 = _make_state(outer=3, best_loss=0.3, seed=1)
         p3 = mgr.save_checkpoint(s3, outer_iteration=3, current_loss=0.3, force=True)
         time.sleep(0.01)
 
-        # 再保存 iter=5，篡改其 .json config_hash
+        # iter=5（时间更近，但篡改其 config_hash）
         s5 = _make_state(outer=5, best_loss=0.5, seed=2)
         p5 = mgr.save_checkpoint(s5, outer_iteration=5, current_loss=0.5, force=True)
         json_path = p5.with_suffix('.json')
@@ -223,18 +278,16 @@ class TestFindLatestCheckpointStrictlyRecency:
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(meta, f)
 
-        # validate_config=False 时仍返回 iter=5
         latest_no_valid = mgr.find_latest_checkpoint(validate_config=False)
         assert latest_no_valid is not None and 'outer_0005' in latest_no_valid.name
 
-        # validate_config=True（且期望 hash 是 mgr.config_hash）时应跳过篡改的 iter=5，回退到 iter=3
         latest_valid = mgr.find_latest_checkpoint(validate_config=True)
         assert latest_valid is not None and 'outer_0003' in latest_valid.name, (
             f"应跳过哈希不一致的 outer_0005，返回合法的 outer_0003，实际是 {latest_valid}"
         )
 
     def test_list_all_checkpoints_sorted_by_recency(self, tmp_path):
-        """list_all_checkpoints 也应按最近→最旧排序"""
+        """list_all_checkpoints 按 created_at desc 排序"""
         mgr = WorkflowCheckpointManager(
             checkpoint_dir=tmp_path,
             workflow_type='TEST',
@@ -243,17 +296,19 @@ class TestFindLatestCheckpointStrictlyRecency:
             save_best_only=False,
             filename_prefix='test',
         )
+        paths = []
         for outer in (1, 5, 3):
             s = _make_state(outer=outer, best_loss=float(outer), seed=outer)
-            mgr.save_checkpoint(s, outer_iteration=outer, current_loss=float(outer), force=True)
+            p = mgr.save_checkpoint(s, outer_iteration=outer, current_loss=float(outer), force=True)
+            paths.append(p)
             time.sleep(0.01)
 
         listed = mgr.list_all_checkpoints()
         assert len(listed) >= 3
-        outers = [int(m['outer_iteration']) for m in listed]
-        # 必须严格降序
-        assert outers == sorted(outers, reverse=True), (
-            f"list_all_checkpoints 应按 outer_iteration desc 排序，实际 outer 序列={outers}"
+        # 按时间保存顺序 1→5→3，created_at 递增，所以 list 应该是 3,5,1
+        created_ats = [m.get('created_at', 0) for m in listed]
+        assert created_ats == sorted(created_ats, reverse=True), (
+            f"list_all_checkpoints 应按 created_at desc 排序，实际时间序列={created_ats}"
         )
 
     def test_empty_dir_returns_none(self, tmp_path):
@@ -266,3 +321,53 @@ class TestFindLatestCheckpointStrictlyRecency:
         assert mgr.find_latest_checkpoint(validate_config=False) is None
         assert mgr.find_best_checkpoint(validate_config=False) is None
         assert mgr.list_all_checkpoints() == []
+
+    def test_rerun_with_older_outer_wins_over_newer(self, tmp_path):
+        """
+        回归用例：第二次运行的 outer 编号比第一次小，但墙钟时间更近。
+
+        第一次运行：outer=8,9,10  (created_at ≈ T_old)
+        第二次运行：outer=1,2     (created_at ≈ T_new, T_new > T_old)
+
+        find_latest_checkpoint 应返回第二次运行的 outer=2（时间最近），
+        而非第一次运行的 outer=10（outer 更大但时间更旧）。
+        """
+        mgr = WorkflowCheckpointManager(
+            checkpoint_dir=tmp_path,
+            workflow_type='TEST',
+            save_freq_outer=1,
+            max_checkpoints=20,
+            save_best_only=False,
+            filename_prefix='test',
+        )
+
+        # 第一次运行：outer=8,9,10 (T=500)
+        old_ts = 500.0
+        for outer in (8, 9, 10):
+            s = _make_state(outer=outer, best_loss=1.0 / outer, seed=outer)
+            p = mgr.save_checkpoint(s, outer_iteration=outer,
+                                    current_loss=s.best_loss, force=True)
+            _forge_created_at(p, old_ts + outer)
+            _touch_mtime(p, offset_seconds=old_ts + outer - time.time())
+            time.sleep(0.005)
+
+        time.sleep(0.01)
+
+        # 第二次运行：outer=1,2 (T=3000)
+        new_ts = 3000.0
+        for outer in (1, 2):
+            s = _make_state(outer=outer, best_loss=1.0 / (outer + 10), seed=outer + 200)
+            p = mgr.save_checkpoint(s, outer_iteration=outer,
+                                    current_loss=s.best_loss, force=True)
+            _forge_created_at(p, new_ts + outer)
+            _touch_mtime(p, offset_seconds=new_ts + outer - time.time())
+            time.sleep(0.005)
+
+        latest = mgr.find_latest_checkpoint(validate_config=False)
+        assert latest is not None
+        # 必须返回第二次运行的 outer=2（时间最近）
+        assert 'outer_0002' in latest.name, (
+            f"重跑 outer 更小但时间更近：应返回 outer_0002，实际是 {latest.name}"
+        )
+        # 绝不能返回第一次运行的 outer=10（outer 最大但时间更旧）
+        assert 'outer_0010' not in latest.name

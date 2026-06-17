@@ -1770,23 +1770,30 @@ class WorkflowCheckpointManager:
 
     def _rank_checkpoint_by_recency(self, json_files: List[Path]) -> List[Path]:
         """
-        按 最近→最旧 排序 checkpoint：
-        优先级：outer_iteration 降序 → inner_iteration 降序 → created_at 降序 → mtime 降序
+        按 最近→最旧 排序 checkpoint
+
+        优先级：
+          1. created_at 降序  — 墙钟时间最优先，确保复用同一目录重跑时
+             返回第二次运行（时间更近）的 checkpoint 而非第一次运行中
+             outer 更大的旧文件。
+          2. mtime 降序       — 文件修改时间兜底（created_at 相同时）
+          3. outer_iteration 降序 — 同秒内按迭代号辅助排序
+          4. inner_iteration 降序
         """
         def _sort_key(f: Path):
             try:
                 with open(f, 'r', encoding='utf-8') as fh:
                     meta = json.load(fh)
+                created = float(meta.get('created_at', 0.0))
                 outer = int(meta.get('outer_iteration', 0))
                 inner = int(meta.get('inner_iteration', 0))
-                created = float(meta.get('created_at', 0.0))
             except Exception:
-                outer, inner, created = 0, 0, 0.0
+                created, outer, inner = 0.0, 0, 0
             try:
                 mtime = f.stat().st_mtime
             except Exception:
                 mtime = 0.0
-            return (-outer, -inner, -created, -mtime)
+            return (-created, -mtime, -outer, -inner)
 
         return sorted(json_files, key=_sort_key)
 
@@ -1822,10 +1829,12 @@ class WorkflowCheckpointManager:
                                validate_config: bool = True,
                                expected_config_hash: Optional[str] = None) -> Optional[Path]:
         """
-        在 checkpoint_dir 中查找**最近一次**保存的 checkpoint 文件（严格按时间/迭代号最近）
+        在 checkpoint_dir 中查找**最近一次保存**的 checkpoint 文件
 
-        排序优先级：outer_iteration 降序 → inner_iteration 降序 → created_at 降序 → 文件 mtime 降序
-        不返回 _latest_best 快捷方式（它指向 best，可能不是最近）。
+        排序优先级：created_at 降序 → mtime 降序 → outer_iteration 降序 → inner_iteration 降序
+
+        关键语义：以墙钟时间为准，即使复用同一目录重跑（旧 run 的 outer 更大
+        但时间更早），也会正确返回第二次运行中保存的 checkpoint。
 
         Args:
             validate_config: 是否验证配置哈希一致
