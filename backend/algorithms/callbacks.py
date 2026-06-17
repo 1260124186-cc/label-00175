@@ -1750,13 +1750,82 @@ class WorkflowCheckpointManager:
                         logger.warning(f"删除旧 checkpoint 失败 {f}: {e}")
             logger.debug(f"已删除旧 checkpoint: {old}")
 
+    def _iter_checkpoint_candidates(self) -> List[Path]:
+        """
+        枚举所有真实 checkpoint（排除 _latest_best 快捷符号），返回 .json 元数据路径列表
+
+        注意：文件名末尾带 _best 的真实 checkpoint（如 test_outer_0005_best.json）
+        是被标记为 best 的真实保存文件，**必须保留**；仅跳过
+        `{prefix}_latest_best.json` 这种专门的快捷方式链接/拷贝。
+        """
+        if not self.checkpoint_dir.exists():
+            return []
+        json_files: List[Path] = []
+        latest_best_tag = f'{self.filename_prefix}_latest_best.json'
+        for f in self.checkpoint_dir.glob(f'{self.filename_prefix}_*.json'):
+            if f.name == latest_best_tag:
+                continue
+            json_files.append(f)
+        return json_files
+
+    def _rank_checkpoint_by_recency(self, json_files: List[Path]) -> List[Path]:
+        """
+        按 最近→最旧 排序 checkpoint：
+        优先级：outer_iteration 降序 → inner_iteration 降序 → created_at 降序 → mtime 降序
+        """
+        def _sort_key(f: Path):
+            try:
+                with open(f, 'r', encoding='utf-8') as fh:
+                    meta = json.load(fh)
+                outer = int(meta.get('outer_iteration', 0))
+                inner = int(meta.get('inner_iteration', 0))
+                created = float(meta.get('created_at', 0.0))
+            except Exception:
+                outer, inner, created = 0, 0, 0.0
+            try:
+                mtime = f.stat().st_mtime
+            except Exception:
+                mtime = 0.0
+            return (-outer, -inner, -created, -mtime)
+
+        return sorted(json_files, key=_sort_key)
+
+    def _validate_checkpoint(self,
+                             base_path: Path,
+                             validate_config: bool,
+                             expected_hash: Optional[str]) -> bool:
+        """验证 checkpoint 元数据合法性（配置哈希等）"""
+        try:
+            meta_path = base_path.with_suffix('.json')
+            if meta_path.exists() and validate_config:
+                with open(meta_path, 'r', encoding='utf-8') as f:
+                    meta = json.load(f)
+                file_hash = meta.get('config_hash', '') or ''
+                if expected_hash is not None and file_hash:
+                    if file_hash != expected_hash:
+                        logger.warning(
+                            f"跳过 checkpoint {base_path.name}: 配置哈希不一致 "
+                            f"(期望 {expected_hash[:8] if len(expected_hash) >= 8 else expected_hash}..., "
+                            f"文件 {file_hash[:8]}...)"
+                        )
+                        return False
+            npz_path = base_path.with_suffix('.npz')
+            if not npz_path.exists():
+                logger.warning(f"跳过 checkpoint {base_path.name}: 缺少 .npz 文件")
+                return False
+            return True
+        except Exception as e:
+            logger.warning(f"检查 checkpoint {base_path} 失败: {e}")
+            return False
+
     def find_latest_checkpoint(self,
                                validate_config: bool = True,
                                expected_config_hash: Optional[str] = None) -> Optional[Path]:
         """
-        在 checkpoint_dir 中查找最近的 checkpoint 文件
+        在 checkpoint_dir 中查找**最近一次**保存的 checkpoint 文件（严格按时间/迭代号最近）
 
-        优先级：_latest_best → 时间戳最新的文件
+        排序优先级：outer_iteration 降序 → inner_iteration 降序 → created_at 降序 → 文件 mtime 降序
+        不返回 _latest_best 快捷方式（它指向 best，可能不是最近）。
 
         Args:
             validate_config: 是否验证配置哈希一致
@@ -1769,36 +1838,59 @@ class WorkflowCheckpointManager:
             return None
 
         expected_hash = expected_config_hash or self.config_hash
+        json_files = self._iter_checkpoint_candidates()
+        if not json_files:
+            return None
 
-        best_link = self.checkpoint_dir / f'{self.filename_prefix}_latest_best.npz'
-        candidates: List[Path] = []
-        if best_link.exists():
-            candidates.append(best_link)
-
-        npz_files = sorted(self.checkpoint_dir.glob(f'{self.filename_prefix}_*.npz'))
-        candidates.extend(npz_files)
-
-        for npz_file in candidates:
-            base = npz_file.with_suffix('')
-            try:
-                meta_path = base.with_suffix('.json')
-                if meta_path.exists():
-                    with open(meta_path, 'r', encoding='utf-8') as f:
-                        meta = json.load(f)
-                    if validate_config and expected_hash:
-                        file_hash = meta.get('config_hash', '')
-                        if file_hash and file_hash != expected_hash:
-                            logger.warning(
-                                f"跳过 checkpoint {base.name}: 配置哈希不一致 "
-                                f"(期望 {expected_hash[:8]}..., 文件 {file_hash[:8]}...)"
-                            )
-                            continue
+        ranked = self._rank_checkpoint_by_recency(json_files)
+        for json_file in ranked:
+            base = json_file.with_suffix('')
+            if self._validate_checkpoint(base, validate_config, expected_hash):
                 return base
-            except Exception as e:
-                logger.warning(f"检查 checkpoint {npz_file} 失败: {e}")
-                continue
-
         return None
+
+    def find_best_checkpoint(self,
+                             validate_config: bool = True,
+                             expected_config_hash: Optional[str] = None) -> Optional[Path]:
+        """
+        查找**最优损失（best_loss 最小）**的 checkpoint（供对比或回退使用，非断点续跑默认入口）
+
+        Args:
+            validate_config: 是否验证配置哈希一致
+            expected_config_hash: 期望的配置哈希
+
+        Returns:
+            checkpoint 文件基路径（不含后缀），未找到返回 None
+        """
+        if not self.checkpoint_dir.exists():
+            return None
+        expected_hash = expected_config_hash or self.config_hash
+
+        best_link = self.checkpoint_dir / f'{self.filename_prefix}_latest_best'
+        if best_link.with_suffix('.npz').exists() or best_link.with_suffix('.json').exists():
+            if self._validate_checkpoint(best_link, validate_config, expected_hash):
+                return best_link
+
+        json_files = self._iter_checkpoint_candidates()
+        if not json_files:
+            return None
+
+        best_path: Optional[Path] = None
+        best_loss = float('inf')
+        for json_file in json_files:
+            base = json_file.with_suffix('')
+            if not self._validate_checkpoint(base, validate_config, expected_hash):
+                continue
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    meta = json.load(f)
+                loss = float(meta.get('best_loss', float('inf')))
+            except Exception:
+                continue
+            if loss < best_loss:
+                best_loss = loss
+                best_path = base
+        return best_path
 
     def load_checkpoint(self, filepath: Union[str, Path]) -> WorkflowCheckpointState:
         """加载 checkpoint 状态的便捷方法"""
@@ -1809,14 +1901,16 @@ class WorkflowCheckpointManager:
         列出目录中所有 checkpoint 的元信息
 
         Returns:
-            元信息字典列表（按创建时间倒序）
+            元信息字典列表（按最近→最旧排序：outer_iteration desc → inner_iteration desc → created_at desc）
         """
         if not self.checkpoint_dir.exists():
             return []
 
+        json_files = self._iter_checkpoint_candidates()
+        ranked = self._rank_checkpoint_by_recency(json_files)
+
         result = []
-        for json_file in sorted(self.checkpoint_dir.glob(f'{self.filename_prefix}_*.json'),
-                                reverse=True):
+        for json_file in ranked:
             try:
                 with open(json_file, 'r', encoding='utf-8') as f:
                     meta = json.load(f)
