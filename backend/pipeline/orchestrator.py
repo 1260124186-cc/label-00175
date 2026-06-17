@@ -95,6 +95,33 @@ class PWVerifyConfig:
 
 
 @dataclass
+class SurrogateIntegrationConfig:
+    """代理模型集成配置"""
+    enabled: bool = False
+    checkpoint_path: Optional[str] = None
+    use_adaptive: bool = True
+    adaptive_config: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'SurrogateIntegrationConfig':
+        if d is None:
+            return cls()
+        cfg = cls()
+        for key, value in d.items():
+            if hasattr(cfg, key):
+                setattr(cfg, key, value)
+        return cfg
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'enabled': self.enabled,
+            'checkpoint_path': self.checkpoint_path,
+            'use_adaptive': self.use_adaptive,
+            'adaptive_config': self.adaptive_config,
+        }
+
+
+@dataclass
 class PipelineConfig:
     enable_opc: bool = True
     enable_ilt: bool = True
@@ -108,6 +135,7 @@ class PipelineConfig:
     hybrid_config: Optional[HybridOPCILTConfig] = None
     smo_config: Optional[SMOConfig] = None
     pw_verify_config: Optional[PWVerifyConfig] = None
+    surrogate_config: Optional[SurrogateIntegrationConfig] = None
 
     output_dir: Optional[str] = None
     save_intermediate: bool = True
@@ -136,6 +164,8 @@ class PipelineConfig:
                 cfg.smo_config = SMOConfig.from_dict(value)
             elif key == 'pw_verify_config':
                 cfg.pw_verify_config = PWVerifyConfig.from_dict(value)
+            elif key == 'surrogate_config':
+                cfg.surrogate_config = SurrogateIntegrationConfig.from_dict(value)
         return cfg
 
     @classmethod
@@ -155,6 +185,7 @@ class PipelineConfig:
             'hybrid_config': self.hybrid_config.to_dict() if self.hybrid_config else None,
             'smo_config': self.smo_config.to_dict() if self.smo_config else None,
             'pw_verify_config': self.pw_verify_config.to_dict() if self.pw_verify_config else None,
+            'surrogate_config': self.surrogate_config.to_dict() if self.surrogate_config else None,
             'output_dir': self.output_dir,
             'save_intermediate': self.save_intermediate,
             'verbose': self.verbose,
@@ -208,6 +239,10 @@ class PipelineResult:
 
     optimal_source: Optional[np.ndarray] = None
     pw_optical_system: Optional[OpticalSystem] = None
+
+    surrogate_used: bool = False
+    surrogate_adaptive_mode: bool = False
+    surrogate_stats: Optional[Dict[str, Any]] = None
 
     stage_metrics: List[StageMetrics] = field(default_factory=list)
     total_time: float = 0.0
@@ -311,6 +346,12 @@ class PipelineResult:
         }
         if self.pw_metrics is not None and self.optimal_source is not None:
             summary['validation']['pw_source_consistency'] = self.validate_pw_source_consistency()
+
+        summary['surrogate'] = {
+            'used': self.surrogate_used,
+            'adaptive_mode': self.surrogate_adaptive_mode,
+            'stats': self.surrogate_stats,
+        }
 
         return summary
 
@@ -509,6 +550,48 @@ class PipelineOrchestrator:
         pw_printability = None
         optimal_source = None
 
+        surrogate_imaging = None
+        surrogate_stats = None
+
+        if cfg.surrogate_config and cfg.surrogate_config.enabled:
+            try:
+                from surrogate import (
+                    AdaptiveSurrogateImaging,
+                    SurrogateImaging,
+                    AdaptiveSurrogateConfig,
+                )
+
+                surr_cfg = cfg.surrogate_config
+                if surr_cfg.checkpoint_path and os.path.exists(surr_cfg.checkpoint_path):
+                    if surr_cfg.use_adaptive:
+                        adaptive_cfg = None
+                        if surr_cfg.adaptive_config:
+                            adaptive_cfg = AdaptiveSurrogateConfig.from_dict(
+                                surr_cfg.adaptive_config
+                            )
+                        surrogate_imaging = AdaptiveSurrogateImaging.from_checkpoint(
+                            surr_cfg.checkpoint_path,
+                            optical_system=optics,
+                            adaptive_config=adaptive_cfg,
+                        )
+                    else:
+                        surrogate_imaging = SurrogateImaging.from_checkpoint(
+                            surr_cfg.checkpoint_path,
+                            optical_system=optics,
+                        )
+                    logger.info(
+                        f"代理模型加载成功: "
+                        f"{'自适应' if surr_cfg.use_adaptive else '静态'}模式"
+                    )
+                else:
+                    logger.warning(
+                        f"代理模型 checkpoint 不存在: {surr_cfg.checkpoint_path}, "
+                        f"将使用全精度仿真"
+                    )
+            except Exception as e:
+                logger.warning(f"加载代理模型失败: {e}，将使用全精度仿真")
+                surrogate_imaging = None
+
         if cfg.use_hybrid_opc_ilt and cfg.enable_opc and cfg.enable_ilt:
             if cfg.verbose:
                 logger.info("=" * 50)
@@ -516,6 +599,15 @@ class PipelineOrchestrator:
                 logger.info("=" * 50)
             t0 = time.time()
             hybrid_config = cfg.hybrid_config or HybridOPCILTConfig()
+            if surrogate_imaging is not None:
+                if hasattr(hybrid_config, 'ilt_config') and hybrid_config.ilt_config:
+                    if hybrid_config.ilt_config.imaging_model is None:
+                        hybrid_config.ilt_config.imaging_model = surrogate_imaging
+                else:
+                    from workflows.ilt import ILTConfig
+                    ilt_cfg = ILTConfig()
+                    ilt_cfg.imaging_model = surrogate_imaging
+                    hybrid_config.ilt_config = ilt_cfg
             hybrid_result = run_hybrid_opc_ilt_workflow(
                 mask, tgt, config=hybrid_config, optical_system=optics
             )
@@ -579,6 +671,8 @@ class PipelineOrchestrator:
                     logger.info("=" * 50)
                 t0 = time.time()
                 ilt_config = cfg.ilt_config or ILTConfig()
+                if surrogate_imaging is not None and ilt_config.imaging_model is None:
+                    ilt_config.imaging_model = surrogate_imaging
                 ilt_result = run_ilt_workflow(mask, tgt, optical_system=optics, config=ilt_config)
                 mask = ilt_result.optimal_mask.copy()
                 elapsed = time.time() - t0
@@ -751,6 +845,18 @@ class PipelineOrchestrator:
 
         total_time = time.time() - t_total_start
 
+        surrogate_used = surrogate_imaging is not None
+        surrogate_adaptive_mode = False
+        surrogate_stats = None
+        if surrogate_imaging is not None:
+            surrogate_adaptive_mode = hasattr(
+                surrogate_imaging, 'get_adaptive_stats'
+            )
+            if surrogate_adaptive_mode:
+                surrogate_stats = surrogate_imaging.get_adaptive_stats()
+            else:
+                surrogate_stats = surrogate_imaging.get_stats()
+
         result = PipelineResult(
             initial_mask=initial_mask.copy() if initial_mask is not None else target.copy(),
             final_mask=mask,
@@ -764,6 +870,9 @@ class PipelineOrchestrator:
             pw_printability=pw_printability,
             optimal_source=optimal_source,
             pw_optical_system=pw_optics if cfg.enable_pw_verify else None,
+            surrogate_used=surrogate_used,
+            surrogate_adaptive_mode=surrogate_adaptive_mode,
+            surrogate_stats=surrogate_stats,
             stage_metrics=stage_metrics,
             total_time=total_time,
         )

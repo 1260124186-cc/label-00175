@@ -169,6 +169,7 @@ class ILTConfig:
 
     pixel_size: float = 1.0
     verbose: bool = True
+    imaging_model: Optional[Any] = None
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'ILTConfig':
@@ -176,7 +177,7 @@ class ILTConfig:
             return cls()
         cfg = cls()
         for key, value in d.items():
-            if hasattr(cfg, key):
+            if hasattr(cfg, key) and key != 'imaging_model':
                 if key == 'optimizer_type':
                     cfg.optimizer_type = ILTOptimizerType(value) if isinstance(value, str) else value
                 elif key == 'transmission_level':
@@ -347,7 +348,8 @@ class DifferentiableImagingChain:
                  optical_system: OpticalSystem,
                  image_size: Tuple[int, int],
                  resist_steepness: float = 50.0,
-                 wafer_threshold: float = 0.3):
+                 wafer_threshold: float = 0.3,
+                 imaging_model: Optional[Any] = None):
         """
         初始化可微成像链
 
@@ -356,15 +358,20 @@ class DifferentiableImagingChain:
             image_size: 图像尺寸 (ny, nx)
             resist_steepness: sigmoid 陡度参数
             wafer_threshold: 光刻胶阈值
+            imaging_model: 可选的外部成像模型（如自适应代理模型），
+                需实现 compute_aerial_image(mask) 接口
         """
         self.optical_system = optical_system
         self.image_size = image_size
         self.resist_steepness = resist_steepness
         self.wafer_threshold = wafer_threshold
 
-        self._imaging = PartialCoherentImaging(
-            optical_system, image_size
-        )
+        if imaging_model is not None:
+            self._imaging = imaging_model
+        else:
+            self._imaging = PartialCoherentImaging(
+                optical_system, image_size
+            )
 
     def forward(self, mask: np.ndarray, dose: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -1112,6 +1119,7 @@ class ILTWorkflow:
             self.optical_system, image_size,
             resist_steepness=cfg.resist_steepness,
             wafer_threshold=cfg.wafer_threshold,
+            imaging_model=cfg.imaging_model,
         )
         self._gradient_projector = GradientProjector(cfg)
         self._complexity_penalty = MaskComplexityPenalty(cfg.complexity)

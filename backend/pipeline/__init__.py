@@ -24,6 +24,7 @@ try:
     from pipeline.orchestrator import (
         PipelineStage,
         PWVerifyConfig,
+        SurrogateIntegrationConfig,
         PipelineConfig,
         StageMetrics,
         PipelineResult,
@@ -56,6 +57,7 @@ except ImportError:
     from .orchestrator import (
         PipelineStage,
         PWVerifyConfig,
+        SurrogateIntegrationConfig,
         PipelineConfig,
         StageMetrics,
         PipelineResult,
@@ -85,6 +87,7 @@ __all__ = [
     'save_batch_summary',
     'PipelineStage',
     'PWVerifyConfig',
+    'SurrogateIntegrationConfig',
     'PipelineConfig',
     'StageMetrics',
     'PipelineResult',

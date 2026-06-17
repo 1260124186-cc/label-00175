@@ -14,7 +14,22 @@
 
 try:
     from surrogate.model import UNet, SurrogateModelConfig
-    from surrogate.imaging import SurrogateImaging
+    from surrogate.imaging import (
+        SurrogateImaging,
+        SurrogateComparisonResult,
+        FidelityMode,
+        ExperienceReplayConfig,
+        OnlineFineTuningConfig,
+        AccuracyMonitorConfig,
+        AdaptiveSurrogateConfig,
+        ExperienceReplayBuffer,
+        FineTuningResult,
+        OnlineFineTuner,
+        AccuracyCheckResult,
+        AccuracyMonitor,
+        AdaptiveUpdateResult,
+        AdaptiveSurrogateImaging,
+    )
     from surrogate.dataset import (
         SurrogateDataset,
         DatasetConfig,
@@ -30,7 +45,22 @@ try:
     )
 except ImportError:
     from .model import UNet, SurrogateModelConfig
-    from .imaging import SurrogateImaging
+    from .imaging import (
+        SurrogateImaging,
+        SurrogateComparisonResult,
+        FidelityMode,
+        ExperienceReplayConfig,
+        OnlineFineTuningConfig,
+        AccuracyMonitorConfig,
+        AdaptiveSurrogateConfig,
+        ExperienceReplayBuffer,
+        FineTuningResult,
+        OnlineFineTuner,
+        AccuracyCheckResult,
+        AccuracyMonitor,
+        AdaptiveUpdateResult,
+        AdaptiveSurrogateImaging,
+    )
     from .dataset import (
         SurrogateDataset,
         DatasetConfig,
@@ -49,6 +79,19 @@ __all__ = [
     'UNet',
     'SurrogateModelConfig',
     'SurrogateImaging',
+    'SurrogateComparisonResult',
+    'FidelityMode',
+    'ExperienceReplayConfig',
+    'OnlineFineTuningConfig',
+    'AccuracyMonitorConfig',
+    'AdaptiveSurrogateConfig',
+    'ExperienceReplayBuffer',
+    'FineTuningResult',
+    'OnlineFineTuner',
+    'AccuracyCheckResult',
+    'AccuracyMonitor',
+    'AdaptiveUpdateResult',
+    'AdaptiveSurrogateImaging',
     'SurrogateDataset',
     'DatasetConfig',
     'generate_training_data',
