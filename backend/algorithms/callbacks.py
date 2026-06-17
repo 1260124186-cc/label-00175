@@ -4,17 +4,23 @@
 
 提供统一的回调接口，支持学习率调度、早停、checkpoint、
 中间掩模保存、收敛曲线绘制等功能。
+同时提供工作流级别的 Checkpoint 管理，支持多阶段流程（SMO/OPC/ILT等）
+的断点续跑，持久化光源图、掩模状态、迭代计数与随机种子。
 """
 
 import os
 import time
+import json
+import pickle
+import random
 import numpy as np
 from abc import ABC, abstractmethod
-from typing import List, Optional, Dict, Any, Callable, Tuple
-from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Any, Callable, Tuple, Union
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 import logging
 from io import BytesIO
+import hashlib
 
 logger = logging.getLogger(__name__)
 
@@ -1333,3 +1339,583 @@ class ExperimentTrackingCallback(Callback):
     def tracker(self):
         """获取底层追踪器"""
         return self._tracker
+
+
+# ============================================================================
+# 工作流级别 Checkpoint 支持（用于多阶段流程：SMO/OPC/ILT等）
+# ============================================================================
+
+
+@dataclass
+class WorkflowCheckpointState:
+    """
+    工作流 Checkpoint 完整状态
+
+    用于在多阶段工作流（SMO/OPC/ILT 等）中持久化完整运行状态，
+    支持 Docker 容器重启或集群节点故障后从最近 checkpoint 恢复。
+
+    Attributes:
+        workflow_type: 工作流类型标识 ('SMO', 'OPC', 'ILT', 'HYBRID' 等)
+        workflow_version: 工作流代码版本标识（用于兼容性检查）
+        checkpoint_id: 唯一 checkpoint 标识（时间戳+哈希）
+        created_at: 创建时间戳（秒）
+        outer_iteration: 当前外层迭代次数（如 SMO 的外层交替次数）
+        inner_iteration: 当前内层迭代次数（如 SMO 的子阶段迭代）
+        current_phase: 当前子阶段标识（如 SMO 的 'source'/'mask'/'joint'）
+        source: 像素化光源分布（2D ndarray，SMO 特有）
+        mask: 当前掩模状态（2D ndarray）
+        best_loss: 历史最优损失值
+        best_mask: 历史最优掩模
+        best_source: 历史最优光源（SMO 特有）
+        loss_history: 损失历史列表
+        loss_components_history: 各损失分量历史
+        random_seed_numpy: numpy 随机状态
+        random_seed_python: Python random 模块状态
+        extra_data: 工作流特有的额外数据字典
+                     - SMO: source_grid_size, source_constraints, patience_counter 等
+                     - OPC: srafs, hotspots, transform_history 等
+        config_hash: 配置参数的哈希（用于验证配置一致性）
+    """
+    workflow_type: str
+    workflow_version: str = '1.0.0'
+    checkpoint_id: str = ''
+    created_at: float = 0.0
+
+    outer_iteration: int = 0
+    inner_iteration: int = 0
+    current_phase: str = ''
+
+    source: Optional[np.ndarray] = None
+    mask: Optional[np.ndarray] = None
+    best_loss: float = float('inf')
+    best_mask: Optional[np.ndarray] = None
+    best_source: Optional[np.ndarray] = None
+
+    loss_history: List[float] = field(default_factory=list)
+    loss_components_history: List[Dict[str, float]] = field(default_factory=list)
+
+    random_seed_numpy: Optional[Tuple[Any, ...]] = None
+    random_seed_python: Optional[Tuple[Any, ...]] = None
+
+    extra_data: Dict[str, Any] = field(default_factory=dict)
+    config_hash: str = ''
+
+    def save(self, filepath: Union[str, Path]) -> None:
+        """
+        保存 checkpoint 状态到文件
+
+        使用 npz + pickle 组合格式，确保大型数组高效存储。
+        """
+        filepath = Path(filepath)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+
+        if not self.checkpoint_id:
+            self.checkpoint_id = self._generate_checkpoint_id()
+        if not self.created_at:
+            self.created_at = time.time()
+
+        npz_data: Dict[str, Any] = {
+            'workflow_type': self.workflow_type,
+            'workflow_version': self.workflow_version,
+            'checkpoint_id': self.checkpoint_id,
+            'created_at': self.created_at,
+            'outer_iteration': self.outer_iteration,
+            'inner_iteration': self.inner_iteration,
+            'current_phase': self.current_phase,
+            'best_loss': self.best_loss,
+            'config_hash': self.config_hash,
+        }
+
+        if self.source is not None:
+            npz_data['source'] = self.source
+        if self.mask is not None:
+            npz_data['mask'] = self.mask
+        if self.best_mask is not None:
+            npz_data['best_mask'] = self.best_mask
+        if self.best_source is not None:
+            npz_data['best_source'] = self.best_source
+        if self.loss_history:
+            npz_data['loss_history'] = np.array(self.loss_history)
+
+        np.savez(filepath.with_suffix('.npz'), **npz_data)
+
+        pickle_data = {
+            'loss_components_history': self.loss_components_history,
+            'random_seed_numpy': self.random_seed_numpy,
+            'random_seed_python': self.random_seed_python,
+            'extra_data': self.extra_data,
+        }
+        with open(filepath.with_suffix('.pkl'), 'wb') as f:
+            pickle.dump(pickle_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        meta_path = filepath.with_suffix('.json')
+        meta = {
+            'workflow_type': self.workflow_type,
+            'workflow_version': self.workflow_version,
+            'checkpoint_id': self.checkpoint_id,
+            'created_at': self.created_at,
+            'created_at_iso': time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(self.created_at)),
+            'outer_iteration': self.outer_iteration,
+            'inner_iteration': self.inner_iteration,
+            'current_phase': self.current_phase,
+            'best_loss': self.best_loss,
+            'loss_count': len(self.loss_history),
+            'has_source': self.source is not None,
+            'has_mask': self.mask is not None,
+            'config_hash': self.config_hash,
+        }
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+
+        logger.info(f"工作流 checkpoint 已保存: {filepath} (外层迭代={self.outer_iteration}, "
+                   f"阶段={self.current_phase}, best_loss={self.best_loss:.4e})")
+
+    @classmethod
+    def load(cls, filepath: Union[str, Path]) -> 'WorkflowCheckpointState':
+        """
+        从文件加载 checkpoint 状态
+
+        优先读取 .npz 和 .pkl，若存在 .json 则校验元数据一致性。
+        """
+        filepath = Path(filepath)
+        base = filepath.with_suffix('')
+        npz_path = base.with_suffix('.npz')
+        pkl_path = base.with_suffix('.pkl')
+        json_path = base.with_suffix('.json')
+
+        if not npz_path.exists():
+            raise FileNotFoundError(f"Checkpoint 文件不存在: {npz_path}")
+
+        npz = np.load(npz_path, allow_pickle=True)
+        data: Dict[str, Any] = {}
+        for k in npz.files:
+            v = npz[k]
+            if isinstance(v, np.ndarray) and v.ndim == 0:
+                v = v.item()
+            data[k] = v
+
+        state = cls(workflow_type=str(data.get('workflow_type', 'UNKNOWN')))
+        state.workflow_version = str(data.get('workflow_version', '1.0.0'))
+        state.checkpoint_id = str(data.get('checkpoint_id', ''))
+        state.created_at = float(data.get('created_at', 0.0))
+        state.outer_iteration = int(data.get('outer_iteration', 0))
+        state.inner_iteration = int(data.get('inner_iteration', 0))
+        state.current_phase = str(data.get('current_phase', ''))
+        state.best_loss = float(data.get('best_loss', float('inf')))
+        state.config_hash = str(data.get('config_hash', ''))
+
+        if 'source' in data:
+            state.source = data['source']
+        if 'mask' in data:
+            state.mask = data['mask']
+        if 'best_mask' in data:
+            state.best_mask = data['best_mask']
+        if 'best_source' in data:
+            state.best_source = data['best_source']
+        if 'loss_history' in data:
+            state.loss_history = list(data['loss_history'])
+
+        if pkl_path.exists():
+            try:
+                with open(pkl_path, 'rb') as f:
+                    pickle_data = pickle.load(f)
+                state.loss_components_history = pickle_data.get('loss_components_history', [])
+                state.random_seed_numpy = pickle_data.get('random_seed_numpy', None)
+                state.random_seed_python = pickle_data.get('random_seed_python', None)
+                state.extra_data = pickle_data.get('extra_data', {})
+            except Exception as e:
+                logger.warning(f"加载 checkpoint pickle 数据失败（可能为旧格式）: {e}")
+
+        logger.info(f"工作流 checkpoint 已加载: {filepath} (外层迭代={state.outer_iteration}, "
+                   f"阶段={state.current_phase}, best_loss={state.best_loss:.4e})")
+        return state
+
+    def capture_random_state(self) -> None:
+        """捕获当前 numpy 和 Python 的随机种子状态"""
+        self.random_seed_numpy = np.random.get_state()
+        self.random_seed_python = random.getstate()
+
+    def restore_random_state(self) -> None:
+        """将 numpy 和 Python 的随机种子恢复到 checkpoint 时的状态"""
+        if self.random_seed_numpy is not None:
+            np.random.set_state(self.random_seed_numpy)
+            logger.debug("numpy 随机状态已恢复")
+        if self.random_seed_python is not None:
+            random.setstate(self.random_seed_python)
+            logger.debug("Python random 随机状态已恢复")
+
+    @staticmethod
+    def _generate_checkpoint_id() -> str:
+        """生成唯一 checkpoint ID：时间戳+随机哈希"""
+        timestamp = int(time.time() * 1000)
+        rand = hashlib.md5(str(random.random()).encode()).hexdigest()[:8]
+        return f"ckpt_{timestamp}_{rand}"
+
+
+class WorkflowCheckpointManager:
+    """
+    工作流 Checkpoint 管理器
+
+    负责 checkpoint 的保存调度、历史管理、查找最近 checkpoint 等功能。
+    支持多阶段工作流（SMO/OPC/ILT 等）的统一管理。
+
+    典型使用：
+        mgr = WorkflowCheckpointManager(
+            checkpoint_dir='./checkpoints/smo_run_001',
+            workflow_type='SMO',
+            save_freq_outer=1,   # 每 N 次外层迭代保存
+            max_checkpoints=10,
+        )
+        # 启动时尝试恢复
+        latest = mgr.find_latest_checkpoint()
+        if latest:
+            state = mgr.load_checkpoint(latest)
+            state.restore_random_state()
+            # ... 从 state 中恢复工作流状态
+
+        # 每次外层迭代结束时
+        mgr.save_if_needed(state, outer_iter, force=False)
+    """
+
+    def __init__(self,
+                 checkpoint_dir: Union[str, Path],
+                 workflow_type: str,
+                 save_freq_outer: int = 1,
+                 save_freq_inner: int = 0,
+                 max_checkpoints: int = 10,
+                 save_best_only: bool = False,
+                 filename_prefix: str = 'workflow',
+                 config: Optional[Any] = None):
+        """
+        初始化 Checkpoint 管理器
+
+        Args:
+            checkpoint_dir: checkpoint 保存根目录
+            workflow_type: 工作流类型标识（'SMO'/'OPC'/'ILT' 等）
+            save_freq_outer: 外层迭代保存频率（每 N 次外层迭代保存一次），0 禁用
+            save_freq_inner: 内层迭代保存频率（每 N 次内层迭代保存一次），0 禁用
+            max_checkpoints: 最多保留的 checkpoint 文件数量（含 best），0 不限制
+            save_best_only: 是否只保留最优 checkpoint
+            filename_prefix: 文件名前缀
+            config: 工作流配置对象（用于 config_hash 一致性校验）
+        """
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.workflow_type = workflow_type
+        self.save_freq_outer = max(0, int(save_freq_outer))
+        self.save_freq_inner = max(0, int(save_freq_inner))
+        self.max_checkpoints = max(0, int(max_checkpoints))
+        self.save_best_only = save_best_only
+        self.filename_prefix = filename_prefix
+
+        self._saved_files: List[Path] = []
+        self._best_filepath: Optional[Path] = None
+        self._best_loss: float = float('inf')
+
+        self.config_hash = ''
+        if config is not None:
+            self.config_hash = self._compute_config_hash(config)
+
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    def _compute_config_hash(self, config: Any) -> str:
+        """计算配置的哈希值，用于恢复时验证配置一致性"""
+        try:
+            if hasattr(config, 'to_dict'):
+                cfg_str = json.dumps(config.to_dict(), sort_keys=True, default=str)
+            elif isinstance(config, dict):
+                cfg_str = json.dumps(config, sort_keys=True, default=str)
+            else:
+                cfg_str = str(config)
+            return hashlib.sha256(cfg_str.encode('utf-8')).hexdigest()[:16]
+        except Exception as e:
+            logger.warning(f"计算配置哈希失败: {e}")
+            return ''
+
+    def should_save(self,
+                    outer_iteration: int,
+                    inner_iteration: int = 0,
+                    force: bool = False) -> bool:
+        """
+        判断当前是否应该保存 checkpoint
+
+        Args:
+            outer_iteration: 当前外层迭代次数
+            inner_iteration: 当前内层迭代次数
+            force: 是否强制保存
+
+        Returns:
+            是否需要保存
+        """
+        if force:
+            return True
+        if self.save_freq_outer > 0 and outer_iteration > 0 and \
+                outer_iteration % self.save_freq_outer == 0:
+            return True
+        if self.save_freq_inner > 0 and inner_iteration > 0 and \
+                inner_iteration % self.save_freq_inner == 0:
+            return True
+        return False
+
+    def save_checkpoint(self,
+                        state: WorkflowCheckpointState,
+                        outer_iteration: int,
+                        current_loss: Optional[float] = None,
+                        force: bool = False) -> Optional[Path]:
+        """
+        根据条件决定是否保存 checkpoint
+
+        Args:
+            state: 要保存的状态
+            outer_iteration: 当前外层迭代次数
+            current_loss: 当前损失值（用于判断 best）
+            force: 是否强制保存
+
+        Returns:
+            若保存了则返回文件路径，否则返回 None
+        """
+        state.workflow_type = self.workflow_type
+        if not state.config_hash and self.config_hash:
+            state.config_hash = self.config_hash
+
+        state.capture_random_state()
+
+        is_best = False
+        if current_loss is not None and current_loss < self._best_loss:
+            self._best_loss = current_loss
+            is_best = True
+
+        if self.save_best_only and not is_best:
+            return None
+
+        if not self.should_save(outer_iteration, state.inner_iteration, force) and not is_best:
+            return None
+
+        if is_best and not self.should_save(outer_iteration, state.inner_iteration, force):
+            pass
+
+        filename_parts = [
+            self.filename_prefix,
+            f"outer_{outer_iteration:04d}",
+        ]
+        if state.inner_iteration > 0:
+            filename_parts.append(f"inner_{state.inner_iteration:04d}")
+        if state.current_phase:
+            filename_parts.append(state.current_phase)
+        if is_best:
+            filename_parts.append('best')
+
+        filename = '_'.join(filename_parts)
+        filepath = self.checkpoint_dir / filename
+
+        state.save(filepath)
+
+        if is_best:
+            self._best_filepath = filepath
+            best_link = self.checkpoint_dir / f'{self.filename_prefix}_latest_best'
+            for suffix in ['.npz', '.pkl', '.json']:
+                src = filepath.with_suffix(suffix)
+                dst = best_link.with_suffix(suffix)
+                if dst.exists() or dst.is_symlink():
+                    dst.unlink()
+                if src.exists():
+                    try:
+                        if hasattr(os, 'symlink'):
+                            os.symlink(src, dst)
+                        else:
+                            import shutil
+                            shutil.copy2(src, dst)
+                    except Exception as e:
+                        logger.debug(f"创建 best checkpoint 链接失败: {e}")
+
+        if not is_best:
+            self._saved_files.append(filepath)
+            self._rotate_checkpoints()
+
+        return filepath
+
+    def _rotate_checkpoints(self) -> None:
+        """轮转 checkpoint，删除最旧的以保持 max_checkpoints 限制"""
+        if self.max_checkpoints <= 0:
+            return
+        while len(self._saved_files) > self.max_checkpoints:
+            old = self._saved_files.pop(0)
+            if old == self._best_filepath:
+                continue
+            for suffix in ['.npz', '.pkl', '.json']:
+                f = old.with_suffix(suffix)
+                if f.exists():
+                    try:
+                        f.unlink()
+                    except Exception as e:
+                        logger.warning(f"删除旧 checkpoint 失败 {f}: {e}")
+            logger.debug(f"已删除旧 checkpoint: {old}")
+
+    def find_latest_checkpoint(self,
+                               validate_config: bool = True,
+                               expected_config_hash: Optional[str] = None) -> Optional[Path]:
+        """
+        在 checkpoint_dir 中查找最近的 checkpoint 文件
+
+        优先级：_latest_best → 时间戳最新的文件
+
+        Args:
+            validate_config: 是否验证配置哈希一致
+            expected_config_hash: 期望的配置哈希（默认使用 self.config_hash）
+
+        Returns:
+            checkpoint 文件基路径（不含后缀），未找到返回 None
+        """
+        if not self.checkpoint_dir.exists():
+            return None
+
+        expected_hash = expected_config_hash or self.config_hash
+
+        best_link = self.checkpoint_dir / f'{self.filename_prefix}_latest_best.npz'
+        candidates: List[Path] = []
+        if best_link.exists():
+            candidates.append(best_link)
+
+        npz_files = sorted(self.checkpoint_dir.glob(f'{self.filename_prefix}_*.npz'))
+        candidates.extend(npz_files)
+
+        for npz_file in candidates:
+            base = npz_file.with_suffix('')
+            try:
+                meta_path = base.with_suffix('.json')
+                if meta_path.exists():
+                    with open(meta_path, 'r', encoding='utf-8') as f:
+                        meta = json.load(f)
+                    if validate_config and expected_hash:
+                        file_hash = meta.get('config_hash', '')
+                        if file_hash and file_hash != expected_hash:
+                            logger.warning(
+                                f"跳过 checkpoint {base.name}: 配置哈希不一致 "
+                                f"(期望 {expected_hash[:8]}..., 文件 {file_hash[:8]}...)"
+                            )
+                            continue
+                return base
+            except Exception as e:
+                logger.warning(f"检查 checkpoint {npz_file} 失败: {e}")
+                continue
+
+        return None
+
+    def load_checkpoint(self, filepath: Union[str, Path]) -> WorkflowCheckpointState:
+        """加载 checkpoint 状态的便捷方法"""
+        return WorkflowCheckpointState.load(filepath)
+
+    def list_all_checkpoints(self) -> List[Dict[str, Any]]:
+        """
+        列出目录中所有 checkpoint 的元信息
+
+        Returns:
+            元信息字典列表（按创建时间倒序）
+        """
+        if not self.checkpoint_dir.exists():
+            return []
+
+        result = []
+        for json_file in sorted(self.checkpoint_dir.glob(f'{self.filename_prefix}_*.json'),
+                                reverse=True):
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    meta = json.load(f)
+                meta['filepath'] = str(json_file.with_suffix(''))
+                result.append(meta)
+            except Exception:
+                continue
+        return result
+
+    def cleanup_all(self, keep_best: bool = True) -> int:
+        """
+        清理所有 checkpoint 文件
+
+        Args:
+            keep_best: 是否保留标记为 best 的 checkpoint
+
+        Returns:
+            删除的文件数量
+        """
+        count = 0
+        if not self.checkpoint_dir.exists():
+            return count
+
+        for suffix in ['.npz', '.pkl', '.json']:
+            pattern = f'{self.filename_prefix}_*{suffix}'
+            for f in self.checkpoint_dir.glob(pattern):
+                if keep_best and '_best.' in f.name:
+                    continue
+                if keep_best and '_latest_best.' in f.name:
+                    continue
+                try:
+                    f.unlink()
+                    count += 1
+                except Exception as e:
+                    logger.warning(f"删除 checkpoint 失败 {f}: {e}")
+
+        self._saved_files.clear()
+        logger.info(f"已清理 {count} 个 checkpoint 文件")
+        return count
+
+
+class WorkflowCheckpointCallback(Callback):
+    """
+    工作流级别的 Checkpoint 回调（适配 Callback 接口）
+
+    与 WorkflowCheckpointManager 配合使用，在训练回调的生命周期中
+    自动管理 checkpoint。适用于将工作流嵌入到 Trainer 的场景。
+    """
+
+    def __init__(self,
+                 checkpoint_manager: WorkflowCheckpointManager,
+                 state_provider: Callable[[], WorkflowCheckpointState],
+                 loss_provider: Optional[Callable[[], float]] = None):
+        """
+        初始化工作流 Checkpoint 回调
+
+        Args:
+            checkpoint_manager: checkpoint 管理器实例
+            state_provider: 调用时返回当前 WorkflowCheckpointState 的函数
+            loss_provider: 调用时返回当前损失值的函数（可选）
+        """
+        super().__init__()
+        self.manager = checkpoint_manager
+        self.state_provider = state_provider
+        self.loss_provider = loss_provider
+        self._last_saved_path: Optional[Path] = None
+
+    def on_epoch_end(self, epoch: int, logs: Optional[Dict[str, Any]] = None):
+        """每个 epoch 结束时尝试保存 checkpoint"""
+        state = self.state_provider()
+        state.outer_iteration = epoch
+        if logs and 'loss' in logs:
+            current_loss = float(logs['loss'])
+        elif self.loss_provider is not None:
+            current_loss = self.loss_provider()
+        else:
+            current_loss = None
+
+        path = self.manager.save_checkpoint(state, epoch, current_loss)
+        if path is not None:
+            self._last_saved_path = path
+
+    def on_train_end(self, logs: Optional[Dict[str, Any]] = None):
+        """训练结束时强制保存最终 checkpoint"""
+        state = self.state_provider()
+        if state.outer_iteration == 0 and self.state is not None:
+            state.outer_iteration = self.state.epoch
+        current_loss = None
+        if logs and 'loss' in logs:
+            current_loss = float(logs['loss'])
+        elif self.loss_provider is not None:
+            current_loss = self.loss_provider()
+        elif self.state is not None:
+            current_loss = self.state.best_loss
+
+        self.manager.save_checkpoint(state, state.outer_iteration, current_loss, force=True)
+
+    @property
+    def last_saved_path(self) -> Optional[Path]:
+        """返回最近一次保存的 checkpoint 路径"""
+        return self._last_saved_path
+

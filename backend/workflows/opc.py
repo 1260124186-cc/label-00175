@@ -32,6 +32,9 @@ from core.imaging import (
 from core.litho_metrics import compute_epe, extract_edges
 from core.metrics import edge_placement_error
 from algorithms.mask_optimizer import MaskOptimizer, OptimizationConfig
+from algorithms.callbacks import (
+    WorkflowCheckpointManager, WorkflowCheckpointState,
+)
 from utils.config import load_config, save_config
 
 logger = logging.getLogger(__name__)
@@ -323,6 +326,14 @@ class OPCConfig:
         pixel_size: 像素尺寸 (nm)
         wafer_threshold: 晶圆成像二值化阈值
         verbose: 是否输出详细日志
+
+        # Checkpoint 配置
+        checkpoint_enable: 是否启用断点续跑功能
+        checkpoint_dir: checkpoint 保存目录（None 则自动生成）
+        checkpoint_save_freq: 迭代保存频率
+        checkpoint_max_keep: 最多保留的 checkpoint 数量
+        checkpoint_save_best_only: 是否只保存最优的 checkpoint
+        checkpoint_force_restart: 是否忽略已有 checkpoint 强制重新开始
     """
     epe_threshold: float = 3.0
     epe_convergence_threshold: float = 1.0
@@ -352,6 +363,14 @@ class OPCConfig:
     pixel_size: float = 1.0
     wafer_threshold: float = 0.3
     verbose: bool = True
+
+    # Checkpoint 配置
+    checkpoint_enable: bool = True
+    checkpoint_dir: Optional[str] = None
+    checkpoint_save_freq: int = 1
+    checkpoint_max_keep: int = 10
+    checkpoint_save_best_only: bool = False
+    checkpoint_force_restart: bool = False
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'OPCConfig':
@@ -398,6 +417,12 @@ class OPCConfig:
             'pixel_size': self.pixel_size,
             'wafer_threshold': self.wafer_threshold,
             'verbose': self.verbose,
+            'checkpoint_enable': self.checkpoint_enable,
+            'checkpoint_dir': self.checkpoint_dir,
+            'checkpoint_save_freq': self.checkpoint_save_freq,
+            'checkpoint_max_keep': self.checkpoint_max_keep,
+            'checkpoint_save_best_only': self.checkpoint_save_best_only,
+            'checkpoint_force_restart': self.checkpoint_force_restart,
         }
 
     def to_yaml(self, config_path: Union[str, Path]) -> None:
@@ -1526,7 +1551,7 @@ class OPCIterationController:
 
 class OPCWorkflow:
     """
-    OPC 完整工作流
+    OPC 完整工作流（支持断点续跑）
 
     封装标准 OPC 流水线：
         输入原始版图（目标图案）
@@ -1565,13 +1590,107 @@ class OPCWorkflow:
             logger.info("OPC 工作流已初始化")
             logger.info(f"配置: EPE 阈值={self.config.epe_threshold}nm, "
                        f"最大迭代={self.config.max_iterations}, "
-                       f"SRAF={'启用' if self.config.sraf_enable else '禁用'}")
+                       f"SRAF={'启用' if self.config.sraf_enable else '禁用'}"
+                       f", Checkpoint={'启用' if self.config.checkpoint_enable else '禁用'}")
+
+    def _init_checkpoint_manager(self,
+                                  initial_mask: np.ndarray,
+                                  target: np.ndarray) -> Optional[WorkflowCheckpointManager]:
+        """初始化 checkpoint 管理器"""
+        if not self.config.checkpoint_enable:
+            return None
+
+        cfg = self.config
+        if cfg.checkpoint_dir:
+            checkpoint_dir = Path(cfg.checkpoint_dir)
+        else:
+            import hashlib
+            mask_hash = hashlib.md5(initial_mask.tobytes()).hexdigest()[:8]
+            target_hash = hashlib.md5(target.tobytes()).hexdigest()[:8]
+            base_dir = Path('./checkpoints')
+            checkpoint_dir = base_dir / f'opc_{mask_hash}_{target_hash}'
+
+        return WorkflowCheckpointManager(
+            checkpoint_dir=checkpoint_dir,
+            workflow_type='OPC',
+            save_freq_outer=cfg.checkpoint_save_freq,
+            max_checkpoints=cfg.checkpoint_max_keep,
+            save_best_only=cfg.checkpoint_save_best_only,
+            filename_prefix='opc',
+            config=cfg,
+        )
+
+    def _try_restore_from_checkpoint(
+        self,
+        ckpt_mgr: WorkflowCheckpointManager,
+    ) -> Optional[Tuple[int, np.ndarray, List[OPCIterationResult],
+                         List[List[HotspotRegion]], List[SRAFFeature],
+                         Optional[OPCIterationResult], float, float]]:
+        """
+        尝试从最近的 checkpoint 恢复 OPC 工作流状态
+
+        Returns:
+            (start_iter, current_mask, iterations, all_hotspots, all_srafs,
+             prev_result, best_epe, best_loss)
+            恢复失败返回 None
+        """
+        if self.config.checkpoint_force_restart:
+            logger.info("checkpoint_force_restart=True，忽略已有 checkpoint，从头开始")
+            return None
+
+        latest_path = ckpt_mgr.find_latest_checkpoint(validate_config=True)
+        if latest_path is None:
+            logger.info("未找到可恢复的 checkpoint，从头开始运行")
+            return None
+
+        try:
+            state = WorkflowCheckpointState.load(latest_path)
+            state.restore_random_state()
+
+            current_mask = state.mask
+            if current_mask is None:
+                logger.warning("  checkpoint 中未找到掩模，恢复失败")
+                return None
+
+            start_iter = int(state.outer_iteration)
+            iterations: List[OPCIterationResult] = list(
+                state.extra_data.get('iterations', [])
+            )
+            all_hotspots: List[List[HotspotRegion]] = list(
+                state.extra_data.get('all_hotspots', [])
+            )
+            all_srafs: List[SRAFFeature] = list(
+                state.extra_data.get('all_srafs', [])
+            )
+            prev_result: Optional[OPCIterationResult] = state.extra_data.get('prev_result', None)
+            best_epe: float = float(state.extra_data.get('best_epe', float('inf')))
+            best_loss: float = state.best_loss
+
+            if state.config_hash and state.config_hash != ckpt_mgr.config_hash:
+                logger.warning(
+                    f"  配置哈希与 checkpoint 不一致，可能导致结果偏差 "
+                    f"(期望 {ckpt_mgr.config_hash[:8]}..., checkpoint {state.config_hash[:8]}...)"
+                )
+
+            logger.info(
+                f"成功从 checkpoint 恢复: 迭代={start_iter}, "
+                f"已执行迭代={len(iterations)}, SRAF数量={len(all_srafs)}, "
+                f"best_epe={best_epe:.3f}nm"
+            )
+            return (start_iter, current_mask, iterations, all_hotspots,
+                    all_srafs, prev_result, best_epe, best_loss)
+
+        except Exception as e:
+            logger.warning(f"恢复 checkpoint 失败，将从头开始: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None
 
     def run(self,
            initial_mask: np.ndarray,
            target: np.ndarray) -> OPCWorkflowResult:
         """
-        运行完整的 OPC 工作流
+        运行完整的 OPC 工作流（支持断点续跑）
 
         Args:
             initial_mask: 初始掩模（通常与目标相同）
@@ -1585,6 +1704,8 @@ class OPCWorkflow:
             logger.info("开始 OPC 工作流")
             logger.info("="*60)
             logger.info(f"初始掩模尺寸: {initial_mask.shape}")
+
+        ckpt_mgr = self._init_checkpoint_manager(initial_mask, target)
 
         initial_wafer_cont = simulate_wafer_image(
             initial_mask,
@@ -1603,23 +1724,40 @@ class OPCWorkflow:
             logger.info(f"初始 EPE: mean={initial_epe['epe_mean']:.3f}nm, "
                        f"max={initial_epe['epe_max']:.3f}nm")
 
-        current_mask = initial_mask.copy()
-        iterations = []
-        all_hotspots = []
-        all_srafs = []
+        # —— 尝试从 checkpoint 恢复 ——
+        start_iter = 0
+        best_epe = initial_epe['epe_mean']
+        best_loss = initial_epe['epe_mean']
+        restored = None
+        if ckpt_mgr is not None:
+            restored = self._try_restore_from_checkpoint(ckpt_mgr)
+
+        if restored is not None:
+            (start_iter, current_mask, iterations, all_hotspots,
+             all_srafs, prev_result, best_epe, best_loss) = restored
+        else:
+            current_mask = initial_mask.copy()
+            iterations: List[OPCIterationResult] = []
+            all_hotspots: List[List[HotspotRegion]] = []
+            all_srafs: List[SRAFFeature] = []
+            prev_result = None
+
         converged = False
         reason = ""
 
-        initial_hotspots = self.controller.hotspot_detector.detect(
-            current_mask, target,
-            wafer_binary=initial_wafer,
-            optical_system=self.optical_system
-        )
-        all_hotspots.append(initial_hotspots)
+        if not all_hotspots:
+            initial_hotspots = self.controller.hotspot_detector.detect(
+                current_mask, target,
+                wafer_binary=initial_wafer if start_iter == 0 else None,
+                optical_system=self.optical_system
+            )
+            all_hotspots.append(initial_hotspots)
 
-        prev_result = None
+        if start_iter > 0 and self.config.verbose:
+            logger.info(f"\n从 checkpoint 恢复后继续: 当前迭代={start_iter}, "
+                       f"best_epe={best_epe:.3f}nm")
 
-        for iteration in range(1, self.config.max_iterations + 1):
+        for iteration in range(max(1, start_iter + 1), self.config.max_iterations + 1):
             iter_result = self.controller.run_iteration(
                 current_mask, target, iteration,
                 existing_srafs=all_srafs
@@ -1633,6 +1771,40 @@ class OPCWorkflow:
                     iter_result.mask_after, target, iter_result.hotspots_before
                 )
                 all_srafs.extend(new_srafs)
+
+            # —— 更新 best 状态 ——
+            current_epe = iter_result.epe_after['epe_mean']
+            if current_epe < best_epe:
+                best_epe = current_epe
+                best_loss = current_epe
+
+            # —— 保存 checkpoint ——
+            if ckpt_mgr is not None:
+                ckpt_state = WorkflowCheckpointState(
+                    workflow_type='OPC',
+                    outer_iteration=iteration,
+                    inner_iteration=0,
+                    current_phase='opc_iteration',
+                    source=None,
+                    mask=iter_result.mask_after.copy(),
+                    best_loss=best_loss,
+                    best_mask=iter_result.mask_after.copy() if current_epe <= best_epe else None,
+                    best_source=None,
+                    loss_history=[float(r.epe_after.get('epe_mean', 0)) for r in iterations],
+                    loss_components_history=[],
+                    extra_data={
+                        'iterations': iterations,
+                        'all_hotspots': all_hotspots,
+                        'all_srafs': all_srafs,
+                        'prev_result': prev_result,
+                        'best_epe': best_epe,
+                    },
+                )
+                ckpt_mgr.save_checkpoint(
+                    ckpt_state,
+                    outer_iteration=iteration,
+                    current_loss=current_epe,
+                )
 
             converged, reason = self.controller.check_convergence(
                 iter_result, prev_result

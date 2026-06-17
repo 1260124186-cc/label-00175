@@ -44,6 +44,9 @@ from core.metrics import (
 )
 from core.litho_metrics import compute_epe
 from algorithms.mask_optimizer import MaskOptimizer, OptimizationConfig, LossWeights
+from algorithms.callbacks import (
+    WorkflowCheckpointManager, WorkflowCheckpointState,
+)
 from utils.config import load_config, save_config
 from utils.logger import setup_logger
 
@@ -160,6 +163,14 @@ class SMOConfig:
 
         source_snapshot_freq: 光源快照保存频率（每N次外层迭代）
         verbose: 是否输出详细日志
+
+        # Checkpoint 配置
+        checkpoint_enable: 是否启用断点续跑功能
+        checkpoint_dir: checkpoint 保存目录（None 则自动生成）
+        checkpoint_save_freq_outer: 外层迭代保存频率
+        checkpoint_max_keep: 最多保留的 checkpoint 数量
+        checkpoint_save_best_only: 是否只保存最优的 checkpoint
+        checkpoint_force_restart: 是否忽略已有 checkpoint 强制重新开始
     """
     strategy: SMOptimizationStrategy = SMOptimizationStrategy.ALTERNATING
     max_outer_iterations: int = 20
@@ -193,6 +204,14 @@ class SMOConfig:
 
     source_snapshot_freq: int = 1
     verbose: bool = True
+
+    # Checkpoint 配置
+    checkpoint_enable: bool = True
+    checkpoint_dir: Optional[str] = None
+    checkpoint_save_freq_outer: int = 1
+    checkpoint_max_keep: int = 10
+    checkpoint_save_best_only: bool = False
+    checkpoint_force_restart: bool = False
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'SMOConfig':
@@ -247,6 +266,12 @@ class SMOConfig:
             'pvb_weight': self.pvb_weight,
             'source_snapshot_freq': self.source_snapshot_freq,
             'verbose': self.verbose,
+            'checkpoint_enable': self.checkpoint_enable,
+            'checkpoint_dir': self.checkpoint_dir,
+            'checkpoint_save_freq_outer': self.checkpoint_save_freq_outer,
+            'checkpoint_max_keep': self.checkpoint_max_keep,
+            'checkpoint_save_best_only': self.checkpoint_save_best_only,
+            'checkpoint_force_restart': self.checkpoint_force_restart,
         }
 
     def to_yaml(self, config_path: Union[str, Path]) -> None:
@@ -2055,11 +2080,123 @@ class SMOWorkflow:
         _, comps, _, _, _ = self._evaluate_state(mask, target, pixelated_source)
         return float(comps.get('pvb_hard_L2', 0.0))
 
+    def _init_checkpoint_manager(self,
+                                  initial_mask: np.ndarray,
+                                  target: np.ndarray) -> Optional[WorkflowCheckpointManager]:
+        """
+        初始化 checkpoint 管理器
+
+        Args:
+            initial_mask: 初始掩模（用于生成唯一目录名）
+            target: 目标图案
+
+        Returns:
+            WorkflowCheckpointManager 实例，若未启用则返回 None
+        """
+        if not self.config.checkpoint_enable:
+            return None
+
+        cfg = self.config
+        if cfg.checkpoint_dir:
+            checkpoint_dir = Path(cfg.checkpoint_dir)
+        else:
+            import hashlib
+            mask_hash = hashlib.md5(initial_mask.tobytes()).hexdigest()[:8]
+            target_hash = hashlib.md5(target.tobytes()).hexdigest()[:8]
+            base_dir = Path('./checkpoints')
+            checkpoint_dir = base_dir / f'smo_{mask_hash}_{target_hash}'
+
+        return WorkflowCheckpointManager(
+            checkpoint_dir=checkpoint_dir,
+            workflow_type='SMO',
+            save_freq_outer=cfg.checkpoint_save_freq_outer,
+            max_checkpoints=cfg.checkpoint_max_keep,
+            save_best_only=cfg.checkpoint_save_best_only,
+            filename_prefix='smo',
+            config=cfg,
+        )
+
+    def _try_restore_from_checkpoint(
+        self,
+        ckpt_mgr: WorkflowCheckpointManager,
+        pixelated_source: PixelatedSource,
+    ) -> Optional[Tuple[int, np.ndarray, np.ndarray, np.ndarray, float, int, List[SMOIterationResult],
+                         List[np.ndarray], List[np.ndarray], List[float]]]:
+        """
+        尝试从最近的 checkpoint 恢复工作流状态
+
+        Returns:
+            若恢复成功，返回 (start_outer_iter, current_mask, best_source, best_mask, best_loss,
+                             patience_counter, iterations, source_history, mask_history, loss_history)
+            否则返回 None
+        """
+        if self.config.checkpoint_force_restart:
+            logger.info("checkpoint_force_restart=True，忽略已有 checkpoint，从头开始")
+            return None
+
+        latest_path = ckpt_mgr.find_latest_checkpoint(validate_config=True)
+        if latest_path is None:
+            logger.info("未找到可恢复的 checkpoint，从头开始运行")
+            return None
+
+        try:
+            state = WorkflowCheckpointState.load(latest_path)
+            state.restore_random_state()
+
+            if state.source is not None and state.source.shape == pixelated_source.intensity.shape:
+                pixelated_source.set_intensity(state.source, auto_project=True)
+                logger.info(f"  从 checkpoint 恢复光源分布（shape={state.source.shape}）")
+            else:
+                logger.warning("  checkpoint 中光源形状不匹配，使用初始光源")
+
+            current_mask = state.mask if state.mask is not None else None
+            if current_mask is None:
+                logger.warning("  checkpoint 中未找到掩模，恢复失败")
+                return None
+
+            best_source = state.best_source if state.best_source is not None else \
+                pixelated_source.get_intensity().copy()
+            best_mask = state.best_mask if state.best_mask is not None else current_mask.copy()
+            best_loss = state.best_loss
+            patience_counter = int(state.extra_data.get('patience_counter', 0))
+            start_outer_iter = int(state.outer_iteration)
+
+            iterations: List[SMOIterationResult] = list(
+                state.extra_data.get('iterations', [])
+            )
+            source_history: List[np.ndarray] = list(
+                state.extra_data.get('source_history', [pixelated_source.get_visualization()])
+            )
+            mask_history: List[np.ndarray] = list(
+                state.extra_data.get('mask_history', [current_mask.copy()])
+            )
+            loss_history: List[float] = list(state.loss_history)
+
+            if state.config_hash and state.config_hash != ckpt_mgr.config_hash:
+                logger.warning(
+                    f"  配置哈希与 checkpoint 不一致，可能导致结果偏差 "
+                    f"(期望 {ckpt_mgr.config_hash[:8]}..., checkpoint {state.config_hash[:8]}...)"
+                )
+
+            logger.info(
+                f"成功从 checkpoint 恢复: 外层迭代={start_outer_iter}, "
+                f"已执行迭代={len(iterations)}, best_loss={best_loss:.4e}, "
+                f"耐心计数={patience_counter}"
+            )
+            return (start_outer_iter, current_mask, best_source, best_mask, best_loss,
+                    patience_counter, iterations, source_history, mask_history, loss_history)
+
+        except Exception as e:
+            logger.warning(f"恢复 checkpoint 失败，将从头开始: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None
+
     def run(self,
             initial_mask: np.ndarray,
             target: np.ndarray) -> SMOWorkflowResult:
         """
-        运行完整的 SMO 工作流
+        运行完整的 SMO 工作流（支持断点续跑）
 
         Args:
             initial_mask: 初始掩模图案
@@ -2079,6 +2216,8 @@ class SMOWorkflow:
             logger.info(f"  策略: {self.config.strategy.value}")
             logger.info(f"  掩模尺寸: {image_size}")
             logger.info(f"  最大外层迭代: {self.config.max_outer_iterations}")
+
+        ckpt_mgr = self._init_checkpoint_manager(initial_mask, target)
 
         source_grid = self.config.source_grid_size or image_size
 
@@ -2106,41 +2245,70 @@ class SMOWorkflow:
             init_params=self.config.source_init_params,
             constraints=self.config.source_constraints
         )
-        # —— 初始光源应用到所有条件 ——
-        if self._multi_cond_enabled:
-            self._imaging.update_source_all_conditions(pixelated_source)
+
+        initial_source_arr = pixelated_source.get_intensity().copy()
+        initial_mask_arr = initial_mask.copy()
+
+        # —— 尝试从 checkpoint 恢复 ——
+        start_outer_iter = 0
+        restored = None
+        if ckpt_mgr is not None:
+            restored = self._try_restore_from_checkpoint(ckpt_mgr, pixelated_source)
+
+        if restored is not None:
+            (start_outer_iter, current_mask, best_source_intensity, best_mask,
+             best_loss, patience_counter, iterations, source_history,
+             mask_history, loss_history) = restored
+            # 恢复后重新应用光源到成像模型
+            if self._multi_cond_enabled:
+                self._imaging.update_source_all_conditions(pixelated_source)
+            else:
+                self._imaging.update_source(pixelated_source)
+        else:
+            # —— 初始光源应用到所有条件 ——
+            if self._multi_cond_enabled:
+                self._imaging.update_source_all_conditions(pixelated_source)
+            current_mask = initial_mask.copy()
+            best_source_intensity = pixelated_source.get_intensity().copy()
+            best_mask = current_mask.copy()
+            patience_counter = 0
+            iterations: List[SMOIterationResult] = []
+            source_history: List[np.ndarray] = [pixelated_source.get_visualization()]
+            mask_history: List[np.ndarray] = [current_mask.copy()]
+            loss_history: List[float] = []
 
         self._source_optimizer = SourceOptimizer(self._imaging, self.config)
         self._mask_optimizer = MaskOptimizerForSMO(self._imaging, self.config)
         self._joint_optimizer = JointGradientOptimizer(self._imaging, self.config)
 
-        initial_source_arr = pixelated_source.get_intensity().copy()
-        initial_mask_arr = initial_mask.copy()
-        current_mask = initial_mask.copy()
-
         init_loss, _, init_aerial, init_wafer, init_epe = self._evaluate_state(
-            current_mask, target, pixelated_source
+            initial_mask_arr, target,
+            PixelatedSource(
+                grid_size=source_grid,
+                optical_system=self.base_optics,
+                init_type=self.config.source_init_type,
+                init_params=self.config.source_init_params,
+                constraints=self.config.source_constraints
+            )
         )
+        if not loss_history:
+            loss_history.append(init_loss)
+            best_loss = init_loss
 
-        iterations: List[SMOIterationResult] = []
-        source_history: List[np.ndarray] = [pixelated_source.get_visualization()]
-        mask_history: List[np.ndarray] = [current_mask.copy()]
-        loss_history: List[float] = [init_loss]
-
-        best_loss = init_loss
-        best_source_intensity = pixelated_source.get_intensity().copy()
-        best_mask = current_mask.copy()
-        patience_counter = 0
-        converged = False
-        reason = ''
-
-        if self.config.verbose:
+        if start_outer_iter > 0 and self.config.verbose:
+            logger.info(
+                f"\n从 checkpoint 恢复后继续: 当前外层迭代={start_outer_iter}, "
+                f"best_loss={best_loss:.6f}"
+            )
+        elif self.config.verbose:
             logger.info(f"\n初始状态: loss={init_loss:.6f}, EPE_mean={init_epe.get('epe_mean', 0):.3f}nm")
             logger.info(f"  等效 sigma: {pixelated_source.compute_effective_sigma():.4f}")
 
+        converged = False
+        reason = ''
         strategy = self.config.strategy
 
-        if strategy == SMOptimizationStrategy.SOURCE_FIRST:
+        if strategy == SMOptimizationStrategy.SOURCE_FIRST and restored is None:
             if self.config.verbose:
                 logger.info(f"\n阶段 1/2: 单独优化光源 ({self.config.source_max_iter} 次迭代)...")
             pixelated_source, _ = self._source_optimizer.optimize(
@@ -2151,7 +2319,7 @@ class SMOWorkflow:
             if self.config.verbose:
                 logger.info(f"阶段 2/2: 固定光源，优化掩模...")
 
-        for outer_iter in range(self.config.max_outer_iterations):
+        for outer_iter in range(start_outer_iter, self.config.max_outer_iterations):
             if self.config.verbose:
                 logger.info(f"\n{'='*60}")
                 logger.info(f"外层迭代 {outer_iter + 1}/{self.config.max_outer_iterations}")
@@ -2295,13 +2463,43 @@ class SMOWorkflow:
                 if self.config.verbose:
                     logger.info(f"  连续 {patience_counter} 轮无显著改善（耐心值 {self.config.convergence_patience}）")
 
-                if patience_counter >= self.config.convergence_patience:
-                    converged = True
-                    reason = (f"外层迭代 {outer_iter+1}: 连续 {patience_counter} 轮"
-                             f"损失改善低于阈值 {self.config.tol}")
-                    if self.config.verbose:
-                        logger.info(f"  收敛触发: {reason}")
-                    break
+            # —— 保存 checkpoint ——
+            if ckpt_mgr is not None:
+                last_phase = iterations[-1].phase if iterations else ''
+                ckpt_state = WorkflowCheckpointState(
+                    workflow_type='SMO',
+                    outer_iteration=outer_iter + 1,
+                    inner_iteration=0,
+                    current_phase=last_phase,
+                    source=pixelated_source.get_intensity(),
+                    mask=current_mask.copy(),
+                    best_loss=best_loss,
+                    best_mask=best_mask.copy(),
+                    best_source=best_source_intensity.copy(),
+                    loss_history=list(loss_history),
+                    loss_components_history=[],
+                    extra_data={
+                        'patience_counter': patience_counter,
+                        'iterations': iterations,
+                        'source_history': source_history,
+                        'mask_history': mask_history,
+                        'source_grid_size': list(source_grid),
+                        'multi_cond_enabled': self._multi_cond_enabled,
+                    },
+                )
+                ckpt_mgr.save_checkpoint(
+                    ckpt_state,
+                    outer_iteration=outer_iter + 1,
+                    current_loss=current_total_loss,
+                )
+
+            if patience_counter >= self.config.convergence_patience:
+                converged = True
+                reason = (f"外层迭代 {outer_iter+1}: 连续 {patience_counter} 轮"
+                         f"损失改善低于阈值 {self.config.tol}")
+                if self.config.verbose:
+                    logger.info(f"  收敛触发: {reason}")
+                break
 
         if not converged:
             reason = f"达到最大外层迭代次数 {self.config.max_outer_iterations}"
