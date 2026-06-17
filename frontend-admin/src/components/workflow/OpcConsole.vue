@@ -278,6 +278,7 @@ const patternParams = reactive({
 })
 const selectedGdsFile = ref('')
 const selectedGdsLayer = ref<number | null>(null)
+const selectedGdsDatatype = ref<number>(0)
 
 const isRunning = ref(false)
 
@@ -312,6 +313,7 @@ const opcConfig = reactive<OPCConfigParams>({ ...defaultOpcConfig })
 
 function onGdsSelect(file: any, layer: number, datatype: number) {
   selectedGdsLayer.value = layer
+  selectedGdsDatatype.value = datatype
 }
 
 async function handleRun() {
@@ -321,9 +323,15 @@ async function handleRun() {
     return
   }
 
-  if (inputSource.value === 'gds' && !selectedGdsFile.value) {
-    ElMessage.warning('请选择 GDS 文件')
-    return
+  if (inputSource.value === 'gds') {
+    if (!selectedGdsFile.value) {
+      ElMessage.warning('请选择 GDS 文件')
+      return
+    }
+    if (selectedGdsLayer.value == null) {
+      ElMessage.warning('请选择 GDS 层号')
+      return
+    }
   }
 
   isRunning.value = true
@@ -336,11 +344,18 @@ async function handleRun() {
       y_end: patternParams.y_end,
     }
 
+    const gdsFileId = inputSource.value === 'gds' ? selectedGdsFile.value : undefined
+    const gdsLayer = inputSource.value === 'gds' ? selectedGdsLayer.value : undefined
+    const gdsDatatype = inputSource.value === 'gds' ? selectedGdsDatatype.value : undefined
+
     const res = await workflowApi.runOpc(
       config.optical_system,
       opcConfig,
       patternType.value,
-      patternParamsObj
+      patternParamsObj,
+      gdsFileId,
+      gdsLayer,
+      gdsDatatype
     )
 
     if (res.success) {

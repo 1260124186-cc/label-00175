@@ -29,6 +29,11 @@ async def submit_opc(req: OPCRunRequest):
         "opc_config": req.opc_config.model_dump(),
         "pattern_type": req.pattern_type,
         "pattern_params": req.pattern_params,
+        "gds_file_id": req.gds_file_id,
+        "gds_layer": req.gds_layer,
+        "gds_datatype": req.gds_datatype,
+        "gds_pixel_size": req.gds_pixel_size,
+        "gds_target_size": req.gds_target_size,
     }
     task_id = run_opc(payload)
     return TaskSubmitResponse(
@@ -47,6 +52,11 @@ async def submit_smo(req: SMORunRequest):
         "smo_config": req.smo_config.model_dump(),
         "pattern_type": req.pattern_type,
         "pattern_params": req.pattern_params,
+        "gds_file_id": req.gds_file_id,
+        "gds_layer": req.gds_layer,
+        "gds_datatype": req.gds_datatype,
+        "gds_pixel_size": req.gds_pixel_size,
+        "gds_target_size": req.gds_target_size,
     }
     task_id = run_smo(payload)
     return TaskSubmitResponse(
@@ -65,6 +75,11 @@ async def submit_ilt(req: ILTRunRequest):
         "ilt_config": req.ilt_config.model_dump(),
         "pattern_type": req.pattern_type,
         "pattern_params": req.pattern_params,
+        "gds_file_id": req.gds_file_id,
+        "gds_layer": req.gds_layer,
+        "gds_datatype": req.gds_datatype,
+        "gds_pixel_size": req.gds_pixel_size,
+        "gds_target_size": req.gds_target_size,
     }
     task_id = run_ilt(payload)
     return TaskSubmitResponse(
@@ -82,6 +97,11 @@ async def submit_process_window(req: ProcessWindowRunRequest):
         "optical_system": req.optical_system.model_dump(),
         "pattern_type": req.pattern_type,
         "pattern_params": req.pattern_params,
+        "gds_file_id": req.gds_file_id,
+        "gds_layer": req.gds_layer,
+        "gds_datatype": req.gds_datatype,
+        "gds_pixel_size": req.gds_pixel_size,
+        "gds_target_size": req.gds_target_size,
         "focus_range": req.focus_range,
         "dose_range": req.dose_range,
         "cd_tolerance": req.cd_tolerance,

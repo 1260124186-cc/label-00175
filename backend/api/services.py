@@ -370,6 +370,75 @@ def _create_test_pattern(pattern_type: str, pattern_params: Dict[str, Any]):
     return target_pattern
 
 
+def _load_gds_pattern(gds_file_id: str, layer: int, datatype: int = 0,
+                     pixel_size: float = 1.0,
+                     target_size: Optional[Tuple[int, int]] = None) -> np.ndarray:
+    """
+    从已上传的 GDS 文件加载指定层并栅格化为二值掩模
+
+    Args:
+        gds_file_id: 上传时生成的 file_id（也是磁盘上的文件名）
+        layer: GDS 层号
+        datatype: GDS 数据类型号，默认 0
+        pixel_size: 每像素对应的 GDS 单位长度（GDS 单位通常为 nm）
+        target_size: 目标尺寸 (H, W)，None 则由版图包围盒自动计算
+
+    Returns:
+        二值掩模 (H, W) float32
+    """
+    from utils.data_io import load_gds_layer
+
+    gds_path = GDS_UPLOAD_DIR / gds_file_id
+    if not gds_path.exists():
+        raise FileNotFoundError(f"GDS 文件不存在: {gds_file_id}")
+
+    mask = load_gds_layer(
+        gds_path,
+        layer=layer,
+        datatype=datatype,
+        pixel_size=pixel_size,
+        target_size=target_size,
+    )
+    import numpy as np
+    return np.asarray(mask, dtype=np.float32)
+
+
+def _resolve_input_pattern(payload: Dict[str, Any]) -> np.ndarray:
+    """
+    根据 payload 统一解析输入图案：优先使用 GDS，否则回退到测试图案
+
+    约定 payload 字段:
+      - gds_file_id: 已上传 GDS 的 file_id，提供则走 GDS 路径
+      - gds_layer: GDS 层号（gds_file_id 存在时必填）
+      - gds_datatype: GDS 数据类型号（可选，默认 0）
+      - gds_pixel_size: 栅格化像素大小（可选，默认 1.0）
+      - gds_target_size: [H, W] 强制输出尺寸（可选）
+      - pattern_type / pattern_params: 回退到测试图案时使用
+    """
+    import numpy as np
+
+    gds_file_id = payload.get("gds_file_id")
+    if gds_file_id:
+        layer = payload.get("gds_layer")
+        if layer is None:
+            raise ValueError("提供 gds_file_id 时必须同时指定 gds_layer")
+        try:
+            layer = int(layer)
+        except (TypeError, ValueError):
+            raise ValueError(f"gds_layer 必须为整数: {layer}")
+        datatype = int(payload.get("gds_datatype") or 0)
+        pixel_size = float(payload.get("gds_pixel_size") or 1.0)
+        raw_size = payload.get("gds_target_size")
+        target_size: Optional[Tuple[int, int]] = None
+        if isinstance(raw_size, (list, tuple)) and len(raw_size) >= 2:
+            target_size = (int(raw_size[0]), int(raw_size[1]))
+        return _load_gds_pattern(gds_file_id, layer, datatype, pixel_size, target_size)
+
+    pattern_type = payload.get("pattern_type") or "rectangle"
+    pattern_params = payload.get("pattern_params") or {}
+    return _create_test_pattern(pattern_type, pattern_params)
+
+
 def add_backend_to_path():
     backend_path = str(BACKEND_ROOT)
     if backend_path not in sys.path:
@@ -631,12 +700,10 @@ def _execute_opc(task_id: str):
         payload = task["payload"]
         opt_sys_dict = payload.get("optical_system") or {}
         opc_cfg_dict = payload.get("opc_config") or {}
-        pattern_type = payload.get("pattern_type") or "rectangle"
-        pattern_params = payload.get("pattern_params") or {}
 
-        _set_progress(task_id, 15, "构造光学系统与测试图案")
+        _set_progress(task_id, 15, "构造光学系统与输入图案")
         optical_system = _build_optical_system(opt_sys_dict)
-        target = _create_test_pattern(pattern_type, pattern_params)
+        target = _resolve_input_pattern(payload)
         import numpy as np
         initial_mask = np.array(target, dtype=np.float32)
 
@@ -696,12 +763,10 @@ def _execute_smo(task_id: str):
         payload = task["payload"]
         opt_sys_dict = payload.get("optical_system") or {}
         smo_cfg_dict = payload.get("smo_config") or {}
-        pattern_type = payload.get("pattern_type") or "rectangle"
-        pattern_params = payload.get("pattern_params") or {}
 
-        _set_progress(task_id, 15, "构造光学系统与测试图案")
+        _set_progress(task_id, 15, "构造光学系统与输入图案")
         optical_system = _build_optical_system(opt_sys_dict)
-        target = _create_test_pattern(pattern_type, pattern_params)
+        target = _resolve_input_pattern(payload)
         import numpy as np
         initial_mask = np.array(target, dtype=np.float32)
 
@@ -759,12 +824,10 @@ def _execute_ilt(task_id: str):
         payload = task["payload"]
         opt_sys_dict = payload.get("optical_system") or {}
         ilt_cfg_dict = payload.get("ilt_config") or {}
-        pattern_type = payload.get("pattern_type") or "rectangle"
-        pattern_params = payload.get("pattern_params") or {}
 
-        _set_progress(task_id, 15, "构造光学系统与测试图案")
+        _set_progress(task_id, 15, "构造光学系统与输入图案")
         optical_system = _build_optical_system(opt_sys_dict)
-        target = _create_test_pattern(pattern_type, pattern_params)
+        target = _resolve_input_pattern(payload)
         import numpy as np
         initial_mask = np.array(target, dtype=np.float32)
 
@@ -821,8 +884,6 @@ def _execute_process_window(task_id: str):
 
         payload = task["payload"]
         opt_sys_dict = payload.get("optical_system") or {}
-        pattern_type = payload.get("pattern_type") or "rectangle"
-        pattern_params = payload.get("pattern_params") or {}
 
         raw_focus = payload.get("focus_range", [-150.0, 150.0, 11])
         raw_dose = payload.get("dose_range", [0.85, 1.15, 11])
@@ -844,9 +905,9 @@ def _execute_process_window(task_id: str):
         focus_range = _parse_range(raw_focus)
         dose_range = _parse_range(raw_dose)
 
-        _set_progress(task_id, 15, "构造光学系统与测试图案")
+        _set_progress(task_id, 15, "构造光学系统与输入图案")
         optical_system = _build_optical_system(opt_sys_dict)
-        target = _create_test_pattern(pattern_type, pattern_params)
+        target = _resolve_input_pattern(payload)
         import numpy as np
         mask = np.array(target, dtype=np.float32)
 
@@ -963,11 +1024,11 @@ def _execute_batch(task_id: str):
         source = payload.get("source")
         if not source:
             raise ValueError("批处理必须提供 source 参数")
-        
+
         gds_path = GDS_UPLOAD_DIR / source
         if gds_path.exists() and gds_path.is_file():
             source = str(gds_path)
-        
+
         layer = payload.get("layer", None)
         if layer is not None:
             layer = int(layer)

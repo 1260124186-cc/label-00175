@@ -75,51 +75,91 @@ export const workflowApi = {
     opticalSystem: any,
     opcConfig: OPCConfigParams,
     patternType: string,
-    patternParams: Record<string, any>
+    patternParams: Record<string, any>,
+    gdsFileId?: string,
+    gdsLayer?: number | null,
+    gdsDatatype?: number | null,
+    gdsPixelSize?: number | null,
+    gdsTargetSize?: [number, number] | null
   ): Promise<TaskSubmitResponse> =>
     service.post<any, TaskSubmitResponse>('/api/workflows/opc', {
       optical_system: opticalSystem,
       opc_config: opcConfig,
       pattern_type: patternType,
       pattern_params: patternParams,
+      gds_file_id: gdsFileId ?? null,
+      gds_layer: gdsLayer ?? null,
+      gds_datatype: gdsDatatype ?? null,
+      gds_pixel_size: gdsPixelSize ?? null,
+      gds_target_size: gdsTargetSize ?? null,
     }),
 
   runSmo: (
     opticalSystem: any,
     smoConfig: SMOConfigParams,
     patternType: string,
-    patternParams: Record<string, any>
+    patternParams: Record<string, any>,
+    gdsFileId?: string,
+    gdsLayer?: number | null,
+    gdsDatatype?: number | null,
+    gdsPixelSize?: number | null,
+    gdsTargetSize?: [number, number] | null
   ): Promise<TaskSubmitResponse> =>
     service.post<any, TaskSubmitResponse>('/api/workflows/smo', {
       optical_system: opticalSystem,
       smo_config: smoConfig,
       pattern_type: patternType,
       pattern_params: patternParams,
+      gds_file_id: gdsFileId ?? null,
+      gds_layer: gdsLayer ?? null,
+      gds_datatype: gdsDatatype ?? null,
+      gds_pixel_size: gdsPixelSize ?? null,
+      gds_target_size: gdsTargetSize ?? null,
     }),
 
   runIlt: (
     opticalSystem: any,
     iltConfig: ILTConfigParams,
     patternType: string,
-    patternParams: Record<string, any>
+    patternParams: Record<string, any>,
+    gdsFileId?: string,
+    gdsLayer?: number | null,
+    gdsDatatype?: number | null,
+    gdsPixelSize?: number | null,
+    gdsTargetSize?: [number, number] | null
   ): Promise<TaskSubmitResponse> =>
     service.post<any, TaskSubmitResponse>('/api/workflows/ilt', {
       optical_system: opticalSystem,
       ilt_config: iltConfig,
       pattern_type: patternType,
       pattern_params: patternParams,
+      gds_file_id: gdsFileId ?? null,
+      gds_layer: gdsLayer ?? null,
+      gds_datatype: gdsDatatype ?? null,
+      gds_pixel_size: gdsPixelSize ?? null,
+      gds_target_size: gdsTargetSize ?? null,
     }),
 
   runProcessWindow: (
     opticalSystem: any,
     pwConfig: ProcessWindowConfig,
     patternType: string,
-    patternParams: Record<string, any>
+    patternParams: Record<string, any>,
+    gdsFileId?: string,
+    gdsLayer?: number | null,
+    gdsDatatype?: number | null,
+    gdsPixelSize?: number | null,
+    gdsTargetSize?: [number, number] | null
   ): Promise<TaskSubmitResponse> =>
     service.post<any, TaskSubmitResponse>('/api/workflows/process-window', {
       optical_system: opticalSystem,
       pattern_type: patternType,
       pattern_params: patternParams,
+      gds_file_id: gdsFileId ?? null,
+      gds_layer: gdsLayer ?? null,
+      gds_datatype: gdsDatatype ?? null,
+      gds_pixel_size: gdsPixelSize ?? null,
+      gds_target_size: gdsTargetSize ?? null,
       focus_range: pwConfig.focus_range,
       dose_range: pwConfig.dose_range,
       cd_tolerance: pwConfig.cd_tolerance,

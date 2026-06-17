@@ -20,14 +20,27 @@
           />
 
           <el-form label-width="120px" label-position="right">
-            <el-form-item label="图案类型">
-              <el-select v-model="patternType" style="width: 100%">
-                <el-option label="矩形 (Rectangle)" value="rectangle" />
-                <el-option label="十字 (Cross)" value="cross" />
-                <el-option label="L 型 (L-shape)" value="l_shape" />
-                <el-option label="阵列 (Array)" value="array" />
-              </el-select>
+            <el-form-item label="输入源">
+              <el-radio-group v-model="inputSource">
+                <el-radio value="synthetic">测试图案</el-radio>
+                <el-radio value="gds">GDS 版图</el-radio>
+              </el-radio-group>
             </el-form-item>
+
+            <template v-if="inputSource === 'synthetic'">
+              <el-form-item label="图案类型">
+                <el-select v-model="patternType" style="width: 100%">
+                  <el-option label="矩形 (Rectangle)" value="rectangle" />
+                  <el-option label="十字 (Cross)" value="cross" />
+                  <el-option label="L 型 (L-shape)" value="l_shape" />
+                  <el-option label="阵列 (Array)" value="array" />
+                </el-select>
+              </el-form-item>
+            </template>
+
+            <template v-else>
+              <GdsUploader v-model="selectedGdsFile" :selected-layer-value="selectedGdsLayer" @select="onGdsSelect" />
+            </template>
 
             <el-divider content-position="left"><span class="divider-label">扫描范围</span></el-divider>
 
@@ -189,6 +202,7 @@ import {
 import { useConfigStore } from '@/stores/config'
 import { workflowApi, taskApi } from '@/api'
 import taskWs from '@/api/websocket'
+import GdsUploader from './GdsUploader.vue'
 import type { ProcessWindowConfig, ProcessWindowMetrics, WorkflowTask, TaskResultResponse } from '@/types/workflow'
 
 const configStore = useConfigStore()
@@ -201,6 +215,15 @@ const bossungData = ref<any[][]>([])
 const hasData = ref(false)
 
 const patternType = ref('rectangle')
+const inputSource = ref<'synthetic' | 'gds'>('synthetic')
+const selectedGdsFile = ref('')
+const selectedGdsLayer = ref<number | null>(null)
+const selectedGdsDatatype = ref<number>(0)
+
+function onGdsSelect(file: any, layer: number, datatype: number) {
+  selectedGdsLayer.value = layer
+  selectedGdsDatatype.value = datatype
+}
 
 const defaultPwConfig: ProcessWindowConfig = {
   focus_range: [-150, 150, 11],
@@ -257,6 +280,17 @@ async function handleRun() {
     return
   }
 
+  if (inputSource.value === 'gds') {
+    if (!selectedGdsFile.value) {
+      ElMessage.warning('请选择 GDS 文件')
+      return
+    }
+    if (selectedGdsLayer.value == null) {
+      ElMessage.warning('请选择 GDS 层号')
+      return
+    }
+  }
+
   isRunning.value = true
   hasData.value = false
   try {
@@ -268,11 +302,18 @@ async function handleRun() {
       y_end: 44,
     }
 
+    const gdsFileId = inputSource.value === 'gds' ? selectedGdsFile.value : undefined
+    const gdsLayer = inputSource.value === 'gds' ? selectedGdsLayer.value : undefined
+    const gdsDatatype = inputSource.value === 'gds' ? selectedGdsDatatype.value : undefined
+
     const res = await workflowApi.runProcessWindow(
       config.optical_system,
       pwConfig,
       patternType.value,
-      patternParams
+      patternParams,
+      gdsFileId,
+      gdsLayer,
+      gdsDatatype
     )
 
     if (res.success) {

@@ -245,6 +245,11 @@ class OPCRunRequest(BaseModel):
     pattern_params: Dict[str, Any] = Field(
         default_factory=lambda: {"size": [64, 64], "x_start": 20, "x_end": 44, "y_start": 20, "y_end": 44}
     )
+    gds_file_id: Optional[str] = Field(None, description="已上传 GDS 的 file_id，提供则忽略图案参数")
+    gds_layer: Optional[int] = Field(None, description="GDS 层号，gds_file_id 存在时必填")
+    gds_datatype: Optional[int] = Field(0, description="GDS 数据类型号，默认 0")
+    gds_pixel_size: Optional[float] = Field(1.0, description="栅格化像素大小 (GDS 单位/像素)")
+    gds_target_size: Optional[List[int]] = Field(None, description="强制输出尺寸 [H, W]")
 
 
 class SourceConstraintsParams(BaseModel):
@@ -303,6 +308,11 @@ class SMORunRequest(BaseModel):
     pattern_params: Dict[str, Any] = Field(
         default_factory=lambda: {"size": [64, 64], "x_start": 20, "x_end": 44, "y_start": 20, "y_end": 44}
     )
+    gds_file_id: Optional[str] = Field(None, description="已上传 GDS 的 file_id，提供则忽略图案参数")
+    gds_layer: Optional[int] = Field(None, description="GDS 层号，gds_file_id 存在时必填")
+    gds_datatype: Optional[int] = Field(0, description="GDS 数据类型号，默认 0")
+    gds_pixel_size: Optional[float] = Field(1.0, description="栅格化像素大小 (GDS 单位/像素)")
+    gds_target_size: Optional[List[int]] = Field(None, description="强制输出尺寸 [H, W]")
 
 
 class ILTComplexityParams(BaseModel):
@@ -363,6 +373,11 @@ class ILTRunRequest(BaseModel):
     pattern_params: Dict[str, Any] = Field(
         default_factory=lambda: {"size": [64, 64], "x_start": 20, "x_end": 44, "y_start": 20, "y_end": 44}
     )
+    gds_file_id: Optional[str] = Field(None, description="已上传 GDS 的 file_id，提供则忽略图案参数")
+    gds_layer: Optional[int] = Field(None, description="GDS 层号，gds_file_id 存在时必填")
+    gds_datatype: Optional[int] = Field(0, description="GDS 数据类型号，默认 0")
+    gds_pixel_size: Optional[float] = Field(1.0, description="栅格化像素大小 (GDS 单位/像素)")
+    gds_target_size: Optional[List[int]] = Field(None, description="强制输出尺寸 [H, W]")
 
 
 class ProcessWindowRunRequest(BaseModel):
@@ -371,6 +386,11 @@ class ProcessWindowRunRequest(BaseModel):
     pattern_params: Dict[str, Any] = Field(
         default_factory=lambda: {"size": [64, 64], "x_start": 20, "x_end": 44, "y_start": 20, "y_end": 44}
     )
+    gds_file_id: Optional[str] = Field(None, description="已上传 GDS 的 file_id，提供则忽略图案参数")
+    gds_layer: Optional[int] = Field(None, description="GDS 层号，gds_file_id 存在时必填")
+    gds_datatype: Optional[int] = Field(0, description="GDS 数据类型号，默认 0")
+    gds_pixel_size: Optional[float] = Field(1.0, description="栅格化像素大小 (GDS 单位/像素)")
+    gds_target_size: Optional[List[int]] = Field(None, description="强制输出尺寸 [H, W]")
     focus_range: List[float] = Field(
         [-150.0, 150.0, 11],
         description="离焦量扫描范围 [start, stop, num_points]"
