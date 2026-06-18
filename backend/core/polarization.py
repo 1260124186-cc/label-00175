@@ -572,28 +572,43 @@ class VectorPupil:
     na: float
     n_immersion: complex = 1.0 + 0.0j
     grid_size: Tuple[int, int] = (256, 256)
+    pixel_size_nm: float = 1.0
     mask_stack: Optional[ThinFilmStack] = None
     incident_polarization: JonesVector = field(
         default_factory=lambda: JonesVector.linear_polarization(0.0)
     )
 
     def __post_init__(self):
+        if self.mask_stack is not None:
+            n_super = self.mask_stack._resolve_n(
+                self.mask_stack.n_superstrate, self.wavelength_nm
+            )
+            if np.real(n_super) > 0 and not np.isclose(np.real(n_super), np.real(self.n_immersion), rtol=1e-3):
+                self.n_immersion = n_super
         self._build_coordinates()
 
     def _build_coordinates(self):
-        """构建光瞳坐标系统"""
+        """构建光瞳坐标系统
+
+        坐标定义（与计算物理一致）：
+        - 像方空间频率 fx, fy (1/nm)，由 pixel_size_nm 和 grid_size 决定
+        - FX = λ·fx, FY = λ·fy  (无量纲，λ 归一化空间频率)
+        - ρ = √(FX² + FY²)
+        - 截止频率 f_c = NA/λ → ρ_c = λ·f_c = NA (与介质无关！因为 NA 是系统参数)
+        - 介质 n 中：sin(θ) = λ·f / n = ρ / n  (由 kx = k·sinθ，k = 2πn/λ)
+        - 因此 sin(θ_max) = NA / n (NA 定义)
+        """
         ny, nx = self.grid_size
         self.k0 = 2.0 * np.pi / self.wavelength_nm
 
-        fx = np.fft.fftfreq(nx, 1.0) * self.wavelength_nm
-        fy = np.fft.fftfreq(ny, 1.0) * self.wavelength_nm
+        fx = np.fft.fftfreq(nx, self.pixel_size_nm) * self.wavelength_nm
+        fy = np.fft.fftfreq(ny, self.pixel_size_nm) * self.wavelength_nm
         self.FX, self.FY = np.meshgrid(fx, fy)
 
         self.rho = np.sqrt(self.FX ** 2 + self.FY ** 2)
-        self.pupil_mask = self.rho <= (self.na / abs(self.n_immersion) + 1e-12)
+        self.pupil_mask = self.rho <= (self.na + 1e-12)
         self.phi_pupil = np.arctan2(self.FY, self.FX)
 
-        rho_safe = np.where(self.rho < 1e-10, 1e-10, self.rho)
         self.sin_theta = self.rho / abs(self.n_immersion)
         self.sin_theta = np.clip(self.sin_theta, 0, 1)
         self.cos_theta = np.sqrt(np.maximum(1.0 - self.sin_theta ** 2, 0.0))
@@ -838,6 +853,11 @@ def compute_polarized_pupil(
     ny, nx = fx.shape
     k0 = 2.0 * np.pi / wavelength_nm
 
+    if mask_stack is not None:
+        n_super = mask_stack._resolve_n(mask_stack.n_superstrate, wavelength_nm)
+        if np.real(n_super) > 0 and not np.isclose(np.real(n_super), np.real(n_immersion), rtol=1e-3):
+            n_immersion = n_super
+
     rho_sq = (fx ** 2 + fy ** 2) / (cutoff ** 2)
     pupil_mask = rho_sq <= 1.0
 
@@ -846,7 +866,9 @@ def compute_polarized_pupil(
     pupil_scalar = np.zeros((ny, nx), dtype=np.complex128)
     pupil_scalar[pupil_mask] = np.exp(1j * total_phase_scalar[pupil_mask])
 
-    sin_theta = np.sqrt(fx ** 2 + fy ** 2) * wavelength_nm / na
+    rho = np.sqrt(fx ** 2 + fy ** 2) * wavelength_nm
+    n_immersion_real = float(np.real(n_immersion)) if np.real(n_immersion) != 0 else 1.0
+    sin_theta = rho / n_immersion_real
     sin_theta = np.clip(sin_theta, 0, 1)
     cos_theta = np.sqrt(np.maximum(1.0 - sin_theta ** 2, 0.0))
     phi = np.arctan2(fy, fx)
@@ -883,10 +905,11 @@ def compute_polarized_pupil(
                     s_mod[i, j] = result["ts"]
                     p_mod[i, j] = result["tp"]
 
-    kz = k0 * np.sqrt(np.maximum(
-        (n_immersion ** 2) - (fx * wavelength_nm) ** 2 - (fy * wavelength_nm) ** 2,
-        0.0 + 0j
-    ))
+    kz_sq = (k0 * n_immersion) ** 2 - (
+        (k0 * fx * wavelength_nm) ** 2 + (k0 * fy * wavelength_nm) ** 2
+    )
+    kz = np.lib.scimath.sqrt(kz_sq)
+    kz = np.where(np.imag(kz) < 0, -kz, kz)
 
     defocus_phase_vec = np.ones((ny, nx), dtype=np.complex128)
     if abs(defocus_nm) > 1e-10:
@@ -1038,6 +1061,7 @@ def create_high_na_immersion_system(
         wavelength_nm=wavelength_nm,
         na=na,
         n_immersion=STANDARD_MATERIALS["water"].get_n(wavelength_nm),
+        pixel_size_nm=pixel_size_nm,
         grid_size=grid_size,
         mask_stack=ar_stack,
         incident_polarization=incident_polarization
@@ -1075,6 +1099,7 @@ def create_euv_reflective_system(
         wavelength_nm=wavelength_nm,
         na=na,
         n_immersion=STANDARD_MATERIALS["air"].get_n(wavelength_nm),
+        pixel_size_nm=pixel_size_nm,
         grid_size=grid_size,
         mask_stack=euv_stack,
         incident_polarization=incident_polarization
