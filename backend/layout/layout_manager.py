@@ -29,7 +29,7 @@ from collections import deque, defaultdict
 
 import numpy as np
 
-from utils.data_io import load_gds_layer
+from utils.data_io import load_gds_layer, load_gds_layer_by_cell_name
 
 logger = logging.getLogger(__name__)
 
@@ -165,9 +165,10 @@ class LayoutCell:
         """
         确保掩模数据已加载（延迟加载入口）
 
-        Args:
-            loader: GDSLoader 实例，若为 None 则尝试根据 source_path 自建
-            options: 加载选项，为 None 则使用默认
+        层次化加载的 cell 会在 metadata.extra['hierarchy'] 中存储
+        is_leaf 标志，延迟加载时会根据该标志决定是否展平引用：
+        - is_leaf=True → flatten_references=True，用于真实仿真
+        - is_leaf=False → flatten_references=False，只取自身多边形
         """
         if self.mask is not None:
             return
@@ -184,13 +185,24 @@ class LayoutCell:
         if loader is None:
             loader = GDSLoader()
 
-        opts = options or LayoutLoadOptions(
-            layer=self.metadata.layer,
-            datatype=self.metadata.datatype or 0,
-            pixel_size=self.metadata.pixel_size,
-            target_size=None,
-            bounds=self.metadata.bounds,
-        )
+        # 如果没有提供 options，或需要按层次信息覆盖 flatten_references
+        if options is None:
+            opts = LayoutLoadOptions(
+                layer=self.metadata.layer,
+                datatype=self.metadata.datatype or 0,
+                pixel_size=self.metadata.pixel_size,
+                target_size=None,
+                bounds=self.metadata.bounds,
+            )
+        else:
+            opts = options
+
+        # 根据 hierarchy 信息自动决定 flatten_references
+        hier_info = (self.metadata.extra or {}).get('hierarchy', {})
+        if 'flatten_refs' in hier_info:
+            opts.flatten_references = bool(hier_info['flatten_refs'])
+        elif 'is_leaf' in hier_info:
+            opts.flatten_references = bool(hier_info['is_leaf'])
 
         loaded = loader.load_cell_mask(src, self.metadata.cell_name, opts)
         if loaded is None:
@@ -310,13 +322,15 @@ class GDSLoader:
         """
         加载指定 cell 的指定层为二值掩模
 
-        优先使用 utils.data_io.load_gds_layer（支持引用展平）。
-        若需要指定 cell 名，则先尝试提取该 cell 的多边形。
+        使用 utils.data_io.load_gds_layer_by_cell_name，
+        按 cell_name 精确提取该 cell 的多边形：
+        - flatten_references=True: 展平该 cell 内部所有引用，用于叶节点
+        - flatten_references=False: 只提取该 cell 自身直接多边形，用于复合节点
 
         Args:
             filepath: GDS 文件路径
-            cell_name: cell 名
-            options: 加载选项
+            cell_name: cell 名（原始名，用于精确查找）
+            options: 加载选项（含 flatten_references 控制）
 
         Returns:
             二值掩模 (H, W) float64；若 cell 为空且 skip_empty 则返回 None
@@ -327,13 +341,15 @@ class GDSLoader:
             raise ValueError("LayoutLoadOptions.layer 不能为空")
 
         try:
-            mask = load_gds_layer(
+            mask = load_gds_layer_by_cell_name(
                 filepath=filepath,
+                cell_name=cell_name,
                 layer=options.layer,
                 datatype=options.datatype,
                 pixel_size=options.pixel_size,
                 target_size=options.target_size,
                 bounds=options.bounds,
+                flatten_references=options.flatten_references,
             )
         except ValueError as e:
             if options.skip_empty_cells and "无多边形" in str(e):
@@ -2706,6 +2722,12 @@ def _extend_layout_manager():
         - 'hier:top'（顶层 cell）
         - 'hier:depth_N'
 
+        关键的掩模加载策略：
+        - 叶节点 (is_leaf=True): flatten_references=True，展平所有子引用，
+          获得真实完整的掩模用于仿真
+        - 复合节点 (is_leaf=False): flatten_references=False，只取自身直接
+          多边形（通常为空），作为子引用合成的基底
+
         Args:
             filepath: GDS/OASIS 文件路径
             layer: GDS 层号
@@ -2718,27 +2740,120 @@ def _extend_layout_manager():
             k: v for k, v in kwargs.items()
             if k in LayoutLoadOptions.__dataclass_fields__
         }}
-        load_opts = LayoutLoadOptions(**opts_kwargs)
-        load_opts.include_subcells = True
-        load_opts.skip_empty_cells = False  # 层次化模式下，即使没有自身多边形也要加载（如只有引用的父 cell）
+        load_opts_base = LayoutLoadOptions(**opts_kwargs)
+        load_opts_base.include_subcells = True
+        load_opts_base.skip_empty_cells = False  # 层次化模式下，即使没有自身多边形也要加载（如只有引用的父 cell）
 
         plan_kwargs = {k: v for k, v in kwargs.items()
                        if k in HierarchyPlanOptions.__dataclass_fields__}
         # pixel_size 同时在 LayoutLoadOptions 和 HierarchyPlanOptions 中，
         # 优先使用 kwargs 中显式传入的值，否则从 load_opts 继承
         if 'pixel_size' not in plan_kwargs:
-            plan_kwargs['pixel_size'] = load_opts.pixel_size
+            plan_kwargs['pixel_size'] = load_opts_base.pixel_size
         plan_opts = HierarchyPlanOptions(**plan_kwargs)
 
-        graph = self.analyze_hierarchy(filepath, layer=layer, datatype=load_opts.datatype)
+        # 1. 先分析层次结构（在加载掩模之前，需要知道哪些是叶节点）
+        graph = self.analyze_hierarchy(filepath, layer=layer, datatype=load_opts_base.datatype)
         plan = self.plan_hierarchical_tasks(graph, options=plan_opts)
 
-        # 直接加载所有 cell，禁用去重（层次化模式下父子 cell 可能有相同展平掩模）
-        cells = self.loader.load_file(filepath, load_opts)
-        lib = LayoutLibrary(name=Path(filepath).stem)
-        lib.add_many(cells, dedup=False)  # 层次化模式下必须禁用去重
+        # 2. 构建所有 cell 列表：在加载时按 is_leaf 决定是否展平子引用
+        cell_names = self.loader.list_all_cells(filepath)
+        file_key = Path(filepath).stem
+        seen_names: Set[str] = set()
+        cells: List[LayoutCell] = []
 
-        # 建立原始 cell 名 → LayoutCell 唯一名称的双向映射
+        for raw_name in cell_names:
+            unique_name = self.loader._unique_name(
+                seen_names, file_key, raw_name
+            )
+            seen_names.add(unique_name)
+
+            node = graph.nodes.get(raw_name)
+            is_leaf = node.is_leaf if node else True
+
+            # 核心差异：
+            # - 叶节点 (is_leaf=True):
+            #   · flatten_references=True（展平所有子引用，得到真实掩模用于仿真）
+            #   · bounds=None（自动根据自身多边形计算紧凑范围）
+            # - 复合节点 (is_leaf=False):
+            #   · flatten_references=False（只取自身直接多边形，子引用通过合成拼接）
+            #   · bounds=node.bounds（使用完整包围盒作为栅格化坐标系，确保
+            #     自身多边形落在完整坐标系的正确位置，与子引用合成坐标系一致）
+            cell_load_opts = LayoutLoadOptions(
+                **{
+                    f: getattr(load_opts_base, f)
+                    for f in LayoutLoadOptions.__dataclass_fields__
+                }
+            )
+            cell_load_opts.flatten_references = is_leaf
+
+            if not is_leaf and node is not None and node.bounds is not None:
+                # 复合节点：使用完整包围盒作为坐标系
+                # 确保自身多边形被栅格化到完整范围的正确位置
+                cell_load_opts.bounds = node.bounds
+                meta_bounds = node.bounds
+            else:
+                # 叶节点 / 没有 node 的情况
+                meta_bounds = load_opts_base.bounds
+
+            meta = LayoutCellMetadata(
+                cell_name=raw_name,
+                source_type=LayoutSourceType.GDS_FILE,
+                source_path=str(Path(filepath).resolve()),
+                layer=layer,
+                datatype=load_opts_base.datatype,
+                pixel_size=load_opts_base.pixel_size,
+                bounds=meta_bounds,
+                load_timestamp=0.0,
+            )
+            self.loader._fill_polygon_counts(
+                filepath, raw_name, cell_load_opts, meta
+            )
+
+            cell = LayoutCell(
+                name=unique_name,
+                metadata=meta,
+                priority=50,
+                tags={'source:gds', f'file:{file_key}'},
+            )
+
+            if cell_load_opts.load_masks_on_init:
+                import time
+                t0 = time.time()
+                mask = None
+                try:
+                    mask = self.loader.load_cell_mask(
+                        filepath, raw_name, cell_load_opts
+                    )
+                except ValueError as e:
+                    if (not cell_load_opts.skip_empty_cells
+                            and '无多边形' in str(e)):
+                        mask = None
+                    else:
+                        logger.warning(f"加载 cell {raw_name} 失败: {e}")
+                        continue
+                except Exception as e:
+                    logger.warning(f"加载 cell {raw_name} 失败: {e}")
+                    continue
+
+                meta.load_timestamp = t0
+                if mask is None:
+                    if cell_load_opts.skip_empty_cells:
+                        logger.debug(f"跳过空 cell: {raw_name}")
+                        continue
+                    # 创建占位符，后续根据 node.bounds 重新设置尺寸
+                    mask = np.zeros((1, 1), dtype=np.float64)
+                cell.mask = mask
+                cell.target = mask.copy()
+                meta.checksum = self.loader._mask_checksum(mask)
+
+            cells.append(cell)
+
+        # 3. 构建 Library，禁用去重（层次化模式下父子 cell 必须都存在）
+        lib = LayoutLibrary(name=file_key)
+        lib.add_many(cells, dedup=False)
+
+        # 4. 建立原始 cell 名 → LayoutCell 唯一名称的双向映射
         raw_to_unique: Dict[str, str] = {}
         unique_to_raw: Dict[str, str] = {}
         for cell in lib.cells():
@@ -2749,7 +2864,7 @@ def _extend_layout_manager():
         plan.raw_to_unique_name = raw_to_unique
         plan.unique_to_raw_name = unique_to_raw
 
-        # 为所有层次图中的 cell 打 tag（即使不在 plan.tasks 中的也要标记层次信息）
+        # 5. 为所有层次图中的 cell 打 tag + 处理只有引用的占位符掩模
         for cell in lib.cells():
             raw_name = cell.cell_name
             if raw_name in graph.nodes:
@@ -2759,13 +2874,17 @@ def _extend_layout_manager():
                     cell.tags.add('hier:top')
                 cell.tags.add(f"hier:depth_{node.depth}")
 
-                # 如果 cell 只有引用没有自身多边形（mask 是 (1,1) 的占位符），
-                # 且 node.bounds 可用，则根据 bounds 设置合适的掩模大小
+                # 如果 cell mask 是占位符 (1,1) 且有 node.bounds，
+                # 按 bounds 重置到真实尺寸的全 0 掩模（合成基底）
                 if (cell.mask is not None and cell.mask.shape == (1, 1)
                         and node.bounds is not None):
                     xmin, ymin, xmax, ymax = node.bounds
-                    nx = max(1, int(np.ceil((xmax - xmin) / plan_opts.pixel_size)))
-                    ny = max(1, int(np.ceil((ymax - ymin) / plan_opts.pixel_size)))
+                    nx = max(1, int(np.ceil(
+                        (xmax - xmin) / plan_opts.pixel_size
+                    )))
+                    ny = max(1, int(np.ceil(
+                        (ymax - ymin) / plan_opts.pixel_size
+                    )))
                     cell.mask = np.zeros((ny, nx), dtype=np.float64)
                     cell.target = cell.mask.copy()
 
@@ -2783,6 +2902,7 @@ def _extend_layout_manager():
                         'unique_key': task.unique_cell_key,
                         'raw_name': raw_name,
                         'unique_name': cell.name,
+                        'flatten_refs': node.is_leaf,
                     }
                 else:
                     cell.metadata.extra['hierarchy'] = {
@@ -2793,6 +2913,7 @@ def _extend_layout_manager():
                         'child_instances': node.total_child_instances,
                         'raw_name': raw_name,
                         'unique_name': cell.name,
+                        'flatten_refs': node.is_leaf,
                     }
 
         q_kwargs = {k: v for k, v in kwargs.items()

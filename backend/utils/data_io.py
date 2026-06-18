@@ -187,6 +187,177 @@ def load_gds_layer(filepath: Union[str, Path],
     return mask
 
 
+def load_gds_layer_by_cell_name(filepath: Union[str, Path],
+                                cell_name: str,
+                                layer: int,
+                                datatype: int = 0,
+                                pixel_size: float = 1.0,
+                                target_size: Optional[Tuple[int, int]] = None,
+                                bounds: Optional[Tuple[float, float, float, float]] = None,
+                                flatten_references: bool = False) -> np.ndarray:
+    """
+    加载 GDS 中指定 cell 的指定层，栅格化为 numpy 掩模
+
+    **与 load_gds_layer 的区别**：
+    - load_gds_layer: 遍历整个 GDS 所有 cell，展平所有引用，生成全图掩模
+    - 本函数: 只处理指定 cell，由 flatten_references 控制是否展平子引用
+
+    Args:
+        filepath: GDS/OASIS 文件路径
+        cell_name: 目标 cell 名
+        layer: GDS 层号
+        datatype: GDS 数据类型号
+        pixel_size: 每像素对应的 GDS 单位长度
+        target_size: 目标尺寸 (height, width)，None 则由 bounds 自动计算
+        bounds: 版图范围 (xmin, ymin, xmax, ymax)
+        flatten_references: 是否递归展平该 cell 内的子引用。
+            - False（默认）: 只取该 cell 自身的直接多边形，用于层次化处理
+            - True: 等价于对该 cell 展平，用于层次化加载的叶节点
+
+    Returns:
+        二值掩模 (H, W) float64
+
+    Raises:
+        ValueError: 指定 cell 不存在或无多边形且未指定 target_size
+    """
+    filepath = Path(filepath)
+    if not filepath.exists():
+        raise FileNotFoundError(f"GDS文件不存在: {filepath}")
+    if not HAS_GDSTK and not HAS_GDSPY:
+        raise ImportError("需要安装 gdstk 或 gdspy")
+
+    polygons = _read_gds_polygons_by_cell(
+        str(filepath), cell_name, layer, datatype,
+        flatten_references=flatten_references,
+    )
+
+    if not polygons:
+        logger.warning(
+            f"GDS {filepath.name} cell={cell_name} (layer={layer}, dt={datatype}) "
+            f"无多边形 (flatten_references={flatten_references})"
+        )
+        if target_size is not None:
+            return np.zeros(target_size, dtype=np.float64)
+        raise ValueError(
+            f"cell={cell_name} 在 (layer={layer}, datatype={datatype}) "
+            f"无多边形，且未指定 target_size"
+        )
+
+    if bounds is None:
+        all_pts = np.vstack(polygons)
+        xmin, ymin = all_pts.min(axis=0)
+        xmax, ymax = all_pts.max(axis=0)
+    else:
+        xmin, ymin, xmax, ymax = bounds
+
+    if target_size is not None:
+        ny, nx = target_size
+    else:
+        nx = max(1, int(np.ceil((xmax - xmin) / pixel_size)))
+        ny = max(1, int(np.ceil((ymax - ymin) / pixel_size)))
+
+    pixel_polygons = []
+    for poly in polygons:
+        px = (poly[:, 0] - xmin) / pixel_size
+        py = (ymax - poly[:, 1]) / pixel_size
+        pixel_polygons.append(np.column_stack([px, py]).astype(np.float64))
+
+    mask = _rasterize_polygons(pixel_polygons, ny, nx)
+
+    logger.debug(
+        f"按cell加载GDS层: {filepath.name}#{cell_name}, "
+        f"flatten_refs={flatten_references}, layer={layer}, "
+        f"掩模尺寸: {mask.shape}, 多边形数: {len(polygons)}"
+    )
+
+    return mask
+
+
+def _read_gds_polygons_by_cell(filepath: str,
+                               cell_name: str,
+                               layer: int,
+                               datatype: int,
+                               flatten_references: bool = False) -> list:
+    """
+    从 GDS 中提取指定 cell 的多边形顶点列表
+
+    Args:
+        filepath: GDS 文件路径
+        cell_name: 目标 cell 名
+        layer: 层号
+        datatype: 数据类型
+        flatten_references: 是否递归展平子引用
+
+    Returns:
+        多边形顶点列表
+    """
+    polygons = []
+
+    if HAS_GDSTK:
+        lib = gdstk.read_gds(filepath)
+        cell_map = {c.name: c for c in lib.cells}
+        cell = cell_map.get(cell_name)
+        if cell is None:
+            logger.warning(f"GDS 中找不到 cell: {cell_name}, "
+                           f"可用: {list(cell_map.keys())}")
+            return []
+
+        if flatten_references:
+            # 使用 gdstk 内置展平功能（正确处理 ARef 阵列展开）
+            # depth=None 表示完全展平，返回的多边形已经过变换
+            for poly in cell.get_polygons(depth=None):
+                if poly.layer == layer and poly.datatype == datatype:
+                    polygons.append(np.array(poly.points))
+        else:
+            # 只取自身直接多边形，不展平子引用
+            for poly in cell.polygons:
+                if poly.layer == layer and poly.datatype == datatype:
+                    polygons.append(np.array(poly.points))
+
+    elif HAS_GDSPY:
+        lib = gdspy.GdsLibrary(infile=filepath)
+        cell_map = lib.cells
+        cell = cell_map.get(cell_name)
+        if cell is None:
+            logger.warning(f"GDS 中找不到 cell: {cell_name}, "
+                           f"可用: {list(cell_map.keys())}")
+            return []
+
+        if flatten_references:
+            # gdspy: 用 flatten() 方法展平 cell
+            try:
+                flat_cell = cell.flatten()
+                for polyset in flat_cell.polygons:
+                    if (polyset.layers[0] == layer
+                            and polyset.datatypes[0] == datatype):
+                        for pts in polyset.polygons:
+                            polygons.append(np.array(pts))
+            except Exception as e:
+                logger.warning(f"gdspy flatten 失败，回退手动展平: {e}")
+                identity = np.eye(3)
+                # 自身直接多边形
+                for polyset in cell.polygons:
+                    if (polyset.layers[0] == layer
+                            and polyset.datatypes[0] == datatype):
+                        for pts in polyset.polygons:
+                            polygons.append(np.array(pts))
+                # 手动展平子引用
+                for ref in cell.references:
+                    ref_polys = _flatten_reference_gdspy(
+                        ref, lib, layer, datatype, identity
+                    )
+                    polygons.extend(ref_polys)
+        else:
+            # 只取自身直接多边形
+            for polyset in cell.polygons:
+                if (polyset.layers[0] == layer
+                        and polyset.datatypes[0] == datatype):
+                    for pts in polyset.polygons:
+                        polygons.append(np.array(pts))
+
+    return polygons
+
+
 def _read_gds_polygons(filepath: str,
                         layer: int,
                         datatype: int) -> list:
