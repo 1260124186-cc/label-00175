@@ -520,3 +520,72 @@ class TaskResultResponse(BaseModel):
     result_detail: Optional[Dict[str, Any]] = None
     payload: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+
+
+class MetricHistoryPoint(BaseModel):
+    step: Optional[int] = None
+    value: float
+    timestamp: float
+
+
+class ExperimentRunSummary(BaseModel):
+    run_id: str
+    experiment_name: str
+    status: str
+    start_time: float
+    end_time: Optional[float] = None
+    duration_seconds: float
+    tags: Dict[str, str] = Field(default_factory=dict)
+    params: Dict[str, Any] = Field(default_factory=dict)
+    metrics_summary: Dict[str, Dict[str, float]] = Field(default_factory=dict)
+
+
+class ExperimentRunDetail(ExperimentRunSummary):
+    metrics: Dict[str, List[MetricHistoryPoint]] = Field(default_factory=dict)
+    artifacts: List[str] = Field(default_factory=list)
+
+
+class ExperimentListResponse(BaseModel):
+    count: int
+    experiments: List[str]
+
+
+class ExperimentRunListResponse(BaseModel):
+    count: int
+    runs: List[ExperimentRunSummary]
+
+
+class ExperimentCompareRequest(BaseModel):
+    run_ids: List[str]
+    metrics: Optional[List[str]] = None
+    params: Optional[List[str]] = None
+
+
+class MetricCompareItem(BaseModel):
+    final: Optional[float] = None
+    min: Optional[float] = None
+    max: Optional[float] = None
+    first: Optional[float] = None
+
+
+class ExperimentCompareRun(BaseModel):
+    run_id: str
+    status: str
+    duration_seconds: float
+    tags: Dict[str, str] = Field(default_factory=dict)
+    params: Dict[str, Any] = Field(default_factory=dict)
+    metrics: Dict[str, MetricCompareItem] = Field(default_factory=dict)
+
+
+class ExperimentCompareResponse(BaseModel):
+    experiment_name: Optional[str] = None
+    compared_run_ids: List[str]
+    runs: List[ExperimentCompareRun]
+    all_metric_names: List[str] = Field(default_factory=list)
+    all_param_names: List[str] = Field(default_factory=list)
+
+
+class MetricCurveResponse(BaseModel):
+    run_id: str
+    metric_name: str
+    points: List[MetricHistoryPoint]
