@@ -713,8 +713,12 @@ class LocalBatchRunner:
                     done_futures = []
                     with self._lock:
                         items = list(self._active_futures.keys())
-                    for fut in as_completed(items, timeout=0.5):
-                        done_futures.append(fut)
+
+                    try:
+                        for fut in as_completed(items, timeout=0.5):
+                            done_futures.append(fut)
+                    except TimeoutError:
+                        continue
 
                     for fut in done_futures:
                         with self._lock:
@@ -1472,10 +1476,10 @@ class HierarchicalBatchRunner:
         """
         # 按 depth 分组 cell
         depth_groups: Dict[int, List[str]] = defaultdict(list)
-        for cell_name, task in plan.tasks.items():
-            node = graph.nodes.get(cell_name)
+        for raw_name, task in plan.tasks.items():
+            node = graph.nodes.get(raw_name)
             depth = node.depth if node else 0
-            depth_groups[depth].append(cell_name)
+            depth_groups[depth].append(raw_name)
 
         # 按 depth 从大到小排序（自底向上）
         sorted_depths = sorted(depth_groups.keys(), reverse=True)
@@ -1486,46 +1490,46 @@ class HierarchicalBatchRunner:
             if self._stop_event.is_set():
                 break
 
-            cell_names = depth_groups[depth]
+            raw_names = depth_groups[depth]
             logger.debug(
-                f"处理 depth={depth} 层，共 {len(cell_names)} 个 cell"
+                f"处理 depth={depth} 层，共 {len(raw_names)} 个 cell"
             )
 
             # 先收集本层需要仿真的任务和可以合成的任务
             sim_tasks: List[str] = []
             compose_tasks: List[str] = []
 
-            for cell_name in cell_names:
-                task = plan.tasks.get(cell_name)
+            for raw_name in raw_names:
+                task = plan.tasks.get(raw_name)
                 if task is None:
                     continue
 
                 if task.needs_full_simulation or task.task_type == 'leaf':
-                    sim_tasks.append(cell_name)
+                    sim_tasks.append(raw_name)
                 else:
-                    compose_tasks.append(cell_name)
+                    compose_tasks.append(raw_name)
 
             # ----------------------------------------------------------
             # 1. 提交本层所有需要仿真的任务（并行）
             # ----------------------------------------------------------
             if sim_tasks:
                 self._submit_sim_tasks(
-                    executor, queue, sim_tasks, worker_counter, progress_cb
+                    executor, queue, sim_tasks, plan, worker_counter, progress_cb
                 )
                 worker_counter += len(sim_tasks)
 
                 # 等待本层所有仿真任务完成
-                self._wait_for_active(queue, progress_cb)
+                self._wait_for_active(queue, plan, progress_cb)
 
             # ----------------------------------------------------------
             # 2. 处理本层可以合成的任务（本地执行，不需要 worker）
             # ----------------------------------------------------------
             if compose_tasks:
-                for cell_name in compose_tasks:
+                for raw_name in compose_tasks:
                     if self._stop_event.is_set():
                         break
                     self._compose_cell_result(
-                        cell_name, queue, plan, graph, pixel_size, progress_cb
+                        raw_name, queue, plan, graph, pixel_size, progress_cb
                     )
 
             # ----------------------------------------------------------
@@ -1537,20 +1541,37 @@ class HierarchicalBatchRunner:
                     self._cancel_remaining_hier(queue, plan)
                     break
 
+    # ------------------------------------------------------------------
+    # 名称映射辅助
+    # ------------------------------------------------------------------
+
+    def _resolve_unique_name(self, raw_name: str,
+                             plan: HierarchyTaskPlan) -> Optional[str]:
+        """将原始 cell 名解析为 LayoutCell 唯一名称"""
+        unique = plan.get_unique_name(raw_name)
+        if unique is None:
+            logger.warning(f"找不到原始 cell 名 {raw_name} 对应的唯一名称")
+        return unique
+
     def _submit_sim_tasks(self,
                           executor: 'ProcessPoolExecutor',
                           queue: LayoutQueue,
-                          cell_names: List[str],
+                          raw_names: List[str],
+                          plan: HierarchyTaskPlan,
                           worker_counter_start: int,
                           progress_cb) -> None:
-        """提交一批仿真任务到进程池"""
-        for i, cell_name in enumerate(cell_names):
+        """提交一批仿真任务到进程池（raw_names 是原始 cell 名）"""
+        for i, raw_name in enumerate(raw_names):
             if self._stop_event.is_set():
                 break
 
-            entry = queue.get_entry(cell_name)
+            unique_name = self._resolve_unique_name(raw_name, plan)
+            if unique_name is None:
+                continue
+
+            entry = queue.get_entry(unique_name)
             if entry is None:
-                logger.warning(f"队列中找不到 cell: {cell_name}，跳过")
+                logger.warning(f"队列中找不到 cell: {unique_name} (raw: {raw_name})，跳过")
                 continue
 
             cell = entry.cell
@@ -1589,7 +1610,7 @@ class HierarchicalBatchRunner:
             progress_cb(cell.name, TaskStatus.RUNNING, 0.0,
                         self._results.get(cell.name))
 
-    def _wait_for_active(self, queue: LayoutQueue, progress_cb) -> None:
+    def _wait_for_active(self, queue: LayoutQueue, plan: HierarchyTaskPlan, progress_cb) -> None:
         """等待所有活跃任务完成"""
         while True:
             with self._lock:
@@ -1602,18 +1623,22 @@ class HierarchicalBatchRunner:
             done_futures = []
             with self._lock:
                 items = list(self._active_futures.keys())
-            for fut in as_completed(items, timeout=0.5):
-                done_futures.append(fut)
+
+            try:
+                for fut in as_completed(items, timeout=0.5):
+                    done_futures.append(fut)
+            except TimeoutError:
+                continue
 
             for fut in done_futures:
                 with self._lock:
-                    cell_name = self._active_futures.pop(fut, None)
-                if cell_name is None:
+                    unique_name = self._active_futures.pop(fut, None)
+                if unique_name is None:
                     continue
-                self._handle_future_result(fut, cell_name, queue, progress_cb)
+                self._handle_future_result(fut, unique_name, queue, plan, progress_cb)
 
     def _compose_cell_result(self,
-                             cell_name: str,
+                             raw_name: str,
                              queue: LayoutQueue,
                              plan: HierarchyTaskPlan,
                              graph: HierarchyGraph,
@@ -1626,14 +1651,18 @@ class HierarchicalBatchRunner:
         2. 用聚合方法估算指标
         3. 写回 TaskResult 和队列
         """
-        entry = queue.get_entry(cell_name)
+        unique_name = self._resolve_unique_name(raw_name, plan)
+        if unique_name is None:
+            return
+
+        entry = queue.get_entry(unique_name)
         if entry is None:
-            logger.warning(f"队列中找不到 cell: {cell_name}，跳过合成")
+            logger.warning(f"队列中找不到 cell: {unique_name} (raw: {raw_name})，跳过合成")
             return
 
         cell = entry.cell
-        task = plan.tasks.get(cell_name)
-        node = graph.nodes.get(cell_name)
+        task = plan.tasks.get(raw_name)
+        node = graph.nodes.get(raw_name)
 
         if task is None or self._merger is None:
             return
@@ -1643,13 +1672,24 @@ class HierarchicalBatchRunner:
 
         # 标记运行中
         self._register_running(cell, task_id, "composer", started_at)
-        progress_cb(cell_name, TaskStatus.RUNNING, 0.0,
-                    self._results.get(cell_name))
+        progress_cb(cell.name, TaskStatus.RUNNING, 0.0,
+                    self._results.get(cell.name))
 
         try:
             # 确保自身掩模已加载（作为 parent_self_mask）
             if not cell.is_mask_loaded:
-                cell.ensure_mask_loaded()
+                try:
+                    cell.ensure_mask_loaded()
+                except Exception:
+                    # 如果只有引用没有自身多边形，创建空掩模作为合成基底
+                    if node and node.bounds:
+                        xmin, ymin, xmax, ymax = node.bounds
+                        nx = max(1, int(np.ceil((xmax - xmin) / pixel_size)))
+                        ny = max(1, int(np.ceil((ymax - ymin) / pixel_size)))
+                        cell.mask = np.zeros((ny, nx), dtype=np.float64)
+                        cell.target = cell.mask.copy()
+                    else:
+                        raise
 
             # 计算完整包围盒（含子引用的整体 bounds）
             if node and node.bounds:
@@ -1685,28 +1725,28 @@ class HierarchicalBatchRunner:
                     out_dir.mkdir(parents=True, exist_ok=True)
                     safe_name = "".join(
                         c if c.isalnum() or c in '-_.' else '_'
-                        for c in cell_name
+                        for c in unique_name
                     )
                     mask_path = str(out_dir / f"{safe_name}__composed.npy")
                     np.save(mask_path, composed_mask)
                 except Exception as e:
-                    logger.warning(f"保存合成掩模失败 {cell_name}: {e}")
+                    logger.warning(f"保存合成掩模失败 {unique_name}: {e}")
 
-            # 缓存合成结果，供更上层使用
+            # 缓存合成结果，供更上层使用（用 raw_name 作为 key，与 child_results_needed 一致）
             self._merger.cache_result(
-                task.unique_cell_key, composed_mask, aggregated_metrics
+                raw_name, composed_mask, aggregated_metrics
             )
 
             # 写回结果
             with self._lock:
-                r = self._results.get(cell_name)
+                r = self._results.get(unique_name)
                 if r is None:
                     r = TaskResult(
                         task_id=task_id,
                         cell_name=cell.name,
                         cell_display_name=cell.cell_name,
                     )
-                    self._results[cell_name] = r
+                    self._results[unique_name] = r
 
                 r.status = TaskStatus.DONE
                 r.task_id = task_id
@@ -1731,13 +1771,15 @@ class HierarchicalBatchRunner:
                 r.extra['total_child_instances'] = sum(
                     len(v) for v in task.child_results_needed.values()
                 )
+                r.extra['raw_name'] = raw_name
+                r.extra['unique_name'] = unique_name
 
-            queue.mark_done(cell_name, progress=1.0)
-            progress_cb(cell_name, TaskStatus.DONE, 1.0,
-                        self._results.get(cell_name))
+            queue.mark_done(unique_name, progress=1.0)
+            progress_cb(cell.name, TaskStatus.DONE, 1.0,
+                        self._results.get(unique_name))
 
             logger.debug(
-                f"合成 cell {cell_name} 完成，"
+                f"合成 cell {unique_name} (raw: {raw_name}) 完成，"
                 f"子 cell 数={len(task.child_results_needed)}, "
                 f"总实例数={r.extra['total_child_instances']}"
             )
@@ -1745,11 +1787,11 @@ class HierarchicalBatchRunner:
         except Exception as e:
             tb = traceback.format_exc(limit=5)
             err = f"合成失败: {e}\n{tb}"
-            logger.error(f"合成 cell 失败 {cell_name}: {err}")
+            logger.error(f"合成 cell 失败 {unique_name} (raw: {raw_name}): {err}")
             self._register_failed(cell, err, worker_id="composer")
-            queue.mark_failed(cell_name, err, retry=False)
-            progress_cb(cell_name, TaskStatus.FAILED, 0.0,
-                        self._results.get(cell_name))
+            queue.mark_failed(unique_name, err, retry=False)
+            progress_cb(cell.name, TaskStatus.FAILED, 0.0,
+                        self._results.get(unique_name))
 
     # ------------------------------------------------------------------
     # 辅助方法（复用 LocalBatchRunner 的模式）
@@ -1809,11 +1851,13 @@ class HierarchicalBatchRunner:
                 r.started_at = r.finished_at
             r.elapsed_sec = round(r.finished_at - r.started_at, 3)
 
-    def _handle_future_result(self, fut: 'Future', cell_name: str,
-                              queue: LayoutQueue, progress_cb) -> None:
-        """处理一个仿真任务的完成结果，并缓存到 merger"""
-        entry = queue.get_entry(cell_name)
+    def _handle_future_result(self, fut: 'Future', unique_name: str,
+                              queue: LayoutQueue, plan: HierarchyTaskPlan,
+                              progress_cb) -> None:
+        """处理一个仿真任务的完成结果，并缓存到 merger（unique_name 是 LayoutCell 标识名）"""
+        entry = queue.get_entry(unique_name)
         cell = entry.cell if entry is not None else None
+        raw_name = plan.get_raw_name(unique_name) if cell else None
         try:
             timeout = self.resource_config.per_task_timeout_sec
             timeout = timeout if timeout > 0 else None
@@ -1821,9 +1865,9 @@ class HierarchicalBatchRunner:
         except Exception as e:
             tb = traceback.format_exc(limit=5)
             err = f"worker exception: {e}\n{tb}"
-            logger.error(f"任务异常 {cell_name}: {err}")
+            logger.error(f"任务异常 {unique_name}: {err}")
             with self._lock:
-                r = self._results.get(cell_name)
+                r = self._results.get(unique_name)
                 if r is not None:
                     r.status = TaskStatus.FAILED
                     r.error_message = err
@@ -1831,27 +1875,29 @@ class HierarchicalBatchRunner:
                     if r.started_at:
                         r.elapsed_sec = round(r.finished_at - r.started_at, 3)
             if entry is not None:
-                queue.mark_failed(cell_name, err, retry=True)
+                queue.mark_failed(unique_name, err, retry=True)
                 if entry.status == LayoutQueue.Status.PENDING:
                     if r is not None:
                         r.status = TaskStatus.PENDING
                         r.retries = entry.retries
-            progress_cb(cell_name, TaskStatus.FAILED if (entry is None or entry.status == LayoutQueue.Status.FAILED)
-                        else TaskStatus.PENDING, 0.0, self._results.get(cell_name))
+            progress_cb(unique_name,
+                        TaskStatus.FAILED if (entry is None or entry.status == LayoutQueue.Status.FAILED)
+                        else TaskStatus.PENDING,
+                        0.0, self._results.get(unique_name))
             return
 
         status_str = raw.get('status', TaskStatus.FAILED.value)
         status_enum = TaskStatus(status_str)
 
         with self._lock:
-            r = self._results.get(cell_name)
+            r = self._results.get(unique_name)
             if r is None:
                 r = TaskResult(
                     task_id=raw.get('task_id', ''),
-                    cell_name=cell_name,
+                    cell_name=unique_name,
                     cell_display_name=raw.get('cell_display_name', ''),
                 )
-                self._results[cell_name] = r
+                self._results[unique_name] = r
 
             r.status = status_enum
             r.initial_mse = raw.get('initial_mse')
@@ -1872,11 +1918,14 @@ class HierarchicalBatchRunner:
                 r.retries = entry.retries
             if raw.get('extra'):
                 r.extra.update(raw['extra'])
+            if raw_name:
+                r.extra['raw_name'] = raw_name
+                r.extra['unique_name'] = unique_name
 
         if status_enum == TaskStatus.DONE:
-            queue.mark_done(cell_name, progress=1.0)
-            # 缓存到 merger，供父 cell 合成使用
-            if self._merger is not None and cell is not None:
+            queue.mark_done(unique_name, progress=1.0)
+            # 缓存到 merger，供父 cell 合成使用（用 raw_name 作为 key）
+            if self._merger is not None and cell is not None and raw_name is not None:
                 try:
                     # 从文件加载或从 payload 获取优化后的掩模
                     optimized_mask = None
@@ -1898,47 +1947,52 @@ class HierarchicalBatchRunner:
                     }
                     if optimized_mask is not None:
                         self._merger.cache_result(
-                            cell_name, optimized_mask, metrics
+                            raw_name, optimized_mask, metrics
                         )
                     elif cell.is_mask_loaded:
                         # fallback: 使用 cell 自身掩模（演示用）
                         # 实际项目中优化后掩模会不同
                         self._merger.cache_result(
-                            cell_name, cell.mask.astype(np.float64), metrics
+                            raw_name, cell.mask.astype(np.float64), metrics
                         )
                 except Exception as e:
-                    logger.warning(f"缓存仿真结果失败 {cell_name}: {e}")
+                    logger.warning(f"缓存仿真结果失败 {unique_name} (raw: {raw_name}): {e}")
 
-            progress_cb(cell_name, TaskStatus.DONE, 1.0, r)
+            progress_cb(unique_name, TaskStatus.DONE, 1.0, r)
         else:
             err = raw.get('error_message') or 'unknown error'
-            queue.mark_failed(cell_name, err, retry=True)
-            new_entry = queue.get_entry(cell_name)
+            queue.mark_failed(unique_name, err, retry=True)
+            new_entry = queue.get_entry(unique_name)
             new_status = TaskStatus.PENDING if (new_entry is not None and
                                                 new_entry.status == LayoutQueue.Status.PENDING) \
                 else TaskStatus.FAILED
             if new_status == TaskStatus.PENDING:
                 r.status = TaskStatus.PENDING
                 r.retries = new_entry.retries if new_entry else r.retries
-            progress_cb(cell_name, new_status, 0.0, r)
+            progress_cb(unique_name, new_status, 0.0, r)
 
     def _cancel_remaining_hier(self, queue: LayoutQueue,
                                plan: HierarchyTaskPlan) -> None:
-        for name in plan.execution_order:
-            e = queue.get_entry(name)
+        for raw_name in plan.execution_order:
+            unique_name = plan.get_unique_name(raw_name)
+            if unique_name is None:
+                continue
+            e = queue.get_entry(unique_name)
             if e is not None and e.status == LayoutQueue.Status.PENDING:
-                queue.mark_cancelled(name)
+                queue.mark_cancelled(unique_name)
                 with self._lock:
-                    r = self._results.get(name)
+                    r = self._results.get(unique_name)
                     if r is None:
-                        self._results[name] = TaskResult(
+                        self._results[unique_name] = TaskResult(
                             task_id=f"{self.batch_id}__cancel_{uuid.uuid4().hex[:6]}",
-                            cell_name=name,
+                            cell_name=unique_name,
                             cell_display_name=e.cell.cell_name,
                         )
-                    r = self._results[name]
+                    r = self._results[unique_name]
                     r.status = TaskStatus.CANCELLED
                     r.finished_at = time.time()
+                    r.extra['raw_name'] = raw_name
+                    r.extra['unique_name'] = unique_name
 
     def _status_printer_loop(self, summary: BatchSummary,
                              queue: LayoutQueue,

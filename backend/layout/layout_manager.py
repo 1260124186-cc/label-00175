@@ -419,9 +419,19 @@ class GDSLoader:
             if options.load_masks_on_init:
                 import time
                 t0 = time.time()
+                mask = None
                 try:
                     mask = self.load_cell_mask(filepath, cell_name, options)
+                except ValueError as e:
+                    # "无多边形" 等预期内的异常
+                    if not options.skip_empty_cells and '无多边形' in str(e):
+                        # 空 cell（只有引用没有自身多边形），后续处理
+                        mask = None
+                    else:
+                        logger.warning(f"加载 cell {cell_name} 失败: {e}")
+                        continue
                 except Exception as e:
+                    # 其他异常
                     logger.warning(f"加载 cell {cell_name} 失败: {e}")
                     continue
                 meta.load_timestamp = t0
@@ -429,6 +439,7 @@ class GDSLoader:
                     if options.skip_empty_cells:
                         logger.debug(f"跳过空 cell: {cell_name}")
                         continue
+                    # 创建空掩模占位符，后续在层次化处理中根据 bounds 重新设置
                     mask = np.zeros((1, 1), dtype=np.float64)
                 cell.mask = mask
                 cell.target = mask.copy()
@@ -1554,6 +1565,76 @@ class HierarchyGraph:
                 counts[aref.child_cell_name] += aref.total_instances
         return dict(counts)
 
+    def compute_bounds(self) -> None:
+        """
+        自底向上计算每个 node 的完整包围盒（包括所有子引用展开后的 bounds）
+
+        对于有自身多边形的 cell，使用已有的 bounds；
+        对于只有引用没有自身多边形的 cell，通过子引用的 bounds + 变换矩阵计算。
+
+        结果直接写入每个 node.bounds 属性。
+        """
+        # 自底向上：先处理叶节点，再处理父节点
+        order = self.topological_order(bottom_up=True)  # 叶节点在前，父节点在后
+
+        for name in order:
+            node = self.nodes[name]
+
+            # 收集所有 bounds：自身多边形的 bounds + 所有子引用展开后的 bounds
+            all_bounds = []
+            if node.bounds is not None:
+                all_bounds.append(node.bounds)
+
+            # 处理单引用
+            for ref in node.single_refs:
+                child_node = self.nodes.get(ref.child_cell_name)
+                if child_node is None or child_node.bounds is None:
+                    continue
+                child_xmin, child_ymin, child_xmax, child_ymax = child_node.bounds
+                # 4 个角点
+                corners = np.array([
+                    [child_xmin, child_ymin, 1.0],
+                    [child_xmax, child_ymin, 1.0],
+                    [child_xmax, child_ymax, 1.0],
+                    [child_xmin, child_ymax, 1.0],
+                ])
+                transformed = (ref.transform @ corners.T).T[:, :2]
+                all_bounds.append((
+                    float(transformed[:, 0].min()),
+                    float(transformed[:, 1].min()),
+                    float(transformed[:, 0].max()),
+                    float(transformed[:, 1].max()),
+                ))
+
+            # 处理阵列引用
+            for aref in node.array_refs:
+                child_node = self.nodes.get(aref.child_cell_name)
+                if child_node is None or child_node.bounds is None:
+                    continue
+                child_xmin, child_ymin, child_xmax, child_ymax = child_node.bounds
+                # 展开所有阵列实例
+                for inst in aref.expand_instances():
+                    corners = np.array([
+                        [child_xmin, child_ymin, 1.0],
+                        [child_xmax, child_ymin, 1.0],
+                        [child_xmax, child_ymax, 1.0],
+                        [child_xmin, child_ymax, 1.0],
+                    ])
+                    transformed = (inst.transform @ corners.T).T[:, :2]
+                    all_bounds.append((
+                        float(transformed[:, 0].min()),
+                        float(transformed[:, 1].min()),
+                        float(transformed[:, 0].max()),
+                        float(transformed[:, 1].max()),
+                    ))
+
+            if all_bounds:
+                all_xmin = min(b[0] for b in all_bounds)
+                all_ymin = min(b[1] for b in all_bounds)
+                all_xmax = max(b[2] for b in all_bounds)
+                all_ymax = max(b[3] for b in all_bounds)
+                node.bounds = (all_xmin, all_ymin, all_xmax, all_ymax)
+
     # ------------------------------------------------------------------
     # 统计与导出
     # ------------------------------------------------------------------
@@ -1713,6 +1794,7 @@ class LayoutHierarchyAnalyzer:
 
         graph.leaf_cells = [name for name, n in graph.nodes.items() if n.is_leaf]
         graph.compute_depths()
+        graph.compute_bounds()  # 自底向上计算所有 cell 的完整包围盒
 
         logger.info(
             f"层次分析完成: {len(graph.nodes)} cells, "
@@ -1843,6 +1925,7 @@ class LayoutHierarchyAnalyzer:
 
         graph.leaf_cells = [name for name, n in graph.nodes.items() if n.is_leaf]
         graph.compute_depths()
+        graph.compute_bounds()  # 自底向上计算所有 cell 的完整包围盒
 
         logger.info(
             f"层次分析完成: {len(graph.nodes)} cells, "
@@ -1966,12 +2049,19 @@ class HierarchyTaskPlan:
         potential_savings: 预估节省的仿真次数
             = (原始扁平 cell 数) - (实际需要仿真的唯一 cell 数)
         graph: 关联的 HierarchyGraph
+        raw_to_unique_name: GDS 原始 cell 名 → LayoutCell 唯一名称的映射
+            LayoutCell.name 通常带有 library 前缀（如 "chip::TOP"），
+            而 HierarchyGraph 中使用的是原始 cell 名（如 "TOP"）。
+            此映射确保两者可以正确关联。
+        unique_to_raw_name: LayoutCell 唯一名称 → GDS 原始 cell 名的反向映射
     """
     tasks: Dict[str, HierarchicalTask] = field(default_factory=dict)
     execution_order: List[str] = field(default_factory=list)
     unique_tasks: int = 0
     potential_savings: int = 0
     graph: Optional[HierarchyGraph] = None
+    raw_to_unique_name: Dict[str, str] = field(default_factory=dict)
+    unique_to_raw_name: Dict[str, str] = field(default_factory=dict)
 
     def summary(self) -> Dict[str, Any]:
         leaf_tasks = sum(1 for t in self.tasks.values() if t.task_type == 'leaf')
@@ -1985,6 +2075,7 @@ class HierarchyTaskPlan:
             'full_simulation_required': full_sim,
             'potential_savings': self.potential_savings,
             'execution_order_length': len(self.execution_order),
+            'name_mapping_count': len(self.raw_to_unique_name),
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1993,7 +2084,16 @@ class HierarchyTaskPlan:
             'execution_order': self.execution_order,
             'tasks': {name: t.to_dict() for name, t in self.tasks.items()},
             'graph_summary': self.graph.summary() if self.graph else None,
+            'raw_to_unique_name': self.raw_to_unique_name,
         }
+
+    def get_unique_name(self, raw_name: str) -> Optional[str]:
+        """通过原始 cell 名获取 LayoutCell 唯一名称"""
+        return self.raw_to_unique_name.get(raw_name)
+
+    def get_raw_name(self, unique_name: str) -> Optional[str]:
+        """通过 LayoutCell 唯一名称获取原始 cell 名"""
+        return self.unique_to_raw_name.get(unique_name)
 
 
 class HierarchyTaskPlanner:
@@ -2062,7 +2162,7 @@ class HierarchyTaskPlanner:
 
             if not node.is_leaf:
                 task.child_results_needed = self._collect_child_needs(node, opts)
-                task.needs_full_simulation = self._should_full_simulate(node, opts)
+                task.needs_full_simulation = self._should_full_simulate(node, opts, graph)
 
             est_size = self._estimate_size(node, opts)
             task.estimated_size = est_size
@@ -2126,7 +2226,8 @@ class HierarchyTaskPlanner:
 
     @staticmethod
     def _should_full_simulate(node: HierarchyNode,
-                              options: 'HierarchyPlanOptions') -> bool:
+                              options: 'HierarchyPlanOptions',
+                              graph: 'HierarchyGraph' = None) -> bool:
         """
         判断复合 cell 是否应该退化到完整仿真
 
@@ -2136,8 +2237,22 @@ class HierarchyTaskPlanner:
         if node.is_leaf:
             return False
 
+        def _recursive_total_instances(n: HierarchyNode, visited: set) -> int:
+            """递归计算所有子实例总数（含间接子节点的展开）"""
+            if n.cell_name in visited:
+                return 0
+            visited.add(n.cell_name)
+
+            total = n.total_child_instances
+            if graph:
+                for child_name in n.children:
+                    child_node = graph.nodes.get(child_name)
+                    if child_node and not child_node.is_leaf:
+                        total += _recursive_total_instances(child_node, visited)
+            return total
+
         self_polys = max(1, node.polygon_count)
-        total_child = node.total_child_instances
+        total_child = _recursive_total_instances(node, set())
         ratio = self_polys / max(1, self_polys + total_child * options.child_polygon_estimate)
 
         if ratio > options.self_polygon_ratio_threshold:
@@ -2605,6 +2720,7 @@ def _extend_layout_manager():
         }}
         load_opts = LayoutLoadOptions(**opts_kwargs)
         load_opts.include_subcells = True
+        load_opts.skip_empty_cells = False  # 层次化模式下，即使没有自身多边形也要加载（如只有引用的父 cell）
 
         plan_kwargs = {k: v for k, v in kwargs.items()
                        if k in HierarchyPlanOptions.__dataclass_fields__}
@@ -2617,8 +2733,23 @@ def _extend_layout_manager():
         graph = self.analyze_hierarchy(filepath, layer=layer, datatype=load_opts.datatype)
         plan = self.plan_hierarchical_tasks(graph, options=plan_opts)
 
-        lib = self.load_gds_file(filepath, options=load_opts)
+        # 直接加载所有 cell，禁用去重（层次化模式下父子 cell 可能有相同展平掩模）
+        cells = self.loader.load_file(filepath, load_opts)
+        lib = LayoutLibrary(name=Path(filepath).stem)
+        lib.add_many(cells, dedup=False)  # 层次化模式下必须禁用去重
 
+        # 建立原始 cell 名 → LayoutCell 唯一名称的双向映射
+        raw_to_unique: Dict[str, str] = {}
+        unique_to_raw: Dict[str, str] = {}
+        for cell in lib.cells():
+            raw_name = cell.cell_name
+            unique_name = cell.name
+            raw_to_unique[raw_name] = unique_name
+            unique_to_raw[unique_name] = raw_name
+        plan.raw_to_unique_name = raw_to_unique
+        plan.unique_to_raw_name = unique_to_raw
+
+        # 为所有层次图中的 cell 打 tag（即使不在 plan.tasks 中的也要标记层次信息）
         for cell in lib.cells():
             raw_name = cell.cell_name
             if raw_name in graph.nodes:
@@ -2627,6 +2758,17 @@ def _extend_layout_manager():
                 if node.is_top:
                     cell.tags.add('hier:top')
                 cell.tags.add(f"hier:depth_{node.depth}")
+
+                # 如果 cell 只有引用没有自身多边形（mask 是 (1,1) 的占位符），
+                # 且 node.bounds 可用，则根据 bounds 设置合适的掩模大小
+                if (cell.mask is not None and cell.mask.shape == (1, 1)
+                        and node.bounds is not None):
+                    xmin, ymin, xmax, ymax = node.bounds
+                    nx = max(1, int(np.ceil((xmax - xmin) / plan_opts.pixel_size)))
+                    ny = max(1, int(np.ceil((ymax - ymin) / plan_opts.pixel_size)))
+                    cell.mask = np.zeros((ny, nx), dtype=np.float64)
+                    cell.target = cell.mask.copy()
+
                 if raw_name in plan.tasks:
                     task = plan.tasks[raw_name]
                     cell.priority = task.priority
@@ -2639,12 +2781,26 @@ def _extend_layout_manager():
                         'parent_count': len(node.parents),
                         'child_instances': node.total_child_instances,
                         'unique_key': task.unique_cell_key,
+                        'raw_name': raw_name,
+                        'unique_name': cell.name,
+                    }
+                else:
+                    cell.metadata.extra['hierarchy'] = {
+                        'depth': node.depth,
+                        'is_leaf': node.is_leaf,
+                        'is_top': node.is_top,
+                        'parent_count': len(node.parents),
+                        'child_instances': node.total_child_instances,
+                        'raw_name': raw_name,
+                        'unique_name': cell.name,
                     }
 
         q_kwargs = {k: v for k, v in kwargs.items()
                     if k in ('priority_by_size', 'priority_by_polygons',
                              'size_priority_reverse', 'max_retries',
                              'require_mask_loaded')}
+        # 层次化模式下，require_mask_loaded 默认 False，允许只有引用没有自身多边形的 cell 入队
+        q_kwargs.setdefault('require_mask_loaded', False)
         queue = self.build_queue(lib, **q_kwargs)
 
         return lib, queue, graph, plan
