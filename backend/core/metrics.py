@@ -2023,6 +2023,8 @@ class CompositeLossComponents:
     min_feature: float = 0.0
     weighted_mse: float = 0.0
     weighted_mae: float = 0.0
+    cd_error: float = 0.0
+    litho_epe: float = 0.0
     total: float = 0.0
 
     def to_dict(self) -> Dict[str, float]:
@@ -2038,5 +2040,7 @@ class CompositeLossComponents:
             'min_feature': self.min_feature,
             'weighted_mse': self.weighted_mse,
             'weighted_mae': self.weighted_mae,
+            'cd_error': self.cd_error,
+            'litho_epe': self.litho_epe,
             'total': self.total
         }

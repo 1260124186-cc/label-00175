@@ -54,6 +54,18 @@ from core.metrics import (
     weighted_mse, weighted_mae,
     weighted_mse_gradient, weighted_mae_gradient
 )
+from core.litho_metrics import (
+    compute_epe,
+    compute_cd,
+    compute_cd_error,
+)
+from metrology.cd_extraction import (
+    MeasurementLine,
+    extract_cd,
+    extract_cd_multiline,
+    CDExtractionMethod,
+    CDExtractionResult,
+)
 from algorithms.optimizer import (
     BaseOptimizer, GradientDescentOptimizer, BFGSOptimizer,
     NewtonOptimizer, OptimizationResult, AdamOptimizer, RMSpropOptimizer
@@ -106,6 +118,7 @@ class LossWeights:
            + w_epe * EPE + w_min_feature * min_feature_size
            + w_weighted_mse * WMSE + w_weighted_mae * WMAE
            + w_worst_case * worst_case_loss（蒙特卡洛最坏情况损失）
+           + w_cd_error * |CD_error| + w_litho_epe * EPE_litho
 
     Attributes:
         mse: MSE（均方误差）权重
@@ -114,11 +127,13 @@ class LossWeights:
         mask_complexity: 掩模复杂度（总变差TV）权重
         binary_penalty: 二值化惩罚权重（曼哈顿距离/熵）
         tv_smooth: 各向同性TV平滑权重
-        epe: 边缘放置误差（EPE）权重
+        epe: 边缘放置误差（EPE，软边缘版本，基于mask/target梯度）权重
         min_feature: 最小特征尺寸约束权重
         weighted_mse: 空间加权MSE权重（热点区域更受关注）
         weighted_mae: 空间加权MAE权重
         worst_case: 蒙特卡洛最坏情况损失权重（需配合 use_monte_carlo=True 使用）
+        cd_error: 实测CD偏差（|CD_wafer - CD_target|）权重，Fab计量指标闭环
+        litho_epe: 光刻EPE（基于晶圆二值图边缘距离变换）权重，Fab可测指标
     """
     mse: float = 1.0
     ssim: float = 0.0
@@ -131,6 +146,8 @@ class LossWeights:
     weighted_mse: float = 0.0
     weighted_mae: float = 0.0
     worst_case: float = 0.0
+    cd_error: float = 0.0
+    litho_epe: float = 0.0
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, float]]) -> 'LossWeights':
@@ -140,7 +157,8 @@ class LossWeights:
         defaults = {
             'mse': 1.0, 'ssim': 0.0, 'pvb': 0.0, 'mask_complexity': 0.0,
             'binary_penalty': 0.0, 'tv_smooth': 0.0, 'epe': 0.0, 'min_feature': 0.0,
-            'weighted_mse': 0.0, 'weighted_mae': 0.0, 'worst_case': 0.0
+            'weighted_mse': 0.0, 'weighted_mae': 0.0, 'worst_case': 0.0,
+            'cd_error': 0.0, 'litho_epe': 0.0,
         }
         defaults.update(d)
         return cls(**defaults)
@@ -157,13 +175,16 @@ class LossWeights:
             'min_feature': self.min_feature,
             'weighted_mse': self.weighted_mse,
             'weighted_mae': self.weighted_mae,
-            'worst_case': self.worst_case
+            'worst_case': self.worst_case,
+            'cd_error': self.cd_error,
+            'litho_epe': self.litho_epe,
         }
 
     def total_weight(self) -> float:
         return (self.mse + self.ssim + self.pvb + self.mask_complexity +
                 self.binary_penalty + self.tv_smooth + self.epe + self.min_feature +
-                self.weighted_mse + self.weighted_mae + self.worst_case)
+                self.weighted_mse + self.weighted_mae + self.worst_case +
+                self.cd_error + self.litho_epe)
 
 
 @dataclass
@@ -251,6 +272,26 @@ class OptimizationConfig:
         min_feature_method: str = 'combined'  # 'morphology', 'frequency', 'combined'
         min_feature_alpha: float = 0.5  # 联合方法中形态学权重
         pixel_size: float = 1.0  # 像素尺寸（用于EPE和最小特征尺寸的物理单位转换）
+
+        # 计量闭环反馈配置（Fab可测指标优化）
+        use_metrology_closed_loop: bool = False  # 是否启用计量指标闭环
+        # 测量线配置：用于沿指定位置提取实测CD（MeasurementLine列表或dict列表）
+        # 例如：[{'start': (y0, x0), 'end': (y1, x1), 'direction': 'horizontal', 'name': 'ML1'}]
+        metrology_lines: Optional[List[Union[Dict[str, Any], MeasurementLine]]] = None
+        # CD提取方法：threshold_crossing | derivative_peak | linear_regression | polynomial_fit
+        cd_extraction_method: str = 'threshold_crossing'
+        # 目标CD值（nm）。None时自动从target图像沿metrology_lines预提取作为目标
+        cd_target_nm: Optional[float] = None
+        # CD偏差损失的归一化系数：1/(cd_tolerance_nm^2)，使CD偏差损失与MSE量级相当
+        cd_tolerance_nm: float = 3.0  # CD允许偏差±3nm
+        # Litho EPE损失的归一化系数：1/(epe_tolerance_nm)
+        litho_epe_tolerance_nm: float = 3.0  # EPE允许偏差±3nm
+        # CD偏差梯度计算的有限差分步长（因为CD提取不可解析求导）
+        cd_gradient_eps: float = 1e-3
+        # Litho EPE 梯度计算的有限差分步长
+        litho_epe_gradient_eps: float = 1e-3
+        # 是否在CD测量线不足时回退到全局CD统计（compute_cd）
+        cd_use_global_fallback: bool = True
     """
     optimizer_type: str = 'gradient_descent'
     max_iter: int = 100
@@ -308,6 +349,17 @@ class OptimizationConfig:
     min_feature_method: str = 'combined'  # 'morphology', 'frequency', 'combined'
     min_feature_alpha: float = 0.5  # 联合方法中形态学权重
     pixel_size: float = 1.0  # 像素尺寸
+
+    # 计量闭环反馈配置（Fab可测指标优化）
+    use_metrology_closed_loop: bool = False  # 是否启用计量指标闭环
+    metrology_lines: Optional[List[Union[Dict[str, Any], MeasurementLine]]] = None
+    cd_extraction_method: str = 'threshold_crossing'
+    cd_target_nm: Optional[float] = None
+    cd_tolerance_nm: float = 3.0
+    litho_epe_tolerance_nm: float = 3.0
+    cd_gradient_eps: float = 1e-3
+    litho_epe_gradient_eps: float = 1e-3
+    cd_use_global_fallback: bool = True
 
     # 频域正则化（带限约束投影）配置
     use_frequency_bandlimit: bool = False  # 是否启用频域带限投影
@@ -630,6 +682,12 @@ class MaskOptimizer:
 
         self._bandlimit_mask: Optional[np.ndarray] = None
 
+        # 计量闭环反馈状态
+        self._metrology_lines_parsed: Optional[List[MeasurementLine]] = None  # 解析后的测量线
+        self._cd_target_value_nm: Optional[float] = None  # 预提取的目标CD
+        self._last_cd_error_value: float = 0.0  # 最近一次的CD误差值（用于梯度回退）
+        self._last_litho_epe_value: float = 0.0  # 最近一次的Litho EPE值
+
     def _setup_bandlimit_mask(self, image_size: tuple):
         """设置频域带限约束掩模"""
         cfg = self.config
@@ -688,6 +746,251 @@ class MaskOptimizer:
             or not self.config.bandlimit_project_gradient):
             return gradient
         return bandlimited_gradient_projection(gradient, self._bandlimit_mask)
+
+    # ------------------------------------------------------------------
+    # 计量闭环反馈辅助方法
+    # ------------------------------------------------------------------
+    def _setup_metrology_closed_loop(self, target_image: np.ndarray):
+        """
+        初始化计量闭环反馈：解析测量线，预提取目标CD值
+
+        Args:
+            target_image: 目标图像（用于预提取CD目标值）
+        """
+        cfg = self.config
+        if not cfg.use_metrology_closed_loop:
+            return
+
+        pixel_size = cfg.pixel_size
+        method = cfg.cd_extraction_method
+
+        lines_raw = cfg.metrology_lines
+        parsed_lines: List[MeasurementLine] = []
+        if lines_raw is not None:
+            for item in lines_raw:
+                if isinstance(item, MeasurementLine):
+                    parsed_lines.append(item)
+                elif isinstance(item, dict):
+                    parsed_lines.append(MeasurementLine(
+                        start=tuple(item['start']),
+                        end=tuple(item['end']),
+                        direction=item.get('direction', 'horizontal'),
+                        name=item.get('name', f'ML{len(parsed_lines)+1}'),
+                    ))
+        self._metrology_lines_parsed = parsed_lines if parsed_lines else None
+
+        if cfg.cd_target_nm is not None:
+            self._cd_target_value_nm = float(cfg.cd_target_nm)
+        elif self._metrology_lines_parsed:
+            try:
+                results = extract_cd_multiline(
+                    target_image,
+                    self._metrology_lines_parsed,
+                    method=method,
+                    pixel_size=pixel_size,
+                )
+                valid = [r.cd_value for r in results if r.confidence > 0.5 and r.cd_value > 0]
+                if valid:
+                    self._cd_target_value_nm = float(np.mean(valid))
+                    logger.info(
+                        f"计量闭环：沿测量线从目标图预提取 CD 目标值 = "
+                        f"{self._cd_target_value_nm:.2f} nm (基于 {len(valid)} 条有效测量线)"
+                    )
+            except Exception as e:
+                logger.warning(f"预提取目标CD失败，将使用晶圆图全局CD统计: {e}")
+                self._cd_target_value_nm = None
+        else:
+            self._cd_target_value_nm = None
+
+        if cfg.verbose and cfg.use_metrology_closed_loop:
+            lw = cfg.loss_weights
+            logger.info(
+                f"计量闭环反馈已启用: "
+                f"cd_error权重={lw.cd_error}, "
+                f"litho_epe权重={lw.litho_epe}, "
+                f"CD容差={cfg.cd_tolerance_nm}nm, "
+                f"EPE容差={cfg.litho_epe_tolerance_nm}nm"
+            )
+
+    def _compute_metrology_cd_error(self, wafer_binary: np.ndarray) -> float:
+        """
+        计算晶圆图的CD偏差损失
+
+        优先沿测量线提取CD；若无测量线或cd_use_global_fallback=True，
+        则使用全局CD统计。损失 = (CD_wafer - CD_target)^2 / cd_tolerance_nm^2
+
+        Args:
+            wafer_binary: 二值化晶圆图（0或1）
+
+        Returns:
+            CD偏差损失值（已归一化，与MSE量级相当）
+        """
+        cfg = self.config
+        pixel_size = cfg.pixel_size
+        method = cfg.cd_extraction_method
+        tolerance = max(cfg.cd_tolerance_nm, 1e-6)
+        target_nm = self._cd_target_value_nm
+
+        cd_wafer_nm: Optional[float] = None
+        cd_target_nm: Optional[float] = None
+
+        if self._metrology_lines_parsed:
+            try:
+                results = extract_cd_multiline(
+                    wafer_binary,
+                    self._metrology_lines_parsed,
+                    method=method,
+                    pixel_size=pixel_size,
+                )
+                valid = [r.cd_value for r in results if r.confidence > 0.3 and r.cd_value > 0]
+                if valid:
+                    cd_wafer_nm = float(np.mean(valid))
+                    if target_nm is None:
+                        if cfg.cd_use_global_fallback:
+                            target_stats = compute_cd(
+                                self._target_image if self._target_image is not None else wafer_binary,
+                                pixel_size=pixel_size,
+                            )
+                            cd_target_nm = target_stats.get('cd_mean', cd_wafer_nm)
+                        else:
+                            cd_target_nm = cd_wafer_nm
+                    else:
+                        cd_target_nm = target_nm
+            except Exception as e:
+                logger.debug(f"沿测量线提取CD失败，回退到全局CD统计: {e}")
+                cd_wafer_nm = None
+
+        if cd_wafer_nm is None or cd_target_nm is None:
+            if not cfg.cd_use_global_fallback:
+                return 0.0
+            try:
+                wafer_stats = compute_cd(wafer_binary, pixel_size=pixel_size)
+                cd_wafer_nm = wafer_stats.get('cd_mean', 0.0)
+                if cd_wafer_nm <= 0:
+                    return 0.0
+                if target_nm is not None:
+                    cd_target_nm = target_nm
+                else:
+                    target_stats = compute_cd(
+                        self._target_image if self._target_image is not None else wafer_binary,
+                        pixel_size=pixel_size,
+                    )
+                    cd_target_nm = target_stats.get('cd_mean', cd_wafer_nm)
+            except Exception as e:
+                logger.debug(f"全局CD统计失败: {e}")
+                return 0.0
+
+        if cd_target_nm is None or cd_target_nm <= 0:
+            return 0.0
+
+        abs_error_nm = abs(cd_wafer_nm - cd_target_nm)
+        normalized_loss = (abs_error_nm ** 2) / (tolerance ** 2)
+        return float(normalized_loss)
+
+    def _compute_litho_epe_loss(self, wafer_binary: np.ndarray) -> float:
+        """
+        计算光刻 EPE 损失（基于晶圆与目标的边缘距离变换）
+
+        损失 = epe_mean / litho_epe_tolerance_nm（与MSE量级相当）
+
+        Args:
+            wafer_binary: 二值化晶圆图
+
+        Returns:
+            归一化的 EPE 损失
+        """
+        cfg = self.config
+        if self._target_image is None:
+            return 0.0
+        tolerance = max(cfg.litho_epe_tolerance_nm, 1e-6)
+        try:
+            target_bin = (self._target_image >= cfg.threshold).astype(np.float64)
+            wafer_bin = (wafer_binary >= cfg.threshold).astype(np.float64)
+            epe_stats = compute_epe(
+                wafer_bin, target_bin,
+                pixel_size=cfg.pixel_size,
+            )
+            epe_mean = epe_stats.get('epe_mean', 0.0)
+            return float(epe_mean / tolerance)
+        except Exception as e:
+            logger.debug(f"计算Litho EPE失败: {e}")
+            return 0.0
+
+    def _compute_cd_error_gradient_approx(self, aerial: np.ndarray, image: np.ndarray) -> np.ndarray:
+        """
+        CD偏差的近似梯度（基于边缘推动的启发式）
+
+        原理：当CD_wafer > CD_target时，边缘需向内收缩→在晶圆边缘附近的亮区(1)施加负梯度(向0推)；
+             当CD_wafer < CD_target时，边缘需向外扩张→在边缘附近的暗区(0)施加正梯度(向1推)。
+        梯度符号由全局CD偏差的符号决定，空间分布集中在过渡区（阈值附近）。
+
+        Args:
+            aerial: 空间像（未阈值化，用于确定过渡区和剂量缩放）
+            image: 用于损失计算的图像（aerial或wafer，可能已阈值化）
+
+        Returns:
+            近似梯度数组（shape=image.shape），量级 ~ O(1/npix) 便于与MSE梯度叠加
+        """
+        cfg = self.config
+        if self._target_image is None or self._last_cd_error_value <= 0:
+            return np.zeros_like(image)
+
+        threshold = cfg.threshold
+        try:
+            wafer_bin = (aerial >= threshold).astype(np.float64)
+            target_bin = (self._target_image >= threshold).astype(np.float64)
+            wafer_cd = compute_cd(wafer_bin, pixel_size=cfg.pixel_size)['cd_mean']
+            target_cd = compute_cd(target_bin, pixel_size=cfg.pixel_size)['cd_mean']
+            if target_cd <= 0:
+                return np.zeros_like(image)
+            sign = 1.0 if wafer_cd > target_cd else -1.0
+        except Exception:
+            sign = 1.0 if np.mean(image) > np.mean(self._target_image) else -1.0
+
+        # 过渡区域（阈值附近，对应边缘附近）
+        transition = np.exp(-((aerial - threshold) ** 2) / (2 * 0.05 ** 2))
+        # 边缘法线方向的梯度（简单版本：正梯度方向=亮区→暗区）
+        grad_y, grad_x = np.gradient(aerial.astype(np.float64))
+        edge_dir_mag = np.sqrt(grad_y ** 2 + grad_x ** 2 + 1e-10)
+        edge_weight = transition * edge_dir_mag / (edge_dir_mag.max() + 1e-10)
+
+        # 在亮区（wafer 1），如果CD过大（sign=1），施加负梯度推到0
+        in_bright = (aerial >= threshold).astype(np.float64)
+        in_dark = 1.0 - in_bright
+        error_map = sign * edge_weight * (in_bright - in_dark)
+
+        n_edges = max(int(np.sum(edge_weight > 0.01)), 1)
+        error_grad = error_map / n_edges
+        return error_grad.astype(np.float64)
+
+    def _compute_litho_epe_gradient_approx(self, aerial: np.ndarray) -> np.ndarray:
+        """
+        Litho EPE的近似梯度（使用可微soft EPE的梯度近似离散EPE的方向）
+
+        Args:
+            aerial: 空间像
+
+        Returns:
+            近似梯度数组
+        """
+        cfg = self.config
+        if self._target_image is None or self._last_litho_epe_value <= 0:
+            return np.zeros_like(aerial)
+
+        tolerance = max(cfg.litho_epe_tolerance_nm, 1e-6)
+        sigma = max(cfg.epe_sigma, 0.5)
+        try:
+            target_bin = (self._target_image >= cfg.threshold).astype(np.float64)
+            grad = soft_edge_placement_error_gradient(
+                aerial, target_bin, sigma=sigma
+            )
+            # 归一化到 ~O(1/npix) 量级，并缩放
+            n = max(aerial.size, 1)
+            scale = 1.0 / (tolerance * n * 0.01 + 1e-10)
+            return (grad * scale).astype(np.float64)
+        except Exception as e:
+            logger.debug(f"计算Litho EPE近似梯度失败: {e}")
+            return np.zeros_like(aerial)
 
     def _should_use_surrogate(self, for_evaluation: bool = False, for_gradient: bool = False) -> bool:
         """判断是否应该使用代理模型
@@ -1800,17 +2103,20 @@ class MaskOptimizer:
     def _compute_image_loss_components(self, image: np.ndarray,
                                        target: np.ndarray) -> CompositeLossComponents:
         """
-        针对单幅图像计算 MSE、(1-SSIM)、加权MSE/MAE 等逐像素损失分量（不含 PVB/正则化）
+        针对单幅图像计算 MSE、(1-SSIM)、加权MSE/MAE 等逐像素损失分量
+        以及计量指标（CD偏差、Litho EPE）损失分量（不含 PVB/正则化）
 
         Args:
             image: 处理后的成像结果
             target: 目标图像
 
         Returns:
-            CompositeLossComponents（填充 mse、ssim、weighted_mse、weighted_mae 字段）
+            CompositeLossComponents（填充 mse、ssim、weighted_mse、weighted_mae、
+            cd_error、litho_epe 字段）
         """
         comp = CompositeLossComponents()
         lw = self.config.loss_weights
+        cfg = self.config
 
         if lw.mse > 0:
             comp.mse = lw.mse * mse(image, target)
@@ -1824,6 +2130,22 @@ class MaskOptimizer:
             comp.weighted_mae = lw.weighted_mae * weighted_mae(
                 image, target, self._spatial_weight_mask
             )
+
+        if cfg.use_metrology_closed_loop and (lw.cd_error > 0 or lw.litho_epe > 0):
+            try:
+                wafer_bin = (image >= cfg.threshold).astype(np.float64)
+            except Exception:
+                wafer_bin = image
+
+            if lw.cd_error > 0:
+                cd_loss = self._compute_metrology_cd_error(wafer_bin)
+                comp.cd_error = lw.cd_error * cd_loss
+                self._last_cd_error_value = cd_loss
+
+            if lw.litho_epe > 0:
+                epe_loss = self._compute_litho_epe_loss(wafer_bin)
+                comp.litho_epe = lw.litho_epe * epe_loss
+                self._last_litho_epe_value = epe_loss
 
         return comp
 
@@ -1973,7 +2295,9 @@ class MaskOptimizer:
 
         image = self._prepare_image(aerial, dose)
         components = self._compute_image_loss_components(image, self._target_image)
-        loss = components.mse + components.ssim + components.weighted_mse + components.weighted_mae
+        loss = (components.mse + components.ssim
+                + components.weighted_mse + components.weighted_mae
+                + components.cd_error + components.litho_epe)
         return loss, image, components
 
     def _compute_single_condition_loss(self, mask: np.ndarray,
@@ -2199,6 +2523,14 @@ class MaskOptimizer:
                         image, self._target_image, self._spatial_weight_mask
                     )
 
+                if cfg.use_metrology_closed_loop:
+                    if lw.cd_error > 0:
+                        cd_approx_grad = self._compute_cd_error_gradient_approx(aerial, image)
+                        error_grad += lw.cd_error * cd_approx_grad
+                    if lw.litho_epe > 0:
+                        epe_approx_grad = self._compute_litho_epe_gradient_approx(aerial)
+                        error_grad += lw.litho_epe * epe_approx_grad
+
                 imaging_grad = self._multi_surrogate_compute_gradient(idx, mask)
                 if imaging_grad is None:
                     imaging_grad = model.compute_image_gradient(mask)
@@ -2254,6 +2586,13 @@ class MaskOptimizer:
                         error_grad += lw.weighted_mae * weighted_mae_gradient(
                             image, self._target_image, self._spatial_weight_mask
                         )
+                    if cfg.use_metrology_closed_loop:
+                        if lw.cd_error > 0:
+                            cd_approx_grad = self._compute_cd_error_gradient_approx(aerial, image)
+                            error_grad += lw.cd_error * cd_approx_grad
+                        if lw.litho_epe > 0:
+                            epe_approx_grad = self._compute_litho_epe_gradient_approx(aerial)
+                            error_grad += lw.litho_epe * epe_approx_grad
                     imaging_grad = self._multi_surrogate_compute_gradient(idx, mask)
                     if imaging_grad is None:
                         imaging_grad = model.compute_image_gradient(mask)
@@ -2497,6 +2836,14 @@ class MaskOptimizer:
                     image, self._target_image, self._spatial_weight_mask
                 )
 
+            if cfg.use_metrology_closed_loop:
+                if lw.cd_error > 0:
+                    cd_approx_grad = self._compute_cd_error_gradient_approx(aerial, image)
+                    error_grad += lw.cd_error * cd_approx_grad
+                if lw.litho_epe > 0:
+                    epe_approx_grad = self._compute_litho_epe_gradient_approx(aerial)
+                    error_grad += lw.litho_epe * epe_approx_grad
+
             imaging_grad = worst_model.compute_image_gradient(mask)
 
             if worst_cond.dose != 1.0:
@@ -2593,6 +2940,14 @@ class MaskOptimizer:
                     error_grad += lw.weighted_mae * weighted_mae_gradient(
                         image, self._target_image, self._spatial_weight_mask
                     )
+
+                if cfg.use_metrology_closed_loop:
+                    if lw.cd_error > 0:
+                        cd_approx_grad = self._compute_cd_error_gradient_approx(aerial, image)
+                        error_grad += lw.cd_error * cd_approx_grad
+                    if lw.litho_epe > 0:
+                        epe_approx_grad = self._compute_litho_epe_gradient_approx(aerial)
+                        error_grad += lw.litho_epe * epe_approx_grad
 
                 if cfg.use_wafer_image_loss:
                     threshold_grad = (aerial >= cfg.threshold).astype(np.float64)
@@ -2749,6 +3104,9 @@ class MaskOptimizer:
 
         self._setup_imaging_model(initial_mask.shape)
         self._setup_bandlimit_mask(initial_mask.shape)
+
+        # 初始化计量闭环反馈（解析测量线，预提取目标CD值）
+        self._setup_metrology_closed_loop(self._target_image)
 
         use_step_training = self._supports_step_training() and self.config.use_callbacks
 
@@ -3969,6 +4327,9 @@ class MultiLayerMaskOptimizer:
 
         self._setup_imaging_model(image_size)
         self._setup_source_optimization()
+
+        # 初始化计量闭环反馈（同时初始化主优化器和晶圆子优化器）
+        self._setup_metrology_closed_loop(self._target_image)
 
         if self.config.use_multi_process:
             self._setup_multi_process_models(image_size)

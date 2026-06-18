@@ -29,7 +29,7 @@ from core.imaging import (
     OpticalSystem, simulate_wafer_image,
     ProcessCondition
 )
-from core.litho_metrics import compute_epe, extract_edges
+from core.litho_metrics import compute_epe, extract_edges, compute_cd_error
 from core.metrics import edge_placement_error
 from algorithms.mask_optimizer import MaskOptimizer, OptimizationConfig
 from algorithms.callbacks import (
@@ -56,6 +56,8 @@ class HotspotRegion:
         center: 区域中心 (y, x)
         epe_mean: 该区域平均 EPE (nm)
         epe_max: 该区域最大 EPE (nm)
+        cd_error_mean: 该区域平均 CD 偏差 (nm，带符号，正=过大，负=过小)
+        cd_error_max: 该区域最大绝对值 CD 偏差 (nm)
         area: 区域面积（像素数）
         edge_type: 边缘类型 ('line_end', 'corner', 'inner_corner', 'general')
         priority: 校正优先级 (0-10，越高越紧急)
@@ -67,6 +69,8 @@ class HotspotRegion:
     area: int
     edge_type: str = 'general'
     priority: float = 5.0
+    cd_error_mean: float = 0.0
+    cd_error_max: float = 0.0
 
     @property
     def height(self) -> int:
@@ -82,6 +86,8 @@ class HotspotRegion:
             'center': list(self.center),
             'epe_mean': self.epe_mean,
             'epe_max': self.epe_max,
+            'cd_error_mean': self.cd_error_mean,
+            'cd_error_max': self.cd_error_max,
             'area': self.area,
             'edge_type': self.edge_type,
             'priority': self.priority,
@@ -185,6 +191,8 @@ class OPCIterationResult:
         wafer_after: 迭代后的晶圆成像（二值）
         epe_before: 迭代前 EPE 统计
         epe_after: 迭代后 EPE 统计
+        cd_error_before: 迭代前 CD 偏差统计（全局）
+        cd_error_after: 迭代后 CD 偏差统计（全局）
         hotspots_before: 迭代前检测到的热点
         hotspots_after: 迭代后剩余的热点
         transforms_applied: 本次应用的变换列表
@@ -201,6 +209,8 @@ class OPCIterationResult:
     epe_after: Dict[str, float]
     hotspots_before: List[HotspotRegion]
     hotspots_after: List[HotspotRegion]
+    cd_error_before: Dict[str, float] = field(default_factory=dict)
+    cd_error_after: Dict[str, float] = field(default_factory=dict)
     transforms_applied: List[OPCTransform] = field(default_factory=list)
     srafs_inserted: int = 0
 
@@ -214,11 +224,21 @@ class OPCIterationResult:
             return self.epe_improvement / self.epe_before['epe_mean']
         return 0.0
 
+    @property
+    def cd_error_mean_before(self) -> float:
+        return self.cd_error_before.get('cd_error_mean', 0.0)
+
+    @property
+    def cd_error_mean_after(self) -> float:
+        return self.cd_error_after.get('cd_error_mean', 0.0)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             'iteration': self.iteration,
             'epe_before': self.epe_before,
             'epe_after': self.epe_after,
+            'cd_error_before': self.cd_error_before,
+            'cd_error_after': self.cd_error_after,
             'hotspots_before_count': len(self.hotspots_before),
             'hotspots_after_count': len(self.hotspots_after),
             'transforms_count': len(self.transforms_applied),
@@ -300,6 +320,10 @@ class OPCConfig:
     Attributes:
         epe_threshold: EPE 热点判定阈值 (nm)
         epe_convergence_threshold: EPE 收敛阈值 (nm)
+        cd_error_threshold: CD 偏差热点判定阈值 (nm，绝对值) — 优先于 EPE
+        cd_error_convergence_threshold: CD 偏差收敛阈值 (nm)
+        use_cd_priority_hotspot: 是否优先使用 CD 偏差标记热点（True=CD优先，False=仅EPE）
+        cd_scan_step: CD 扫描线步长（像素），用于生成 CD 偏差图
         max_iterations: 最大迭代次数
         min_hotspot_area: 最小热点区域面积（像素）
         hotspot_dilation: 热点区域膨胀像素数
@@ -337,6 +361,10 @@ class OPCConfig:
     """
     epe_threshold: float = 3.0
     epe_convergence_threshold: float = 1.0
+    cd_error_threshold: float = 2.0
+    cd_error_convergence_threshold: float = 0.5
+    use_cd_priority_hotspot: bool = True
+    cd_scan_step: int = 2
     max_iterations: int = 10
     min_hotspot_area: int = 4
     hotspot_dilation: int = 2
@@ -394,6 +422,10 @@ class OPCConfig:
         return {
             'epe_threshold': self.epe_threshold,
             'epe_convergence_threshold': self.epe_convergence_threshold,
+            'cd_error_threshold': self.cd_error_threshold,
+            'cd_error_convergence_threshold': self.cd_error_convergence_threshold,
+            'use_cd_priority_hotspot': self.use_cd_priority_hotspot,
+            'cd_scan_step': self.cd_scan_step,
             'max_iterations': self.max_iterations,
             'min_hotspot_area': self.min_hotspot_area,
             'hotspot_dilation': self.hotspot_dilation,
@@ -487,10 +519,40 @@ class HotspotDetector:
             pixel_size=self.config.pixel_size
         )
 
+        cd_error_stats: Optional[Dict[str, float]] = None
+        if self.config.use_cd_priority_hotspot:
+            try:
+                cd_stats_h = compute_cd_error(
+                    wafer_binary, target,
+                    direction='horizontal',
+                    pixel_size=self.config.pixel_size
+                )
+                cd_stats_v = compute_cd_error(
+                    wafer_binary, target,
+                    direction='vertical',
+                    pixel_size=self.config.pixel_size
+                )
+                cd_error_stats = {
+                    'cd_error_mean_h': cd_stats_h.get('cd_error_mean', 0.0),
+                    'cd_error_mean_v': cd_stats_v.get('cd_error_mean', 0.0),
+                    'cd_wafer_mean_h': cd_stats_h.get('cd_wafer_mean', 0.0),
+                    'cd_target_mean_h': cd_stats_h.get('cd_target_mean', 0.0),
+                }
+            except Exception as e:
+                logger.debug(f"全局CD统计失败: {e}")
+
         if self.config.verbose:
-            logger.info(f"EPE 统计: mean={epe_stats['epe_mean']:.3f}nm, "
-                       f"max={epe_stats['epe_max']:.3f}nm, "
-                       f"std={epe_stats['epe_std']:.3f}nm")
+            epe_msg = f"EPE 统计: mean={epe_stats['epe_mean']:.3f}nm, max={epe_stats['epe_max']:.3f}nm"
+            if cd_error_stats is not None:
+                cd_msg = (
+                    f" | CD 偏差: H={cd_error_stats['cd_error_mean_h']:.3f}nm, "
+                    f"V={cd_error_stats['cd_error_mean_v']:.3f}nm, "
+                    f"晶圆CD(H)={cd_error_stats['cd_wafer_mean_h']:.3f}nm, "
+                    f"目标CD(H)={cd_error_stats['cd_target_mean_h']:.3f}nm"
+                )
+                logger.info(epe_msg + cd_msg)
+            else:
+                logger.info(epe_msg)
 
         hotspots = self._identify_hotspots(wafer_binary, target)
         hotspots = self._prioritize_hotspots(hotspots)
@@ -500,11 +562,61 @@ class HotspotDetector:
 
         return hotspots
 
+    def _compute_cd_error_map(self,
+                              wafer_binary: np.ndarray,
+                              target_binary: np.ndarray) -> np.ndarray:
+        """
+        计算近似的逐像素 CD 偏差图（单位 nm）
+
+        原理：使用"边缘带符号距离"之差近似局部线宽差：
+            - 对亮区内部像素，线宽的一半 ≈ 到最近边缘的距离
+            - 因此，CD 偏差 ≈ 2 * (d_target_inner - d_wafer_inner) （在边缘附近有效）
+        CD > 0：晶圆 CD 大于目标 CD；CD < 0：晶圆 CD 小于目标 CD
+
+        Args:
+            wafer_binary: 晶圆二值图
+            target_binary: 目标二值图
+
+        Returns:
+            cd_error_map: 逐像素 CD 偏差图 (nm)，非边缘附近像素为 0
+        """
+        ps = self.config.pixel_size
+
+        wafer_edge = extract_edges(wafer_binary)
+        target_edge = extract_edges(target_binary)
+
+        dist_to_wafer = distance_transform_edt(1.0 - (wafer_edge > 0.5)) * ps
+        dist_to_target = distance_transform_edt(1.0 - (target_edge > 0.5)) * ps
+
+        wafer_inner = (wafer_binary >= 0.5).astype(np.float64)
+        target_inner = (target_binary >= 0.5).astype(np.float64)
+
+        # 带符号距离：内部取负（线宽的一半取正值），外部取正
+        signed_wafer = np.where(wafer_inner > 0.5, dist_to_wafer, -dist_to_wafer)
+        signed_target = np.where(target_inner > 0.5, dist_to_target, -dist_to_target)
+
+        # 在目标边缘附近，计算局部 CD 偏差近似
+        # 局部 CD ≈ 两个相对边缘的带符号距离之差，在单个边缘附近近似为 2 * |signed_dist|
+        edge_band = dist_to_target < (5.0 * ps)
+
+        # 近似 CD 偏差 = 2 * (|signed_target| - |signed_wafer|) （目标边缘附近）
+        cd_approx = 2.0 * (np.abs(signed_target) - np.abs(signed_wafer))
+        cd_error_map = np.where(edge_band, cd_approx, 0.0)
+
+        return cd_error_map.astype(np.float64)
+
     def _identify_hotspots(self,
                           wafer_binary: np.ndarray,
                           target_binary: np.ndarray) -> List[HotspotRegion]:
         """
-        识别热点区域
+        识别热点区域（CD 偏差优先于 EPE）
+
+        工作流程：
+            1. 计算 EPE 距离图（像素 → nm）
+            2. 计算 CD 偏差近似图（逐像素 CD 偏差，nm）
+            3. CD 偏差超阈值的像素 → 高优先级热点（始终标记）
+            4. EPE 超阈值且 CD 不超的像素 → 常规热点
+            5. 合并后进行连通域分析和属性统计
 
         Args:
             wafer_binary: 晶圆二值图
@@ -519,8 +631,9 @@ class HotspotDetector:
         if np.sum(target_edge) == 0 and np.sum(wafer_edge) == 0:
             return []
 
-        dist_to_wafer = distance_transform_edt(1.0 - wafer_edge)
-        dist_to_target = distance_transform_edt(1.0 - target_edge)
+        # ==== 1. 计算 EPE 距离图 ====
+        dist_to_wafer = distance_transform_edt(1.0 - (wafer_edge > 0.5))
+        dist_to_target = distance_transform_edt(1.0 - (target_edge > 0.5))
 
         epe_map = np.zeros_like(wafer_binary)
         wafer_mask = wafer_edge > 0.5
@@ -529,11 +642,25 @@ class HotspotDetector:
         epe_map[target_mask] = np.maximum(epe_map[target_mask], dist_to_wafer[target_mask])
 
         epe_map_nm = epe_map * self.config.pixel_size
-        hotspot_mask = epe_map_nm >= self.config.epe_threshold
+
+        # ==== 2. 计算 CD 偏差图 ====
+        cd_error_map_nm = self._compute_cd_error_map(wafer_binary, target_binary)
+        cd_abs_map_nm = np.abs(cd_error_map_nm)
+
+        # ==== 3. 热点判定（CD 偏差优先） ====
+        cd_hotspot_mask = cd_abs_map_nm >= self.config.cd_error_threshold
+        epe_hotspot_mask = epe_map_nm >= self.config.epe_threshold
+
+        if self.config.use_cd_priority_hotspot:
+            # CD 超阈值的像素始终标记；EPE 超阈值且 CD 未超的像素也标记
+            hotspot_mask = cd_hotspot_mask | epe_hotspot_mask
+        else:
+            hotspot_mask = epe_hotspot_mask
 
         if self.config.hotspot_dilation > 0:
             struct = generate_binary_structure(2, 2)
             hotspot_mask = binary_dilation(hotspot_mask, struct, iterations=self.config.hotspot_dilation)
+            cd_hotspot_mask = binary_dilation(cd_hotspot_mask, struct, iterations=self.config.hotspot_dilation)
 
         labeled, num_features = label(hotspot_mask)
 
@@ -561,17 +688,38 @@ class HotspotDetector:
             epe_mean = float(np.mean(region_epe))
             epe_max = float(np.max(region_epe))
 
+            # 统计该区域的 CD 偏差（仅统计边缘附近像素，即 cd_abs_map_nm > 0 的像素）
+            region_cd_pixels = cd_abs_map_nm[region_mask]
+            valid_cd_mask = region_cd_pixels > 0
+            if np.any(valid_cd_mask):
+                region_cd_values = cd_error_map_nm[region_mask]
+                valid_cd_values = region_cd_values[valid_cd_mask]
+                cd_error_mean = float(np.mean(valid_cd_values))
+                cd_error_max = float(np.max(np.abs(valid_cd_values)))
+            else:
+                cd_error_mean = 0.0
+                cd_error_max = 0.0
+
             cy = (y_min + y_max) / 2.0
             cx = (x_min + x_max) / 2.0
             center = (cy, cx)
 
             edge_type = self._classify_edge_type(target_binary, bbox)
 
+            # 若该区域含 CD 偏差超阈值像素，在 edge_type 中标记以便优先级计算
+            cd_flagged = bool(np.any(cd_hotspot_mask[region_mask]))
+            if cd_flagged and edge_type == 'general':
+                edge_type = 'cd_critical'
+            elif cd_flagged:
+                edge_type = edge_type  # 保持原类型，在优先级中用 cd_error 评分
+
             hotspot = HotspotRegion(
                 bbox=bbox,
                 center=center,
                 epe_mean=epe_mean,
                 epe_max=epe_max,
+                cd_error_mean=cd_error_mean,
+                cd_error_max=cd_error_max,
                 area=area,
                 edge_type=edge_type
             )
@@ -645,7 +793,13 @@ class HotspotDetector:
 
     def _prioritize_hotspots(self, hotspots: List[HotspotRegion]) -> List[HotspotRegion]:
         """
-        为热点分配优先级并排序
+        为热点分配优先级并排序（CD 偏差优先于 EPE）
+
+        优先级公式（CD 偏差得分权重最高 0.5）：
+            priority = 0.5 * cd_error_score
+                     + 0.30 * epe_score
+                     + 0.15 * type_score
+                     + 0.05 * area_score
 
         Args:
             hotspots: 热点列表
@@ -654,17 +808,37 @@ class HotspotDetector:
             按优先级排序的热点列表
         """
         type_weight = {
-            'line_end': 10.0,
-            'corner': 8.0,
-            'inner_corner': 9.0,
-            'general': 5.0,
+            'cd_critical': 10.0,
+            'line_end': 9.0,
+            'inner_corner': 8.5,
+            'corner': 7.5,
+            'general': 4.0,
         }
 
         for hotspot in hotspots:
-            epe_score = min(10.0, hotspot.epe_max / self.config.epe_threshold * 5.0)
-            type_score = type_weight.get(hotspot.edge_type, 5.0)
+            # ---- CD 偏差得分（权重 0.5，最高优先级） ----
+            cd_threshold = max(self.config.cd_error_threshold, 1e-6)
+            cd_ratio = hotspot.cd_error_max / cd_threshold
+            cd_error_score = min(10.0, 3.0 * cd_ratio + 2.0 * (hotspot.cd_error_max > 0))
+            if hotspot.edge_type == 'cd_critical':
+                cd_error_score = max(cd_error_score, 8.0)
+
+            # ---- EPE 得分（权重 0.30） ----
+            epe_threshold = max(self.config.epe_threshold, 1e-6)
+            epe_score = min(10.0, hotspot.epe_max / epe_threshold * 5.0)
+
+            # ---- 边缘类型得分（权重 0.15） ----
+            type_score = type_weight.get(hotspot.edge_type, 4.0)
+
+            # ---- 区域面积得分（权重 0.05） ----
             area_score = min(5.0, np.log10(hotspot.area + 1) * 2.0)
-            hotspot.priority = 0.5 * epe_score + 0.3 * type_score + 0.2 * area_score
+
+            hotspot.priority = (
+                0.50 * cd_error_score
+                + 0.30 * epe_score
+                + 0.15 * type_score
+                + 0.05 * area_score
+            )
 
         hotspots.sort(key=lambda h: h.priority, reverse=True)
         return hotspots
@@ -1517,7 +1691,14 @@ class OPCIterationController:
                          iteration_result: OPCIterationResult,
                          prev_result: Optional[OPCIterationResult]) -> Tuple[bool, str]:
         """
-        检查收敛条件
+        检查收敛条件（CD 偏差收敛判据优先于 EPE）
+
+        收敛判据优先级：
+            1. CD 偏差均值 ≤ cd_error_convergence_threshold（最高优先级）
+            2. EPE 均值 ≤ epe_convergence_threshold
+            3. 所有热点消除
+            4. CD/EPE 改善停滞
+            5. 达到最大迭代次数
 
         Args:
             iteration_result: 当前迭代结果
@@ -1526,6 +1707,18 @@ class OPCIterationController:
         Returns:
             (是否收敛, 终止原因)
         """
+        # ---- CD 偏差收敛（最高优先级，Fab 真实可测指标） ----
+        if iteration_result.cd_error_after:
+            cd_error_mean_after = iteration_result.cd_error_after.get('cd_error_mean', None)
+            if cd_error_mean_after is not None:
+                if abs(cd_error_mean_after) <= self.config.cd_error_convergence_threshold:
+                    return (
+                        True,
+                        f"CD 偏差已收敛到阈值以下: "
+                        f"|{cd_error_mean_after:.3f}| nm <= "
+                        f"{self.config.cd_error_convergence_threshold} nm"
+                    )
+
         epe_mean = iteration_result.epe_after['epe_mean']
         if epe_mean <= self.config.epe_convergence_threshold:
             return True, f"EPE 已收敛到阈值以下: {epe_mean:.3f} nm <= {self.config.epe_convergence_threshold} nm"
@@ -1536,7 +1729,19 @@ class OPCIterationController:
         if prev_result is not None:
             prev_epe = prev_result.epe_after['epe_mean']
             improvement = prev_epe - epe_mean
-            if improvement < self.config.epe_convergence_threshold * 0.1:
+            cd_improvement_stagnant = improvement < self.config.epe_convergence_threshold * 0.1
+
+            # 同时检查 CD 偏差改善停滞
+            cd_stagnant = True
+            if (iteration_result.cd_error_after and prev_result.cd_error_after):
+                prev_cd = abs(prev_result.cd_error_after.get('cd_error_mean', 0.0))
+                curr_cd = abs(iteration_result.cd_error_after.get('cd_error_mean', 0.0))
+                cd_delta = prev_cd - curr_cd
+                cd_stagnant = cd_delta < self.config.cd_error_convergence_threshold * 0.1
+
+            if cd_improvement_stagnant and cd_stagnant:
+                return True, f"CD偏差与EPE改善均停滞: EPE改善{improvement:.4f}nm, CD改善{cd_delta:.4f}nm"
+            elif cd_improvement_stagnant:
                 return True, f"EPE 改善停滞: {improvement:.4f} nm < 阈值"
 
             if iteration_result.iteration >= self.config.max_iterations:
