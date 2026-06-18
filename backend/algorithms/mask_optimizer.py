@@ -188,6 +188,131 @@ class LossWeights:
 
 
 @dataclass
+class BandlimitConstraintConfig:
+    """
+    频域带限约束配置（制造约束联动）
+
+    匹配掩模写入机的空间频率上限，确保优化结果可制造。
+    可基于物理参数（像素尺寸、最小线宽）自动计算截止频率。
+    支持与 TV/曼哈顿惩罚协同工作，形成"硬约束+软约束"的可制造性保障。
+
+    Attributes:
+        enable: 是否启用频域带限约束
+        type: 带限类型: 'lowpass', 'circular', 'rectangular', 'directional', 'custom'
+        outer_radius: 外截止半径（归一化0-1），当 auto_detect=False 时使用
+        inner_radius: 内截止半径（归一化0-1），仅 bandpass/bandstop 使用
+        fx_range: 矩形带通x方向频率范围 (low, high)
+        fy_range: 矩形带通y方向频率范围 (low, high)
+        angle_range: 方向带通角度范围 (min, max)，单位弧度
+        smooth: 是否使用平滑（巴特沃斯）过渡
+        order: 巴特沃斯滤波器阶数（smooth=True时有效）
+        preserve_dc: 是否保留直流分量
+        project_gradient: 是否对梯度也施加频域投影
+        projection_freq: 投影频率（每N次迭代投影一次），1表示每步都投影
+        auto_detect: 是否基于制造参数自动计算带限参数
+        min_linewidth_nm: 最小线宽（nm），用于自动计算截止频率
+        pixel_size_nm: 像素尺寸（nm），用于自动计算截止频率
+        custom_mask: 自定义频域掩模（type='custom'时使用）
+
+        # 与正则化惩罚的协同配置
+        synergistic_regularization: 是否启用与正则化的协同模式
+        tv_scale_factor: 启用带限时TV正则化强度的缩放因子（<1表示减弱TV，因为带限已有平滑效果）
+        manhattan_scale_factor: 启用带限时曼哈顿惩罚强度的缩放因子
+        apply_bandlimit_before_regularization: 带限投影是否在正则化梯度之前应用
+    """
+    enable: bool = False
+    type: str = 'lowpass'  # 'lowpass', 'circular', 'rectangular', 'directional', 'custom'
+    outer_radius: float = 0.5
+    inner_radius: float = 0.0
+    fx_range: Tuple[float, float] = (0.0, 0.5)
+    fy_range: Tuple[float, float] = (0.0, 0.5)
+    angle_range: Tuple[float, float] = (0.0, 2 * np.pi)
+    smooth: bool = False
+    order: int = 4
+    preserve_dc: bool = True
+    project_gradient: bool = False
+    projection_freq: int = 1
+    auto_detect: bool = False
+    min_linewidth_nm: Optional[float] = None
+    pixel_size_nm: Optional[float] = None
+    custom_mask: Any = None
+
+    # 协同正则化配置
+    synergistic_regularization: bool = True
+    tv_scale_factor: float = 0.5
+    manhattan_scale_factor: float = 1.0
+    apply_bandlimit_before_regularization: bool = True
+
+    @classmethod
+    def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'BandlimitConstraintConfig':
+        """从字典创建，缺失键使用默认值"""
+        if d is None:
+            return cls()
+        cfg = cls()
+        for key, value in d.items():
+            if hasattr(cfg, key):
+                if key in ('fx_range', 'fy_range', 'angle_range') and isinstance(value, list):
+                    setattr(cfg, key, tuple(value))
+                else:
+                    setattr(cfg, key, value)
+        return cfg
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {}
+        for f in self.__dataclass_fields__.values():
+            val = getattr(self, f.name)
+            if f.name == 'custom_mask' and val is not None:
+                result[f.name] = 'custom_mask_placeholder'
+            else:
+                result[f.name] = val
+        return result
+
+    def compute_cutoff_from_manufacturing(self, shape: Tuple[int, int]) -> float:
+        """
+        基于制造参数计算归一化截止频率
+
+        根据掩模写入机的最小线宽和像素尺寸，计算空间频率上限，
+        转换为归一化频率（0-1，1对应奈奎斯特频率）。
+
+        原理: 最小线宽 w_min 对应最高空间频率 f_max = 1/(2*w_min)
+              奈奎斯特频率 f_nyquist = 1/(2*pixel_size)
+              归一化截止频率 = f_max / f_nyquist = pixel_size / w_min
+
+        Args:
+            shape: 图像尺寸 (height, width)
+
+        Returns:
+            归一化截止频率（0-1）
+        """
+        if not self.auto_detect:
+            return self.outer_radius
+
+        if self.min_linewidth_nm is None or self.pixel_size_nm is None:
+            logger.warning(
+                "auto_detect=True 但 min_linewidth_nm 或 pixel_size_nm 未设置，"
+                "使用默认 outer_radius"
+            )
+            return self.outer_radius
+
+        pixel_size = self.pixel_size_nm
+        min_w = self.min_linewidth_nm
+
+        if min_w <= 0 or pixel_size <= 0:
+            raise ValueError("min_linewidth_nm 和 pixel_size_nm 必须大于0")
+
+        cutoff = pixel_size / min_w
+        cutoff = min(max(cutoff, 0.0), 1.0)
+
+        logger.info(
+            f"基于制造参数自动计算频带限制: "
+            f"最小线宽={min_w}nm, 像素尺寸={pixel_size}nm, "
+            f"归一化截止频率={cutoff:.4f}"
+        )
+
+        return cutoff
+
+
+@dataclass
 class RegularizationConfig:
     """
     正则化配置
@@ -198,29 +323,37 @@ class RegularizationConfig:
               'min_feature_morph', 'min_feature_freq', 'min_feature_combined', None
         strength: 正则化强度系数
         params: 额外参数字典（如 min_size, sigma 等）
+        bandlimit: 频域带限约束配置（制造约束联动）
     """
     type: Optional[str] = None  # 'l1', 'l2', 'tv', 'tv_isotropic', 'manhattan',
                                  # 'binary_entropy', 'epe', 'epe_soft',
                                  # 'min_feature_morph', 'min_feature_freq', 'min_feature_combined'
     strength: float = 0.0
     params: Dict[str, Any] = field(default_factory=dict)
+    bandlimit: BandlimitConstraintConfig = field(default_factory=BandlimitConstraintConfig)
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'RegularizationConfig':
         """从字典创建，缺失键使用默认值"""
         if d is None:
             return cls()
-        return cls(
-            type=d.get('type', None),
-            strength=float(d.get('strength', 0.0)),
-            params=dict(d.get('params', {}))
-        )
+        cfg = cls()
+        if 'type' in d:
+            cfg.type = d.get('type', None)
+        if 'strength' in d:
+            cfg.strength = float(d.get('strength', 0.0))
+        if 'params' in d:
+            cfg.params = dict(d.get('params', {}))
+        if 'bandlimit' in d:
+            cfg.bandlimit = BandlimitConstraintConfig.from_dict(d.get('bandlimit'))
+        return cfg
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             'type': self.type,
             'strength': self.strength,
-            'params': self.params
+            'params': self.params,
+            'bandlimit': self.bandlimit.to_dict()
         }
 
 
@@ -681,6 +814,7 @@ class MaskOptimizer:
         self._trainer_state: Optional[TrainerState] = None
 
         self._bandlimit_mask: Optional[np.ndarray] = None
+        self._bandlimit_config: Optional[BandlimitConstraintConfig] = None
 
         # 计量闭环反馈状态
         self._metrology_lines_parsed: Optional[List[MeasurementLine]] = None  # 解析后的测量线
@@ -688,16 +822,56 @@ class MaskOptimizer:
         self._last_cd_error_value: float = 0.0  # 最近一次的CD误差值（用于梯度回退）
         self._last_litho_epe_value: float = 0.0  # 最近一次的Litho EPE值
 
+    def _get_effective_bandlimit_config(self) -> Optional[BandlimitConstraintConfig]:
+        """
+        获取生效的频域带限配置
+
+        优先级: RegularizationConfig.bandlimit > OptimizationConfig 频域配置
+        当 RegularizationConfig.bandlimit.enable=True 时，优先使用该配置；
+        否则回退到 OptimizationConfig.use_frequency_bandlimit 配置。
+
+        Returns:
+            生效的 BandlimitConstraintConfig，未启用时返回 None
+        """
+        opt_cfg = self.config
+        reg_cfg = opt_cfg.regularization
+
+        if reg_cfg.bandlimit.enable:
+            return reg_cfg.bandlimit
+
+        if opt_cfg.use_frequency_bandlimit:
+            bl_cfg = BandlimitConstraintConfig()
+            bl_cfg.enable = True
+            bl_cfg.type = opt_cfg.bandlimit_type
+            bl_cfg.inner_radius = opt_cfg.bandlimit_inner_radius
+            bl_cfg.outer_radius = opt_cfg.bandlimit_outer_radius
+            bl_cfg.fx_range = opt_cfg.bandlimit_fx_range
+            bl_cfg.fy_range = opt_cfg.bandlimit_fy_range
+            bl_cfg.angle_range = opt_cfg.bandlimit_angle_range
+            bl_cfg.smooth = opt_cfg.bandlimit_smooth
+            bl_cfg.order = opt_cfg.bandlimit_order
+            bl_cfg.preserve_dc = opt_cfg.bandlimit_preserve_dc
+            bl_cfg.projection_freq = opt_cfg.bandlimit_projection_freq
+            bl_cfg.project_gradient = opt_cfg.bandlimit_project_gradient
+            bl_cfg.custom_mask = opt_cfg.bandlimit_custom_mask
+            return bl_cfg
+
+        return None
+
     def _setup_bandlimit_mask(self, image_size: tuple):
         """设置频域带限约束掩模"""
-        cfg = self.config
-        if not cfg.use_frequency_bandlimit:
+        bl_cfg = self._get_effective_bandlimit_config()
+        if bl_cfg is None or not bl_cfg.enable:
             self._bandlimit_mask = None
+            self._bandlimit_config = None
             return
 
+        self._bandlimit_config = bl_cfg
+
         try:
-            custom_mask = cfg.bandlimit_custom_mask
-            if (cfg.bandlimit_type.lower() == 'custom'
+            custom_mask = bl_cfg.custom_mask
+            bl_type_lower = bl_cfg.type.lower()
+            if (bl_type_lower == 'custom'
                 and custom_mask is not None):
                 if custom_mask.shape != tuple(image_size):
                     logger.warning(
@@ -709,43 +883,74 @@ class MaskOptimizer:
                     sx = image_size[1] / custom_mask.shape[1]
                     custom_mask = zoom(custom_mask, (sy, sx), order=1)
 
+            outer_radius = bl_cfg.compute_cutoff_from_manufacturing(image_size)
+            inner_radius = bl_cfg.inner_radius
+
             self._bandlimit_mask = create_bandlimit_mask(
                 shape=image_size,
-                bandlimit_type=cfg.bandlimit_type,
-                inner_radius=cfg.bandlimit_inner_radius,
-                outer_radius=cfg.bandlimit_outer_radius,
-                fx_range=cfg.bandlimit_fx_range,
-                fy_range=cfg.bandlimit_fy_range,
-                angle_range=cfg.bandlimit_angle_range,
-                smooth=cfg.bandlimit_smooth,
-                order=cfg.bandlimit_order,
-                custom_mask=custom_mask if cfg.bandlimit_type.lower() == 'custom' else None
+                bandlimit_type=bl_cfg.type,
+                inner_radius=inner_radius,
+                outer_radius=outer_radius,
+                fx_range=bl_cfg.fx_range,
+                fy_range=bl_cfg.fy_range,
+                angle_range=bl_cfg.angle_range,
+                smooth=bl_cfg.smooth,
+                order=bl_cfg.order,
+                custom_mask=custom_mask if bl_type_lower == 'custom' else None
             )
             logger.info(
-                f"频域带限投影已启用: 类型={cfg.bandlimit_type}, "
-                f"内半径={cfg.bandlimit_inner_radius}, "
-                f"外半径={cfg.bandlimit_outer_radius}"
+                f"频域带限投影已启用: 类型={bl_cfg.type}, "
+                f"内半径={inner_radius:.4f}, "
+                f"外半径={outer_radius:.4f}"
+                + (f" (基于制造参数自动计算)" if bl_cfg.auto_detect else "")
             )
         except Exception as e:
             logger.warning(f"创建频域带限掩模失败，跳过频域约束: {e}")
             self._bandlimit_mask = None
+            self._bandlimit_config = None
 
     def _apply_bandlimit_projection(self, mask: np.ndarray) -> np.ndarray:
         """应用频域带限投影"""
         if self._bandlimit_mask is None:
             return mask
+        preserve_dc = True
+        if self._bandlimit_config is not None:
+            preserve_dc = self._bandlimit_config.preserve_dc
+        else:
+            preserve_dc = self.config.bandlimit_preserve_dc
         return bandlimit_projection(
             mask,
             self._bandlimit_mask,
-            preserve_dc=self.config.bandlimit_preserve_dc
+            preserve_dc=preserve_dc
         )
 
     def _apply_gradient_bandlimit(self, gradient: np.ndarray) -> np.ndarray:
         """对梯度应用频域带限投影"""
-        if (self._bandlimit_mask is None
-            or not self.config.bandlimit_project_gradient):
+        if self._bandlimit_mask is None:
+            return gradient
+
+        project_gradient = False
+        if self._bandlimit_config is not None:
+            project_gradient = self._bandlimit_config.project_gradient
+        else:
+            project_gradient = self.config.bandlimit_project_gradient
+
+        if not project_gradient:
             return gradient
         return bandlimited_gradient_projection(gradient, self._bandlimit_mask)
+
+    def _should_apply_bandlimit_this_epoch(self, epoch: int) -> bool:
+        """判断当前迭代是否应该应用带限投影"""
+        if self._bandlimit_mask is None:
+            return False
+
+        proj_freq = 1
+        if self._bandlimit_config is not None:
+            proj_freq = max(1, self._bandlimit_config.projection_freq)
+        else:
+            proj_freq = max(1, self.config.bandlimit_projection_freq)
+
+        return epoch % proj_freq == 0
 
     # ------------------------------------------------------------------
     # 计量闭环反馈辅助方法
@@ -1801,8 +2006,7 @@ class MaskOptimizer:
 
             x_new = self._clip_to_bounds(x_new)
 
-            proj_freq = max(1, self.config.bandlimit_projection_freq)
-            if epoch % proj_freq == 0:
+            if self._should_apply_bandlimit_this_epoch(epoch):
                 x_new = self._apply_bandlimit_projection(x_new)
                 x_new = self._clip_to_bounds(x_new)
 
@@ -1982,9 +2186,39 @@ class MaskOptimizer:
             return _apply_threshold_for_loss(aerial, self.config.threshold)
         return aerial
 
+    def _get_regularization_scale_factor(self, reg_type: str) -> float:
+        """
+        获取正则化强度的缩放因子（用于与带限约束协同）
+
+        当启用带限约束且 synergistic_regularization=True 时，
+        根据正则化类型返回相应的缩放因子：
+        - TV类正则化：由于带限投影本身有平滑效果，可适当减弱TV
+        - 曼哈顿惩罚：通常保持或增强，以确保二值化
+
+        Args:
+            reg_type: 正则化类型
+
+        Returns:
+            缩放因子
+        """
+        bl_cfg = self._bandlimit_config
+        if bl_cfg is None or not bl_cfg.enable or not bl_cfg.synergistic_regularization:
+            return 1.0
+
+        reg_type_lower = reg_type.lower()
+
+        if reg_type_lower in ('tv', 'tv_isotropic', 'mask_complexity', 'tv_smooth'):
+            return bl_cfg.tv_scale_factor
+        elif reg_type_lower in ('manhattan', 'binary_penalty', 'binary_entropy'):
+            return bl_cfg.manhattan_scale_factor
+
+        return 1.0
+
     def _compute_regularization_loss(self, mask: np.ndarray) -> float:
         """
         计算正则化项损失
+
+        支持与频域带限约束协同：当启用带限时，TV类正则化强度会自动缩放。
 
         Args:
             mask: 掩模图案
@@ -1999,42 +2233,45 @@ class MaskOptimizer:
         params = reg_cfg.params
         reg_type = reg_cfg.type.lower()
 
+        scale = self._get_regularization_scale_factor(reg_type)
+        effective_strength = reg_cfg.strength * scale
+
         if reg_type == 'l1':
-            return reg_cfg.strength * l1_regularization(mask)
+            return effective_strength * l1_regularization(mask)
         elif reg_type == 'l2':
-            return reg_cfg.strength * l2_regularization(mask)
+            return effective_strength * l2_regularization(mask)
         elif reg_type == 'tv':
-            return reg_cfg.strength * tv_regularization(mask)
+            return effective_strength * tv_regularization(mask)
         elif reg_type == 'tv_isotropic':
-            return reg_cfg.strength * total_variation_isotropic(mask)
+            return effective_strength * total_variation_isotropic(mask)
         elif reg_type == 'manhattan':
-            return reg_cfg.strength * manhattan_distance_penalty(mask)
+            return effective_strength * manhattan_distance_penalty(mask)
         elif reg_type == 'binary_entropy':
-            return reg_cfg.strength * binary_entropy_penalty(mask)
+            return effective_strength * binary_entropy_penalty(mask)
         elif reg_type == 'epe':
             epe_threshold = params.get('threshold', self.config.epe_threshold)
             pixel_size = params.get('pixel_size', self.config.pixel_size)
-            return reg_cfg.strength * edge_placement_error(
+            return effective_strength * edge_placement_error(
                 mask, self._target_image, epe_threshold, pixel_size
             )
         elif reg_type == 'epe_soft':
             sigma = params.get('sigma', self.config.epe_sigma)
             pixel_size = params.get('pixel_size', self.config.pixel_size)
-            return reg_cfg.strength * soft_edge_placement_error(
+            return effective_strength * soft_edge_placement_error(
                 mask, self._target_image, sigma, pixel_size
             )
         elif reg_type == 'min_feature_morph':
             min_size = params.get('min_size', self.config.min_feature_size)
-            return reg_cfg.strength * soft_min_feature_size_morphology(mask, min_size)
+            return effective_strength * soft_min_feature_size_morphology(mask, min_size)
         elif reg_type == 'min_feature_freq':
             min_size = params.get('min_size', self.config.min_feature_size)
             pixel_size = params.get('pixel_size', self.config.pixel_size)
-            return reg_cfg.strength * min_feature_size_frequency(mask, min_size, pixel_size)
+            return effective_strength * min_feature_size_frequency(mask, min_size, pixel_size)
         elif reg_type == 'min_feature_combined':
             min_size = params.get('min_size', self.config.min_feature_size)
             pixel_size = params.get('pixel_size', self.config.pixel_size)
             alpha = params.get('alpha', self.config.min_feature_alpha)
-            return reg_cfg.strength * min_feature_size_combined(
+            return effective_strength * min_feature_size_combined(
                 mask, min_size, pixel_size, alpha
             )
         else:
@@ -2044,6 +2281,8 @@ class MaskOptimizer:
     def _compute_regularization_gradient(self, mask: np.ndarray) -> np.ndarray:
         """
         计算正则化项的梯度
+
+        支持与频域带限约束协同：当启用带限时，TV类正则化强度会自动缩放。
 
         Args:
             mask: 掩模图案
@@ -2058,43 +2297,46 @@ class MaskOptimizer:
         params = reg_cfg.params
         reg_type = reg_cfg.type.lower()
 
+        scale = self._get_regularization_scale_factor(reg_type)
+        effective_strength = reg_cfg.strength * scale
+
         if reg_type == 'l1':
-            return reg_cfg.strength * l1_regularization_gradient(mask)
+            return effective_strength * l1_regularization_gradient(mask)
         elif reg_type == 'l2':
-            return reg_cfg.strength * l2_regularization_gradient(mask)
+            return effective_strength * l2_regularization_gradient(mask)
         elif reg_type == 'tv':
-            return reg_cfg.strength * tv_regularization_gradient(mask)
+            return effective_strength * tv_regularization_gradient(mask)
         elif reg_type == 'tv_isotropic':
-            return reg_cfg.strength * total_variation_isotropic_gradient(mask)
+            return effective_strength * total_variation_isotropic_gradient(mask)
         elif reg_type == 'manhattan':
-            return reg_cfg.strength * manhattan_distance_penalty_gradient(mask)
+            return effective_strength * manhattan_distance_penalty_gradient(mask)
         elif reg_type == 'binary_entropy':
-            return reg_cfg.strength * binary_entropy_penalty_gradient(mask)
+            return effective_strength * binary_entropy_penalty_gradient(mask)
         elif reg_type == 'epe':
             epe_threshold = params.get('threshold', self.config.epe_threshold)
             eps = params.get('eps', 1e-5)
-            return reg_cfg.strength * edge_placement_error_gradient(
+            return effective_strength * edge_placement_error_gradient(
                 mask, self._target_image, epe_threshold, eps
             )
         elif reg_type == 'epe_soft':
             sigma = params.get('sigma', self.config.epe_sigma)
-            return reg_cfg.strength * soft_edge_placement_error_gradient(
+            return effective_strength * soft_edge_placement_error_gradient(
                 mask, self._target_image, sigma
             )
         elif reg_type == 'min_feature_morph':
             min_size = params.get('min_size', self.config.min_feature_size)
-            return reg_cfg.strength * soft_min_feature_size_morphology_gradient(mask, min_size)
+            return effective_strength * soft_min_feature_size_morphology_gradient(mask, min_size)
         elif reg_type == 'min_feature_freq':
             min_size = params.get('min_size', self.config.min_feature_size)
             pixel_size = params.get('pixel_size', self.config.pixel_size)
-            return reg_cfg.strength * min_feature_size_frequency_gradient(
+            return effective_strength * min_feature_size_frequency_gradient(
                 mask, min_size, pixel_size
             )
         elif reg_type == 'min_feature_combined':
             min_size = params.get('min_size', self.config.min_feature_size)
             pixel_size = params.get('pixel_size', self.config.pixel_size)
             alpha = params.get('alpha', self.config.min_feature_alpha)
-            return reg_cfg.strength * min_feature_size_combined_gradient(
+            return effective_strength * min_feature_size_combined_gradient(
                 mask, min_size, pixel_size, alpha
             )
         else:
@@ -2153,6 +2395,8 @@ class MaskOptimizer:
         """
         计算掩模约束项（二值化惩罚、TV平滑、EPE、最小特征尺寸）
 
+        支持与频域带限约束协同：当启用带限时，TV类和二值化惩罚强度会自动缩放。
+
         Args:
             mask: 掩模图案
 
@@ -2164,13 +2408,17 @@ class MaskOptimizer:
         cfg = self.config
 
         if lw.binary_penalty > 0:
+            binary_scale = self._get_regularization_scale_factor('binary_penalty')
+            effective_binary_weight = lw.binary_penalty * binary_scale
             if cfg.binary_penalty_type == 'entropy':
-                comp.binary_penalty = lw.binary_penalty * binary_entropy_penalty(mask)
+                comp.binary_penalty = effective_binary_weight * binary_entropy_penalty(mask)
             else:
-                comp.binary_penalty = lw.binary_penalty * manhattan_distance_penalty(mask)
+                comp.binary_penalty = effective_binary_weight * manhattan_distance_penalty(mask)
 
         if lw.tv_smooth > 0:
-            comp.tv_smooth = lw.tv_smooth * total_variation_isotropic(mask)
+            tv_scale = self._get_regularization_scale_factor('tv_smooth')
+            effective_tv_weight = lw.tv_smooth * tv_scale
+            comp.tv_smooth = effective_tv_weight * total_variation_isotropic(mask)
 
         if lw.epe > 0:
             if cfg.epe_use_soft:
@@ -2203,6 +2451,8 @@ class MaskOptimizer:
         """
         计算掩模约束项的梯度
 
+        支持与频域带限约束协同：当启用带限时，TV类和二值化惩罚强度会自动缩放。
+
         Args:
             mask: 掩模图案
 
@@ -2214,13 +2464,17 @@ class MaskOptimizer:
         cfg = self.config
 
         if lw.binary_penalty > 0:
+            binary_scale = self._get_regularization_scale_factor('binary_penalty')
+            effective_binary_weight = lw.binary_penalty * binary_scale
             if cfg.binary_penalty_type == 'entropy':
-                grad += lw.binary_penalty * binary_entropy_penalty_gradient(mask)
+                grad += effective_binary_weight * binary_entropy_penalty_gradient(mask)
             else:
-                grad += lw.binary_penalty * manhattan_distance_penalty_gradient(mask)
+                grad += effective_binary_weight * manhattan_distance_penalty_gradient(mask)
 
         if lw.tv_smooth > 0:
-            grad += lw.tv_smooth * total_variation_isotropic_gradient(mask)
+            tv_scale = self._get_regularization_scale_factor('tv_smooth')
+            effective_tv_weight = lw.tv_smooth * tv_scale
+            grad += effective_tv_weight * total_variation_isotropic_gradient(mask)
 
         if lw.epe > 0:
             if cfg.epe_use_soft:
@@ -2418,7 +2672,9 @@ class MaskOptimizer:
                 total_loss += lw.pvb * pvb_val
 
             if lw.mask_complexity > 0:
-                total_loss += lw.mask_complexity * total_variation(mask)
+                mc_scale = self._get_regularization_scale_factor('mask_complexity')
+                effective_mc_weight = lw.mask_complexity * mc_scale
+                total_loss += effective_mc_weight * total_variation(mask)
 
             mask_constraints = self._compute_mask_constraints(mask)
             total_loss += (mask_constraints.binary_penalty +
@@ -2551,7 +2807,9 @@ class MaskOptimizer:
                 per_losses.append(loss_i)
 
             if lw.mask_complexity > 0:
-                gradient += lw.mask_complexity * total_variation_gradient(mask)
+                mc_scale = self._get_regularization_scale_factor('mask_complexity')
+                effective_mc_weight = lw.mask_complexity * mc_scale
+                gradient += effective_mc_weight * total_variation_gradient(mask)
 
             gradient += self._compute_mask_constraints_gradient(mask)
 
@@ -2755,7 +3013,9 @@ class MaskOptimizer:
                     mask, self._imaging_model, dose=1.0
                 )
                 if lw.mask_complexity > 0:
-                    base_loss += lw.mask_complexity * total_variation(mask)
+                    mc_scale = self._get_regularization_scale_factor('mask_complexity')
+                    effective_mc_weight = lw.mask_complexity * mc_scale
+                    base_loss += effective_mc_weight * total_variation(mask)
 
                 mask_constraints = self._compute_mask_constraints(mask)
                 base_loss += (mask_constraints.binary_penalty +
@@ -2956,7 +3216,9 @@ class MaskOptimizer:
                 gradient = error_grad * imaging_grad
 
                 if lw.mask_complexity > 0:
-                    gradient += lw.mask_complexity * total_variation_gradient(mask)
+                    mc_scale = self._get_regularization_scale_factor('mask_complexity')
+                    effective_mc_weight = lw.mask_complexity * mc_scale
+                    gradient += effective_mc_weight * total_variation_gradient(mask)
 
                 gradient += self._compute_mask_constraints_gradient(mask)
 
