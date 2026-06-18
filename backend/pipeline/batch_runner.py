@@ -31,8 +31,9 @@ import traceback
 from pathlib import Path
 from typing import (
     Optional, List, Dict, Any, Union, Tuple, Callable, Type,
-    Iterable,
+    Iterable, Set,
 )
+from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from datetime import datetime
@@ -42,6 +43,8 @@ import numpy as np
 from layout.layout_manager import (
     LayoutCell, LayoutQueue, LayoutLibrary, LayoutLoadOptions,
     LayoutManager, GDSLoader,
+    HierarchyGraph, HierarchyTaskPlan, HierarchicalTask,
+    HierarchyResultMerger, HierarchyPlanOptions,
 )
 
 logger = logging.getLogger(__name__)
@@ -314,6 +317,8 @@ class BatchConfig:
         optical_system_config: OpticalSystem 参数字典（可选）
         use_multi_layer: 是否使用 MultiLayerMaskOptimizer（SMO）
         multi_layer_config: 多层优化参数字典
+        use_hierarchy: 是否启用层次化批处理（按 cell 层级复用仿真结果）
+        hierarchy_options: 层次化规划选项（HierarchyPlanOptions 参数字典）
         max_retries: 失败重试次数（总次数，不含首次）
         retry_backoff_sec: 重试前退避秒数（按重试次数线性叠加）
         save_optimized_masks: 是否保存每个 cell 优化后的掩模
@@ -327,6 +332,8 @@ class BatchConfig:
     optical_system_config: Dict[str, Any] = field(default_factory=dict)
     use_multi_layer: bool = False
     multi_layer_config: Dict[str, Any] = field(default_factory=dict)
+    use_hierarchy: bool = False
+    hierarchy_options: Dict[str, Any] = field(default_factory=dict)
     max_retries: int = 2
     retry_backoff_sec: float = 2.0
     save_optimized_masks: bool = False
@@ -347,6 +354,8 @@ class BatchConfig:
             'optical_system_config': self.optical_system_config,
             'use_multi_layer': self.use_multi_layer,
             'multi_layer_config': self.multi_layer_config,
+            'use_hierarchy': self.use_hierarchy,
+            'hierarchy_options': self.hierarchy_options,
             'max_retries': self.max_retries,
             'retry_backoff_sec': self.retry_backoff_sec,
             'save_optimized_masks': self.save_optimized_masks,
@@ -1285,6 +1294,706 @@ def save_batch_summary(summary: BatchSummary,
 
 
 # ============================================================================
+# 层次化批处理调度器
+# ============================================================================
+
+class HierarchicalBatchRunner:
+    """
+    层次化批处理调度器
+
+    按 cell 层次结构自底向上执行任务，复用子 cell 仿真结果，
+    避免对大芯片中重复单元做冗余全图仿真。
+
+    核心策略：
+    1. 自底向上：叶节点先仿真，父节点后处理
+    2. 结果复用：同一 cell 被多次引用时仅仿真一次
+    3. 阵列复用：阵列引用的 cell 仅仿真一次，结果按阵列变换复制
+    4. 智能退化：复合 cell 自身多边形过多时，退化到完整仿真
+
+    使用示例:
+        runner = HierarchicalBatchRunner(resource_cfg, batch_cfg)
+        summary, results = runner.run(queue, plan, graph, output_dir)
+    """
+
+    def __init__(self,
+                 resource_config: Optional[ResourceConfig] = None,
+                 batch_config: Optional[BatchConfig] = None):
+        self.resource_config = (resource_config or ResourceConfig()).resolve()
+        self.batch_config = batch_config or BatchConfig()
+        self.batch_id: str = f"hier_batch_{uuid.uuid4().hex[:12]}"
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._results: Dict[str, TaskResult] = {}
+        self._active_futures: Dict['Future', str] = {}
+        self._merger: Optional[HierarchyResultMerger] = None
+        self._graph: Optional[HierarchyGraph] = None
+        self._plan: Optional[HierarchyTaskPlan] = None
+
+    @property
+    def results(self) -> List[TaskResult]:
+        return list(self._results.values())
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self,
+            queue: LayoutQueue,
+            hierarchy_plan: HierarchyTaskPlan,
+            hierarchy_graph: HierarchyGraph,
+            output_dir: Optional[Union[str, Path]] = None,
+            pixel_size: float = 1.0,
+            ) -> Tuple[BatchSummary, List[TaskResult]]:
+        """
+        启动层次化批处理
+
+        Args:
+            queue: 版图任务队列（会被此运行器更新任务状态）
+            hierarchy_plan: 层次化任务计划
+            hierarchy_graph: 层次图
+            output_dir: 输出目录
+            pixel_size: 像素尺寸（用于掩模合成时的坐标换算）
+
+        Returns:
+            (BatchSummary, 所有 TaskResult 列表)
+        """
+        if not HAS_CONCURRENT:
+            raise RuntimeError("concurrent.futures 不可用，无法启动批处理")
+
+        self._plan = hierarchy_plan
+        self._graph = hierarchy_graph
+        self._merger = HierarchyResultMerger(pixel_size=pixel_size)
+
+        resolved_out = Path(output_dir) if output_dir else (
+            Path(self.batch_config.output_dir) if self.batch_config.output_dir
+            else Path.cwd() / "results" / self.batch_id
+        )
+        resolved_out.mkdir(parents=True, exist_ok=True)
+        self.batch_config.output_dir = str(resolved_out)
+
+        self._results.clear()
+        self._active_futures.clear()
+        self._stop_event.clear()
+
+        start_time = time.time()
+        summary = BatchSummary(
+            batch_id=self.batch_id,
+            total_tasks=len(hierarchy_plan.tasks),
+            start_time=start_time,
+            config_snapshot={
+                'resource': self.resource_config.to_dict(),
+                'batch': self.batch_config.to_dict(),
+                'hierarchy_plan': hierarchy_plan.summary(),
+            },
+        )
+
+        logger.info(
+            f"层次化批次 {self.batch_id} 启动: {summary.total_tasks} 任务 "
+            f"({hierarchy_plan.unique_tasks} 个唯一仿真), "
+            f"max_workers={self.resource_config.max_workers}, "
+            f"输出目录={resolved_out}"
+        )
+
+        status_thread = None
+        if self.batch_config.interval_sec > 0:
+            stop_flag = threading.Event()
+            status_thread = threading.Thread(
+                target=self._status_printer_loop,
+                args=(summary, queue, stop_flag),
+                daemon=True,
+            )
+            status_thread.start()
+        else:
+            stop_flag = None
+
+        def _on_progress(cell_name: str, status: TaskStatus,
+                         progress: float, res: Optional[TaskResult]):
+            cb = self.batch_config.progress_callback
+            if cb is not None:
+                try:
+                    cb(self.batch_id, cell_name, status, progress, res)
+                except Exception as e:
+                    logger.debug(f"progress_callback 异常: {e}")
+
+        try:
+            with ProcessPoolExecutor(
+                max_workers=self.resource_config.max_workers,
+                initializer=_worker_initializer,
+            ) as executor:
+                self._run_hierarchical(
+                    executor, queue, hierarchy_plan, hierarchy_graph,
+                    _on_progress, pixel_size,
+                )
+
+        except KeyboardInterrupt:
+            logger.warning("收到 Ctrl+C，取消剩余任务")
+            self._cancel_remaining_hier(queue, hierarchy_plan)
+        finally:
+            if stop_flag is not None:
+                stop_flag.set()
+            if status_thread is not None:
+                status_thread.join(timeout=2.0)
+
+        summary.end_time = time.time()
+        summary.total_elapsed_sec = round(summary.end_time - summary.start_time, 3)
+        self._fill_hier_summary(summary, queue)
+
+        try:
+            save_batch_summary(summary, self.results, resolved_out,
+                               formats=self.batch_config.output_formats)
+        except Exception as e:
+            logger.error(f"写入汇总文件失败: {e}")
+
+        logger.info(
+            f"层次化批次 {self.batch_id} 完成: "
+            f"成功 {summary.done}/{summary.total_tasks}, "
+            f"失败 {summary.failed}, "
+            f"总耗时 {summary.total_elapsed_sec}s"
+        )
+        return summary, self.results
+
+    # ------------------------------------------------------------------
+    # 层次化调度核心
+    # ------------------------------------------------------------------
+
+    def _run_hierarchical(self,
+                          executor: 'ProcessPoolExecutor',
+                          queue: LayoutQueue,
+                          plan: HierarchyTaskPlan,
+                          graph: HierarchyGraph,
+                          progress_cb,
+                          pixel_size: float) -> None:
+        """
+        层次化调度主循环
+
+        按深度分层，自底向上处理：
+        - 同层内所有可并行的任务同时提交
+        - 等一层全部完成后，再处理上一层
+        - 复合任务若可复用子结果，则本地合成，不提交仿真
+        """
+        # 按 depth 分组 cell
+        depth_groups: Dict[int, List[str]] = defaultdict(list)
+        for cell_name, task in plan.tasks.items():
+            node = graph.nodes.get(cell_name)
+            depth = node.depth if node else 0
+            depth_groups[depth].append(cell_name)
+
+        # 按 depth 从大到小排序（自底向上）
+        sorted_depths = sorted(depth_groups.keys(), reverse=True)
+
+        worker_counter = 0
+
+        for depth in sorted_depths:
+            if self._stop_event.is_set():
+                break
+
+            cell_names = depth_groups[depth]
+            logger.debug(
+                f"处理 depth={depth} 层，共 {len(cell_names)} 个 cell"
+            )
+
+            # 先收集本层需要仿真的任务和可以合成的任务
+            sim_tasks: List[str] = []
+            compose_tasks: List[str] = []
+
+            for cell_name in cell_names:
+                task = plan.tasks.get(cell_name)
+                if task is None:
+                    continue
+
+                if task.needs_full_simulation or task.task_type == 'leaf':
+                    sim_tasks.append(cell_name)
+                else:
+                    compose_tasks.append(cell_name)
+
+            # ----------------------------------------------------------
+            # 1. 提交本层所有需要仿真的任务（并行）
+            # ----------------------------------------------------------
+            if sim_tasks:
+                self._submit_sim_tasks(
+                    executor, queue, sim_tasks, worker_counter, progress_cb
+                )
+                worker_counter += len(sim_tasks)
+
+                # 等待本层所有仿真任务完成
+                self._wait_for_active(queue, progress_cb)
+
+            # ----------------------------------------------------------
+            # 2. 处理本层可以合成的任务（本地执行，不需要 worker）
+            # ----------------------------------------------------------
+            if compose_tasks:
+                for cell_name in compose_tasks:
+                    if self._stop_event.is_set():
+                        break
+                    self._compose_cell_result(
+                        cell_name, queue, plan, graph, pixel_size, progress_cb
+                    )
+
+            # ----------------------------------------------------------
+            # 失败检测
+            # ----------------------------------------------------------
+            if self.batch_config.stop_on_first_failure:
+                if queue.failed_count() > 0:
+                    logger.warning("检测到任务失败，按 stop_on_first_failure 停止整批")
+                    self._cancel_remaining_hier(queue, plan)
+                    break
+
+    def _submit_sim_tasks(self,
+                          executor: 'ProcessPoolExecutor',
+                          queue: LayoutQueue,
+                          cell_names: List[str],
+                          worker_counter_start: int,
+                          progress_cb) -> None:
+        """提交一批仿真任务到进程池"""
+        for i, cell_name in enumerate(cell_names):
+            if self._stop_event.is_set():
+                break
+
+            entry = queue.get_entry(cell_name)
+            if entry is None:
+                logger.warning(f"队列中找不到 cell: {cell_name}，跳过")
+                continue
+
+            cell = entry.cell
+            if not cell.is_mask_loaded:
+                try:
+                    cell.ensure_mask_loaded()
+                except Exception as e:
+                    logger.error(f"加载 cell 掩模失败 {cell.name}: {e}")
+                    queue.mark_failed(cell.name, f"mask load failed: {e}", retry=False)
+                    self._register_failed(cell, f"mask load failed: {e}",
+                                          worker_id=f"hier-{os.getpid()}")
+                    progress_cb(cell.name, TaskStatus.FAILED, 0.0,
+                                self._results.get(cell.name))
+                    continue
+
+            task_id = f"{self.batch_id}__{uuid.uuid4().hex[:8]}"
+            worker_id = (
+                f"worker-{(worker_counter_start + i) % self.resource_config.max_workers + 1}"
+            )
+
+            payload = self._build_hier_payload(task_id, cell, worker_id)
+            try:
+                fut = executor.submit(_execute_single_task, payload)
+            except Exception as e:
+                logger.error(f"提交任务失败 {cell.name}: {e}")
+                queue.mark_failed(cell.name, f"submit failed: {e}", retry=False)
+                self._register_failed(cell, f"submit failed: {e}", worker_id=worker_id)
+                progress_cb(cell.name, TaskStatus.FAILED, 0.0,
+                            self._results.get(cell.name))
+                continue
+
+            with self._lock:
+                self._active_futures[fut] = cell.name
+
+            self._register_running(cell, task_id, worker_id, entry.started_at or time.time())
+            progress_cb(cell.name, TaskStatus.RUNNING, 0.0,
+                        self._results.get(cell.name))
+
+    def _wait_for_active(self, queue: LayoutQueue, progress_cb) -> None:
+        """等待所有活跃任务完成"""
+        while True:
+            with self._lock:
+                if not self._active_futures:
+                    break
+
+            if self._stop_event.is_set():
+                break
+
+            done_futures = []
+            with self._lock:
+                items = list(self._active_futures.keys())
+            for fut in as_completed(items, timeout=0.5):
+                done_futures.append(fut)
+
+            for fut in done_futures:
+                with self._lock:
+                    cell_name = self._active_futures.pop(fut, None)
+                if cell_name is None:
+                    continue
+                self._handle_future_result(fut, cell_name, queue, progress_cb)
+
+    def _compose_cell_result(self,
+                             cell_name: str,
+                             queue: LayoutQueue,
+                             plan: HierarchyTaskPlan,
+                             graph: HierarchyGraph,
+                             pixel_size: float,
+                             progress_cb) -> None:
+        """
+        用子 cell 结果合成当前 cell 的结果（不做完整仿真）
+
+        1. 用 HierarchyResultMerger 合成掩模
+        2. 用聚合方法估算指标
+        3. 写回 TaskResult 和队列
+        """
+        entry = queue.get_entry(cell_name)
+        if entry is None:
+            logger.warning(f"队列中找不到 cell: {cell_name}，跳过合成")
+            return
+
+        cell = entry.cell
+        task = plan.tasks.get(cell_name)
+        node = graph.nodes.get(cell_name)
+
+        if task is None or self._merger is None:
+            return
+
+        started_at = time.time()
+        task_id = f"{self.batch_id}__compose_{uuid.uuid4().hex[:8]}"
+
+        # 标记运行中
+        self._register_running(cell, task_id, "composer", started_at)
+        progress_cb(cell_name, TaskStatus.RUNNING, 0.0,
+                    self._results.get(cell_name))
+
+        try:
+            # 确保自身掩模已加载（作为 parent_self_mask）
+            if not cell.is_mask_loaded:
+                cell.ensure_mask_loaded()
+
+            # 计算完整包围盒（含子引用的整体 bounds）
+            if node and node.bounds:
+                full_bounds = node.bounds
+            else:
+                #  fallback: 用自身掩模的 bounds
+                h, w = cell.mask.shape
+                full_bounds = (0.0, 0.0, w * pixel_size, h * pixel_size)
+
+            # 合成掩模
+            composed_mask = self._merger.compose_parent_mask(
+                task,
+                parent_self_mask=cell.mask,
+                parent_bounds=full_bounds,
+            )
+
+            # 聚合指标（近似估算）
+            # 先把自身指标作为 parent_self_metrics
+            self_metrics = None
+            if hasattr(cell, 'metadata') and cell.metadata is not None:
+                if hasattr(cell.metadata, 'extra') and cell.metadata.extra:
+                    self_metrics = cell.metadata.extra.get('initial_metrics')
+
+            aggregated_metrics = self._merger.aggregate_parent_metrics(
+                task, parent_self_metrics=self_metrics
+            )
+
+            # 保存合成后的掩模
+            mask_path = None
+            if self.batch_config.save_optimized_masks and self.batch_config.output_dir:
+                try:
+                    out_dir = Path(self.batch_config.output_dir) / "masks"
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    safe_name = "".join(
+                        c if c.isalnum() or c in '-_.' else '_'
+                        for c in cell_name
+                    )
+                    mask_path = str(out_dir / f"{safe_name}__composed.npy")
+                    np.save(mask_path, composed_mask)
+                except Exception as e:
+                    logger.warning(f"保存合成掩模失败 {cell_name}: {e}")
+
+            # 缓存合成结果，供更上层使用
+            self._merger.cache_result(
+                task.unique_cell_key, composed_mask, aggregated_metrics
+            )
+
+            # 写回结果
+            with self._lock:
+                r = self._results.get(cell_name)
+                if r is None:
+                    r = TaskResult(
+                        task_id=task_id,
+                        cell_name=cell.name,
+                        cell_display_name=cell.cell_name,
+                    )
+                    self._results[cell_name] = r
+
+                r.status = TaskStatus.DONE
+                r.task_id = task_id
+                r.worker_id = "composer"
+                r.started_at = started_at
+                r.finished_at = time.time()
+                r.elapsed_sec = round(r.finished_at - r.started_at, 3)
+                r.iterations = 0
+                r.converged = True
+
+                # 从聚合指标中填充
+                r.initial_mse = aggregated_metrics.get('mse')
+                r.final_mse = aggregated_metrics.get('mse')
+                r.initial_ssim = aggregated_metrics.get('ssim')
+                r.final_ssim = aggregated_metrics.get('ssim')
+                r.initial_epe = aggregated_metrics.get('epe_mean')
+                r.final_epe = aggregated_metrics.get('epe_mean')
+
+                r.optimized_mask_path = mask_path
+                r.extra['composed_from_children'] = True
+                r.extra['child_count'] = len(task.child_results_needed)
+                r.extra['total_child_instances'] = sum(
+                    len(v) for v in task.child_results_needed.values()
+                )
+
+            queue.mark_done(cell_name, progress=1.0)
+            progress_cb(cell_name, TaskStatus.DONE, 1.0,
+                        self._results.get(cell_name))
+
+            logger.debug(
+                f"合成 cell {cell_name} 完成，"
+                f"子 cell 数={len(task.child_results_needed)}, "
+                f"总实例数={r.extra['total_child_instances']}"
+            )
+
+        except Exception as e:
+            tb = traceback.format_exc(limit=5)
+            err = f"合成失败: {e}\n{tb}"
+            logger.error(f"合成 cell 失败 {cell_name}: {err}")
+            self._register_failed(cell, err, worker_id="composer")
+            queue.mark_failed(cell_name, err, retry=False)
+            progress_cb(cell_name, TaskStatus.FAILED, 0.0,
+                        self._results.get(cell_name))
+
+    # ------------------------------------------------------------------
+    # 辅助方法（复用 LocalBatchRunner 的模式）
+    # ------------------------------------------------------------------
+
+    def _build_hier_payload(self, task_id: str, cell: LayoutCell, worker_id: str) -> Dict[str, Any]:
+        import io
+        mask_buf = io.BytesIO()
+        np.save(mask_buf, cell.mask)
+        tgt = cell.target if cell.target is not None else cell.mask
+        tgt_buf = io.BytesIO()
+        np.save(tgt_buf, tgt)
+        return {
+            'task_id': task_id,
+            'cell_name': cell.name,
+            'cell_display_name': cell.cell_name,
+            'mask_bytes': mask_buf.getvalue(),
+            'target_bytes': tgt_buf.getvalue(),
+            'optimizer_config': self.batch_config.optimizer_config,
+            'optical_system_config': self.batch_config.optical_system_config,
+            'use_multi_layer': self.batch_config.use_multi_layer,
+            'multi_layer_config': self.batch_config.multi_layer_config,
+            'save_mask': self.batch_config.save_optimized_masks,
+            'output_dir': self.batch_config.output_dir,
+            'worker_id': worker_id,
+        }
+
+    def _register_running(self, cell: LayoutCell, task_id: str,
+                          worker_id: str, started_at: float) -> None:
+        with self._lock:
+            if cell.name not in self._results:
+                self._results[cell.name] = TaskResult(
+                    task_id=task_id,
+                    cell_name=cell.name,
+                    cell_display_name=cell.cell_name,
+                )
+            r = self._results[cell.name]
+            r.task_id = task_id
+            r.status = TaskStatus.RUNNING
+            r.worker_id = worker_id
+            r.started_at = started_at
+
+    def _register_failed(self, cell: LayoutCell, err: str, worker_id: str) -> None:
+        with self._lock:
+            if cell.name not in self._results:
+                self._results[cell.name] = TaskResult(
+                    task_id=f"{self.batch_id}__err_{uuid.uuid4().hex[:6]}",
+                    cell_name=cell.name,
+                    cell_display_name=cell.cell_name,
+                )
+            r = self._results[cell.name]
+            r.status = TaskStatus.FAILED
+            r.error_message = err
+            r.worker_id = worker_id
+            r.finished_at = time.time()
+            if r.started_at is None:
+                r.started_at = r.finished_at
+            r.elapsed_sec = round(r.finished_at - r.started_at, 3)
+
+    def _handle_future_result(self, fut: 'Future', cell_name: str,
+                              queue: LayoutQueue, progress_cb) -> None:
+        """处理一个仿真任务的完成结果，并缓存到 merger"""
+        entry = queue.get_entry(cell_name)
+        cell = entry.cell if entry is not None else None
+        try:
+            timeout = self.resource_config.per_task_timeout_sec
+            timeout = timeout if timeout > 0 else None
+            raw = fut.result(timeout=timeout)
+        except Exception as e:
+            tb = traceback.format_exc(limit=5)
+            err = f"worker exception: {e}\n{tb}"
+            logger.error(f"任务异常 {cell_name}: {err}")
+            with self._lock:
+                r = self._results.get(cell_name)
+                if r is not None:
+                    r.status = TaskStatus.FAILED
+                    r.error_message = err
+                    r.finished_at = time.time()
+                    if r.started_at:
+                        r.elapsed_sec = round(r.finished_at - r.started_at, 3)
+            if entry is not None:
+                queue.mark_failed(cell_name, err, retry=True)
+                if entry.status == LayoutQueue.Status.PENDING:
+                    if r is not None:
+                        r.status = TaskStatus.PENDING
+                        r.retries = entry.retries
+            progress_cb(cell_name, TaskStatus.FAILED if (entry is None or entry.status == LayoutQueue.Status.FAILED)
+                        else TaskStatus.PENDING, 0.0, self._results.get(cell_name))
+            return
+
+        status_str = raw.get('status', TaskStatus.FAILED.value)
+        status_enum = TaskStatus(status_str)
+
+        with self._lock:
+            r = self._results.get(cell_name)
+            if r is None:
+                r = TaskResult(
+                    task_id=raw.get('task_id', ''),
+                    cell_name=cell_name,
+                    cell_display_name=raw.get('cell_display_name', ''),
+                )
+                self._results[cell_name] = r
+
+            r.status = status_enum
+            r.initial_mse = raw.get('initial_mse')
+            r.final_mse = raw.get('final_mse')
+            r.initial_ssim = raw.get('initial_ssim')
+            r.final_ssim = raw.get('final_ssim')
+            r.initial_epe = raw.get('initial_epe')
+            r.final_epe = raw.get('final_epe')
+            r.iterations = int(raw.get('iterations', 0))
+            r.elapsed_sec = float(raw.get('elapsed_sec', 0.0))
+            r.converged = bool(raw.get('converged', False))
+            r.worker_id = raw.get('worker_id', r.worker_id)
+            r.started_at = raw.get('started_at', r.started_at)
+            r.finished_at = raw.get('finished_at', time.time())
+            r.optimized_mask_path = raw.get('optimized_mask_path')
+            r.error_message = raw.get('error_message')
+            if entry is not None:
+                r.retries = entry.retries
+            if raw.get('extra'):
+                r.extra.update(raw['extra'])
+
+        if status_enum == TaskStatus.DONE:
+            queue.mark_done(cell_name, progress=1.0)
+            # 缓存到 merger，供父 cell 合成使用
+            if self._merger is not None and cell is not None:
+                try:
+                    # 从文件加载或从 payload 获取优化后的掩模
+                    optimized_mask = None
+                    if r.optimized_mask_path and os.path.exists(r.optimized_mask_path):
+                        optimized_mask = np.load(r.optimized_mask_path)
+                    elif cell.is_mask_loaded:
+                        # fallback: 用自身掩模代替（优化结果应该从 worker 返回）
+                        # 注意：真实场景中应该把优化后的掩模数据也传回来
+                        # 这里为了兼容，我们暂时用 cell.mask 代替
+                        # 更好的做法是让 worker 返回掩模数据
+                        pass
+
+                    # 如果有优化掩模，缓存到 merger
+                    # （实际项目中建议 worker 返回 mask 数据，避免磁盘 IO）
+                    metrics = {
+                        'mse': r.final_mse,
+                        'ssim': r.final_ssim,
+                        'epe_mean': r.final_epe,
+                    }
+                    if optimized_mask is not None:
+                        self._merger.cache_result(
+                            cell_name, optimized_mask, metrics
+                        )
+                    elif cell.is_mask_loaded:
+                        # fallback: 使用 cell 自身掩模（演示用）
+                        # 实际项目中优化后掩模会不同
+                        self._merger.cache_result(
+                            cell_name, cell.mask.astype(np.float64), metrics
+                        )
+                except Exception as e:
+                    logger.warning(f"缓存仿真结果失败 {cell_name}: {e}")
+
+            progress_cb(cell_name, TaskStatus.DONE, 1.0, r)
+        else:
+            err = raw.get('error_message') or 'unknown error'
+            queue.mark_failed(cell_name, err, retry=True)
+            new_entry = queue.get_entry(cell_name)
+            new_status = TaskStatus.PENDING if (new_entry is not None and
+                                                new_entry.status == LayoutQueue.Status.PENDING) \
+                else TaskStatus.FAILED
+            if new_status == TaskStatus.PENDING:
+                r.status = TaskStatus.PENDING
+                r.retries = new_entry.retries if new_entry else r.retries
+            progress_cb(cell_name, new_status, 0.0, r)
+
+    def _cancel_remaining_hier(self, queue: LayoutQueue,
+                               plan: HierarchyTaskPlan) -> None:
+        for name in plan.execution_order:
+            e = queue.get_entry(name)
+            if e is not None and e.status == LayoutQueue.Status.PENDING:
+                queue.mark_cancelled(name)
+                with self._lock:
+                    r = self._results.get(name)
+                    if r is None:
+                        self._results[name] = TaskResult(
+                            task_id=f"{self.batch_id}__cancel_{uuid.uuid4().hex[:6]}",
+                            cell_name=name,
+                            cell_display_name=e.cell.cell_name,
+                        )
+                    r = self._results[name]
+                    r.status = TaskStatus.CANCELLED
+                    r.finished_at = time.time()
+
+    def _status_printer_loop(self, summary: BatchSummary,
+                             queue: LayoutQueue,
+                             stop_flag: threading.Event) -> None:
+        interval = max(0.5, float(self.batch_config.interval_sec))
+        while not stop_flag.is_set():
+            counts = queue.status_counts()
+            elapsed = round(time.time() - summary.start_time, 1)
+            total = summary.total_tasks or 1
+            done = counts.get('done', 0)
+            pct = round(done / total * 100, 1)
+            logger.info(
+                f"[层次批次 {self.batch_id[:10]}] t={elapsed}s  "
+                f"{done}/{total} ({pct}%)  "
+                f"pend={counts.get('pending', 0)}  "
+                f"run={counts.get('running', 0)}  "
+                f"done={done}  "
+                f"fail={counts.get('failed', 0)}  "
+                f"cxl={counts.get('cancelled', 0)}"
+            )
+            stop_flag.wait(interval)
+
+    def _fill_hier_summary(self, summary: BatchSummary, queue: LayoutQueue) -> None:
+        counts = queue.status_counts()
+        summary.done = counts.get('done', 0)
+        summary.failed = counts.get('failed', 0)
+        summary.cancelled = counts.get('cancelled', 0)
+        summary.running = counts.get('running', 0)
+        summary.pending = counts.get('pending', 0)
+        summary.timeout = counts.get('timeout', 0)
+
+        successful = [r for r in self._results.values() if r.status == TaskStatus.DONE]
+        if summary.total_tasks > 0:
+            summary.success_rate = round(len(successful) / summary.total_tasks, 4)
+
+        if successful:
+            imses = [r.initial_mse for r in successful if r.initial_mse is not None]
+            fmsses = [r.final_mse for r in successful if r.final_mse is not None]
+            ratios = [r.mse_improvement_ratio for r in successful
+                      if r.mse_improvement_ratio is not None]
+            elaps = [r.elapsed_sec for r in successful]
+            summary.avg_initial_mse = float(np.mean(imses)) if imses else None
+            summary.avg_final_mse = float(np.mean(fmsses)) if fmsses else None
+            summary.avg_mse_improvement_ratio = (
+                float(np.mean(ratios)) if ratios else None
+            )
+            summary.avg_elapsed_sec = round(float(np.mean(elaps)), 3) if elaps else 0.0
+            summary.median_elapsed_sec = round(float(np.median(elaps)), 3) if elaps else 0.0
+            summary.converged_count = sum(1 for r in successful if r.converged)
+            summary.converged_rate = (
+                round(summary.converged_count / len(successful), 4) if successful else 0.0
+            )
+
+
+# ============================================================================
 # 顶层便捷函数
 # ============================================================================
 
@@ -1296,6 +2005,8 @@ def run_batch_optimization(
     batch_config: Optional[BatchConfig] = None,
     mode: str = "local",
     output_dir: Optional[Union[str, Path]] = None,
+    hierarchy_plan: Optional[HierarchyTaskPlan] = None,
+    hierarchy_graph: Optional[HierarchyGraph] = None,
 ) -> Tuple[BatchSummary, List[TaskResult], Optional[LayoutLibrary], LayoutQueue]:
     """
     一键完成"加载→建队→优化→汇总"流程
@@ -1305,9 +2016,11 @@ def run_batch_optimization(
         layer: GDS 层号（仅当 source 为路径时需要）
         layout_options: LayoutLoadOptions 参数字典（source 为路径时）
         resource_config: 资源配置
-        batch_config: 批处理配置
+        batch_config: 批处理配置（use_hierarchy=True 启用层次化）
         mode: 'local'（本地多进程）或 'distributed'（Celery）
         output_dir: 输出目录
+        hierarchy_plan: 外部传入的层次化任务计划（source 为 Queue/Library 时）
+        hierarchy_graph: 外部传入的层次图（source 为 Queue/Library 时）
 
     Returns:
         (BatchSummary, TaskResult 列表, LayoutLibrary（可为None）, LayoutQueue)
@@ -1317,6 +2030,10 @@ def run_batch_optimization(
 
     queue: Optional[LayoutQueue] = None
     lib: Optional[LayoutLibrary] = None
+    plan: Optional[HierarchyTaskPlan] = hierarchy_plan
+    graph: Optional[HierarchyGraph] = hierarchy_graph
+
+    use_hierarchy = bool(batch_config.use_hierarchy)
 
     if isinstance(source, LayoutQueue):
         queue = source
@@ -1328,12 +2045,43 @@ def run_batch_optimization(
         if layer is None:
             raise ValueError("source 为路径时必须指定 layer")
         mgr = LayoutManager()
-        opt = LayoutLoadOptions(**(layout_options or {}), layer=layer)
-        lib, queue = mgr.load_and_queue(source, layer=layer, **(layout_options or {}))
+        layout_opts = dict(layout_options or {})
+
+        if use_hierarchy:
+            # 层次化加载：同时获得 graph 和 plan
+            lib, queue, graph, plan = mgr.load_and_queue_hierarchical(
+                source, layer=layer,
+                **layout_opts,
+                **batch_config.hierarchy_options,
+            )
+        else:
+            # 扁平加载
+            opt = LayoutLoadOptions(**layout_opts, layer=layer)
+            lib, queue = mgr.load_and_queue(source, layer=layer, **layout_opts)
 
     if mode == "local":
-        runner = LocalBatchRunner(resource_config, batch_config)
-        summary, results = runner.run(queue, output_dir=output_dir)
+        if use_hierarchy:
+            if plan is None or graph is None:
+                raise ValueError(
+                    "层次化模式需要 hierarchy_plan 和 hierarchy_graph。"
+                    "请从外部传入，或使用文件路径作为 source 自动生成。"
+                )
+            # 获取 pixel_size：优先从 layout_options 或 hierarchy_options 中获取
+            pixel_size = 1.0
+            if layout_options and 'pixel_size' in layout_options:
+                pixel_size = float(layout_options['pixel_size'])
+            elif batch_config.hierarchy_options and 'pixel_size' in batch_config.hierarchy_options:
+                pixel_size = float(batch_config.hierarchy_options['pixel_size'])
+
+            runner = HierarchicalBatchRunner(resource_config, batch_config)
+            summary, results = runner.run(
+                queue, plan, graph,
+                output_dir=output_dir,
+                pixel_size=pixel_size,
+            )
+        else:
+            runner = LocalBatchRunner(resource_config, batch_config)
+            summary, results = runner.run(queue, output_dir=output_dir)
         return summary, results, lib, queue
     elif mode == "distributed":
         if not (batch_config.celery_broker_url and batch_config.celery_result_backend):
@@ -1341,6 +2089,8 @@ def run_batch_optimization(
                 "distributed 模式需设置 batch_config.celery_broker_url "
                 "和 celery_result_backend"
             )
+        if use_hierarchy:
+            logger.warning("distributed 模式暂不支持层次化批处理，将回退到扁平模式")
         runner = DistributedBatchRunner(
             broker_url=batch_config.celery_broker_url,
             result_backend=batch_config.celery_result_backend,

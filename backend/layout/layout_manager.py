@@ -2264,7 +2264,7 @@ class HierarchyResultMerger:
         Args:
             parent_task: 父 cell 的 HierarchicalTask
             parent_self_mask: 父 cell 自身几何的栅格化掩模（不含子引用）
-            parent_bounds: 父 cell 的完整包围盒 (xmin, ymin, xmax, ymax)
+            parent_bounds: 父 cell 的完整包围盒 (xmin, ymin, xmax, ymax)，世界坐标
             target_size: 目标尺寸 (H, W)，None 则根据 bounds 和 pixel_size 计算
 
         Returns:
@@ -2299,43 +2299,77 @@ class HierarchyResultMerger:
                     continue
                 self._paste_child_mask(
                     result, child_mask, transform,
-                    xmin, ymax, nx, ny
+                    xmin, ymin, xmax, ymax, nx, ny
                 )
 
         result = np.clip(result, 0.0, 1.0)
         return result
 
-    @staticmethod
-    def _paste_child_mask(parent_mask: np.ndarray,
+    def _paste_child_mask(self,
+                          parent_mask: np.ndarray,
                           child_mask: np.ndarray,
                           transform: np.ndarray,
                           parent_xmin: float,
+                          parent_ymin: float,
+                          parent_xmax: float,
                           parent_ymax: float,
                           parent_nx: int,
                           parent_ny: int) -> None:
         """
         将子 cell 掩模通过仿射变换粘贴到父 cell 掩模上
 
+        坐标系统说明（严格区分像素坐标与世界坐标）：
+        - 像素坐标：以像素为单位，(0,0) 在左上角，y 向下增长
+        - 世界坐标：以物理长度为单位（如 nm），y 向上增长
+        - pixel_size：每个像素对应的物理长度
+        - transform：子世界坐标 → 父世界坐标 的 3×3 齐次变换矩阵
+
+        变换链路：
+        子像素 → 子世界 → transform → 父世界 → 父像素
+
         原地修改 parent_mask。
         """
         ch, cw = child_mask.shape
+        ps = self.pixel_size
 
-        corners_child = np.array([
-            [0.0, 0.0],      # 左上角
-            [cw, 0.0],       # 右上角
-            [cw, ch],        # 右下角
-            [0.0, ch],       # 左下角
+        # ------------------------------------------------------------
+        # Step 1: 计算子 cell 四个角在父世界坐标系中的位置
+        # ------------------------------------------------------------
+        # 子 cell 世界坐标的 4 个角（子 cell 本地坐标系，原点在左下角）
+        # 注意：子掩模图像坐标系 (0,0) 在左上角，世界坐标系 (0,0) 在左下角
+        child_corners_world = np.array([
+            [0.0,              (ch - 1) * ps],  # 左上角 (世界: 左, 上)
+            [(cw - 1) * ps,    (ch - 1) * ps],  # 右上角
+            [(cw - 1) * ps,    0.0],             # 右下角
+            [0.0,              0.0],             # 左下角
         ], dtype=np.float64)
 
-        corners_parent_px = HierarchyResultMerger._transform_corners(
-            corners_child, transform, parent_xmin, parent_ymax, parent_ny
-        )
+        # 子世界 → 父世界
+        corners_h = np.column_stack([
+            child_corners_world[:, 0],
+            child_corners_world[:, 1],
+            np.ones(4),
+        ])
+        parent_corners_world = (transform @ corners_h.T).T[:, :2]
 
-        x_coords = corners_parent_px[:, 0]
-        y_coords = corners_parent_px[:, 1]
-        x0, x1 = int(np.floor(x_coords.min())), int(np.ceil(x_coords.max()))
-        y0, y1 = int(np.floor(y_coords.min())), int(np.ceil(y_coords.max()))
+        # 父世界 → 父像素
+        # 父像素 px = (wx - parent_xmin) / pixel_size
+        # 父像素 py = (parent_ymax - wy) / pixel_size  （y 轴翻转）
+        parent_corners_px = np.zeros_like(parent_corners_world)
+        parent_corners_px[:, 0] = (parent_corners_world[:, 0] - parent_xmin) / ps
+        parent_corners_px[:, 1] = (parent_ymax - parent_corners_world[:, 1]) / ps
 
+        # ------------------------------------------------------------
+        # Step 2: 计算父掩模中需要处理的 ROI 范围
+        # ------------------------------------------------------------
+        x_coords = parent_corners_px[:, 0]
+        y_coords = parent_corners_px[:, 1]
+        x0 = int(np.floor(x_coords.min()))
+        x1 = int(np.ceil(x_coords.max()))
+        y0 = int(np.floor(y_coords.min()))
+        y1 = int(np.ceil(y_coords.max()))
+
+        # 裁剪到父掩模边界内
         x0 = max(0, x0)
         y0 = max(0, y0)
         x1 = min(parent_nx, x1)
@@ -2343,23 +2377,35 @@ class HierarchyResultMerger:
         if x1 <= x0 or y1 <= y0:
             return
 
+        # ------------------------------------------------------------
+        # Step 3: 对 ROI 内每个父像素，逆变换到子世界，再到子像素做双线性插值
+        # ------------------------------------------------------------
         try:
             inv_transform = np.linalg.inv(transform)
         except np.linalg.LinAlgError:
             return
 
         yy, xx = np.mgrid[y0:y1, x0:x1]
-        px = xx.ravel().astype(np.float64)
-        py = yy.ravel().astype(np.float64)
+        px_flat = xx.ravel().astype(np.float64)
+        py_flat = yy.ravel().astype(np.float64)
 
-        world_x = parent_xmin + px * 1.0
-        world_y = parent_ymax - py * 1.0
-        pts_h = np.column_stack([world_x, world_y, np.ones_like(world_x)])
-        child_world = (inv_transform @ pts_h.T).T[:, :2]
+        # 父像素 → 父世界
+        parent_wx = parent_xmin + px_flat * ps
+        parent_wy = parent_ymax - py_flat * ps
 
-        child_px = child_world[:, 0] / 1.0
-        child_py = (ch - 1) - child_world[:, 1] / 1.0
+        # 父世界 → 子世界（逆变换）
+        parent_w_h = np.column_stack([parent_wx, parent_wy, np.ones_like(parent_wx)])
+        child_world = (inv_transform @ parent_w_h.T).T[:, :2]
 
+        # 子世界 → 子像素
+        # 子像素 px = wx / pixel_size
+        # 子像素 py = (ch - 1) - wy / pixel_size  （y 轴翻转）
+        child_px = child_world[:, 0] / ps
+        child_py = (ch - 1) - child_world[:, 1] / ps
+
+        # ------------------------------------------------------------
+        # Step 4: 双线性插值采样
+        # ------------------------------------------------------------
         valid = (
             (child_px >= 0) & (child_px < cw - 1)
             & (child_py >= 0) & (child_py < ch - 1)
@@ -2390,19 +2436,6 @@ class HierarchyResultMerger:
         valid_idx = np.where(valid)[0]
         dest_flat[valid_idx] = np.maximum(dest_flat[valid_idx], interp)
         parent_mask[y0:y1, x0:x1] = dest_flat.reshape(dest.shape)
-
-    @staticmethod
-    def _transform_corners(corners: np.ndarray,
-                           transform: np.ndarray,
-                           parent_xmin: float,
-                           parent_ymax: float,
-                           parent_ny: int) -> np.ndarray:
-        """将子 cell 角点从子像素坐标变换到父像素坐标"""
-        pts_h = np.column_stack([corners[:, 0], corners[:, 1], np.ones(len(corners))])
-        world = (transform @ pts_h.T).T[:, :2]
-        px = (world[:, 0] - parent_xmin)
-        py = (parent_ymax - world[:, 1])
-        return np.column_stack([px, py])
 
     @staticmethod
     def _resize_mask(mask: np.ndarray, ny: int, nx: int) -> np.ndarray:
@@ -2575,10 +2608,11 @@ def _extend_layout_manager():
 
         plan_kwargs = {k: v for k, v in kwargs.items()
                        if k in HierarchyPlanOptions.__dataclass_fields__}
-        plan_opts = HierarchyPlanOptions(
-            pixel_size=load_opts.pixel_size,
-            **plan_kwargs,
-        )
+        # pixel_size 同时在 LayoutLoadOptions 和 HierarchyPlanOptions 中，
+        # 优先使用 kwargs 中显式传入的值，否则从 load_opts 继承
+        if 'pixel_size' not in plan_kwargs:
+            plan_kwargs['pixel_size'] = load_opts.pixel_size
+        plan_opts = HierarchyPlanOptions(**plan_kwargs)
 
         graph = self.analyze_hierarchy(filepath, layer=layer, datatype=load_opts.datatype)
         plan = self.plan_hierarchical_tasks(graph, options=plan_opts)
