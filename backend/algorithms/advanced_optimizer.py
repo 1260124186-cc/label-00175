@@ -28,6 +28,9 @@ from algorithms.deep_rl_models import (
     ActorCriticModel,
     ActorCriticConfig,
     DeepRLModelFactory,
+    PretrainedWeightManager,
+    PretrainConfig,
+    FinetuneConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -431,6 +434,9 @@ class ReinforcementLearningOptimizer(BaseHeuristicOptimizer):
                  ppo_config: Optional[PPOConfig] = None,
                  ac_config: Optional[ActorCriticConfig] = None,
                  device: str = 'cpu',
+                 use_pretrained: bool = True,
+                 pretrained_weights_path: Optional[str] = None,
+                 pretrained_strict: bool = False,
                  **kwargs):
         """
         初始化强化学习优化器
@@ -449,6 +455,9 @@ class ReinforcementLearningOptimizer(BaseHeuristicOptimizer):
             ppo_config: PPO 配置
             ac_config: Actor-Critic 配置
             device: PyTorch 设备
+            use_pretrained: 是否自动加载预训练权重（默认 True，缩短冷启动时间）
+            pretrained_weights_path: 自定义预训练权重路径（优先级高于自动搜索）
+            pretrained_strict: 加载预训练权重时是否严格匹配层名称
         """
         super().__init__(**kwargs)
         self.state_dim = state_dim
@@ -460,6 +469,10 @@ class ReinforcementLearningOptimizer(BaseHeuristicOptimizer):
         self.model_type = model_type
         self.state_encoding = state_encoding
         self.device = device
+        self.use_pretrained = use_pretrained
+        self.pretrained_weights_path = pretrained_weights_path
+        self.pretrained_strict = pretrained_strict
+        self._pretrained_loaded: bool = False
 
         self._replay_buffer: List[Tuple] = []
         self._buffer_size = 10000
@@ -497,6 +510,55 @@ class ReinforcementLearningOptimizer(BaseHeuristicOptimizer):
                 f"Unknown model_type '{model_type}', "
                 f"available: {DeepRLModelFactory.available_models() + ['simple']}"
             )
+
+        if self.use_pretrained and model_type in ('dqn', 'ppo'):
+            self._pretrained_loaded = PretrainedWeightManager.load_pretrained_if_available(
+                model=self._deep_model,
+                model_type=model_type,
+                strict=self.pretrained_strict,
+                custom_path=self.pretrained_weights_path,
+            )
+
+    def load_pretrained_weights(self,
+                                 model_type: Optional[str] = None,
+                                 path: Optional[str] = None,
+                                 strict: bool = False) -> bool:
+        """
+        手动加载预训练权重
+
+        Args:
+            model_type: 模型类型，默认使用当前 model_type
+            path: 权重文件路径，为 None 时自动搜索
+            strict: 是否严格加载
+
+        Returns:
+            是否加载成功
+        """
+        mt = model_type or self.model_type
+        if self._deep_model is None:
+            logger.warning("深度模型未初始化，无法加载预训练权重")
+            return False
+
+        if mt in ('dqn', 'ppo') and hasattr(self._deep_model, 'load_weights'):
+            self._pretrained_loaded = PretrainedWeightManager.load_pretrained_if_available(
+                model=self._deep_model,
+                model_type=mt,
+                strict=strict,
+                custom_path=path,
+            )
+            return self._pretrained_loaded
+        else:
+            logger.warning(f"模型类型 {mt} 不支持预训练权重加载")
+            return False
+
+    def enable_pretrained(self, enabled: bool = True) -> None:
+        """启用/禁用预训练权重加载"""
+        self.use_pretrained = enabled
+
+    @property
+    def pretrained_loaded(self) -> bool:
+        """是否已成功加载预训练权重"""
+        return self._pretrained_loaded
 
     def set_model(self, model):
         """
@@ -704,13 +766,16 @@ class ReinforcementLearningOptimizer(BaseHeuristicOptimizer):
                     f"epsilon = {self.epsilon:.4f}, model = {model_info}"
                 )
 
+        pretrained_info = ""
+        if self.model_type in ('dqn', 'ppo'):
+            pretrained_info = f", pretrained={'yes' if self._pretrained_loaded else 'no'}"
         return OptimizationResult(
             x=best_mask,
             fun=best_loss,
             nit=self.max_iter,
             nfev=nfev,
             success=True,
-            message=f"强化学习优化完成 (model={self.model_type}, encoding={self.state_encoding})",
+            message=f"强化学习优化完成 (model={self.model_type}, encoding={self.state_encoding}{pretrained_info})",
             history=self.history
         )
 
