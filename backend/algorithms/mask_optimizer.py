@@ -293,8 +293,8 @@ class OptimizationConfig:
     monte_carlo_n_samples: int = 50  # 蒙特卡洛采样数量
     monte_carlo_focus_std: float = 30.0  # 离焦量标准差 (nm)
     monte_carlo_dose_std: float = 0.05  # 剂量相对标准差
-    monte_carlo_aberration_std: Optional[float] = None  # 像差系数标准差（波长λ）
-    monte_carlo_zernike_indices: Optional[List[int]] = None  # 要扰动的Zernike系数索引
+    monte_carlo_aberration_std: Optional[Union[float, Dict[int, float]]] = None  # 像差系数标准差（波长λ），float或按Zernike索引的Dict
+    monte_carlo_zernike_indices: Optional[List[int]] = None  # 要扰动的Zernike系数索引，None使用光学系统中已有的非零系数
     monte_carlo_distribution: str = 'normal'  # 分布类型: 'normal' 或 'uniform'
     monte_carlo_seed: Optional[int] = None  # 随机种子
     monte_carlo_resample_freq: int = 10  # 重新采样频率（每N次迭代重新采样一次），0表示固定采样
@@ -954,18 +954,26 @@ class MaskOptimizer:
                 if not zernike_indices:
                     zernike_indices = [3, 4, 5, 6, 7, 8, 9, 10]
 
-            aberration_std = float(cfg.monte_carlo_aberration_std)
+            if isinstance(cfg.monte_carlo_aberration_std, (int, float)):
+                aberration_std_dict = {
+                    j: float(cfg.monte_carlo_aberration_std) for j in zernike_indices
+                }
+            else:
+                aberration_std_dict = dict(cfg.monte_carlo_aberration_std)
+
             if cfg.monte_carlo_distribution == 'normal':
                 aberration_samples = {}
                 for j in zernike_indices:
+                    std = aberration_std_dict.get(j, 0.0)
                     base_val = self.optical_system.zernike_coefficients.get(j, 0.0)
                     aberration_samples[j] = rng.normal(
-                        loc=base_val, scale=aberration_std, size=n
+                        loc=base_val, scale=std, size=n
                     )
             else:
                 aberration_samples = {}
-                half = aberration_std * np.sqrt(3)
                 for j in zernike_indices:
+                    std = aberration_std_dict.get(j, 0.0)
+                    half = std * np.sqrt(3)
                     base_val = self.optical_system.zernike_coefficients.get(j, 0.0)
                     aberration_samples[j] = rng.uniform(
                         low=base_val - half, high=base_val + half, size=n

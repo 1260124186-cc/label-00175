@@ -1703,6 +1703,279 @@ class ProcessWindowAnalyzer:
 
         return fig
 
+    def plot_monte_carlo_scatter(
+        self,
+        mc_result: MonteCarloResult,
+        metric: str = 'cd_error',
+        title: Optional[str] = None,
+        save_path: Optional[str] = None,
+        show: bool = True,
+        figsize: Tuple[int, int] = (10, 8),
+        cd_tolerance: Optional[float] = None,
+    ) -> Any:
+        """
+        绘制蒙特卡洛采样在 focus-dose 平面上的散点图
+
+        每个点代表一个蒙特卡洛采样，颜色表示对应指标的大小，
+        并用不同符号区分可打印/不可打印。
+
+        Args:
+            mc_result: 蒙特卡洛分析结果
+            metric: 用于颜色编码的指标: 'cd', 'cd_error', 'epe', 'mse', 'ssim', 'ils', 'nils'
+            title: 图表标题
+            save_path: 保存路径
+            show: 是否显示
+            figsize: 图像尺寸
+            cd_tolerance: 用于判断可打印性的 CD 相对容差，None 则使用 mc_result 中的值
+
+        Returns:
+            Figure 对象
+        """
+        import matplotlib.pyplot as plt
+
+        metric_map = {
+            'cd': (mc_result.cd_stats, 'CD (nm)'),
+            'cd_error': (mc_result.cd_error_stats, 'CD 误差 (nm)'),
+            'epe': (mc_result.epe_stats, 'EPE (nm)'),
+            'mse': (mc_result.mse_stats, 'MSE'),
+            'ssim': (mc_result.ssim_stats, 'SSIM'),
+            'ils': (mc_result.ils_stats, 'ILS'),
+            'nils': (mc_result.nils_stats, 'NILS'),
+        }
+
+        if metric not in metric_map:
+            raise ValueError(
+                f"未知指标 '{metric}'，可选值: {list(metric_map.keys())}"
+            )
+
+        stats, metric_name = metric_map[metric]
+        if stats.samples is None:
+            raise ValueError(
+                "采样值未保存，请在 monte_carlo_analysis 中设置 save_samples=True"
+            )
+
+        conditions = mc_result.sampled_conditions
+        focus_vals = np.array([c.defocus for c in conditions])
+        dose_vals = np.array([c.dose for c in conditions])
+        metric_vals = stats.samples
+
+        if cd_tolerance is not None:
+            cd_tgt = self.cd_target
+            cd_samples = mc_result.cd_stats.samples
+            if cd_samples is not None:
+                cd_lower = cd_tgt * (1.0 - cd_tolerance)
+                cd_upper = cd_tgt * (1.0 + cd_tolerance)
+                passing = (cd_samples >= cd_lower) & (cd_samples <= cd_upper)
+            else:
+                passing = np.ones(len(focus_vals), dtype=bool)
+        else:
+            passing = np.ones(len(focus_vals), dtype=bool)
+
+        fig, ax = plt.subplots(figsize=figsize)
+
+        sc_pass = ax.scatter(
+            focus_vals[passing], dose_vals[passing],
+            c=metric_vals[passing], cmap='viridis',
+            marker='o', s=60, alpha=0.8, edgecolors='white', linewidths=0.5,
+            label='可打印'
+        )
+
+        if np.any(~passing):
+            sc_fail = ax.scatter(
+                focus_vals[~passing], dose_vals[~passing],
+                c=metric_vals[~passing], cmap='viridis',
+                marker='x', s=80, alpha=0.9, linewidths=1.5,
+                label='不可打印'
+            )
+
+        worst = mc_result.worst_condition
+        ax.scatter(
+            worst.defocus, worst.dose,
+            c='red', marker='*', s=300, edgecolors='black', linewidths=1,
+            label=f'最坏情况 (focus={worst.defocus:.0f}nm, dose={worst.dose:.3f})'
+        )
+
+        ax.axvline(0.0, color='gray', linestyle='--', alpha=0.5, label='标称 focus')
+        ax.axhline(1.0, color='gray', linestyle=':', alpha=0.5, label='标称 dose')
+
+        cbar = plt.colorbar(sc_pass, ax=ax)
+        cbar.set_label(metric_name, fontsize=12)
+
+        ax.set_xlabel('Focus (nm)', fontsize=12)
+        ax.set_ylabel('Dose', fontsize=12)
+        if title is None:
+            title = f"蒙特卡洛采样散点图 (N={mc_result.n_samples})"
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.legend(loc='best', fontsize=10)
+        ax.grid(True, alpha=0.3, linestyle=':')
+
+        info_text = (
+            f"可打印比例: {mc_result.passing_ratio * 100:.1f}%\n"
+            f"{metric_name} 均值: {stats.mean:.3f}\n"
+            f"{metric_name} 最坏: {stats.worst_case:.3f}"
+        )
+        ax.text(0.02, 0.98, info_text, transform=ax.transAxes,
+                fontsize=10, verticalalignment='top', horizontalalignment='left',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+        plt.tight_layout()
+
+        if save_path:
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(save_path, dpi=150, bbox_inches='tight')
+            logger.info(f"图像已保存: {save_path}")
+
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+        return fig
+
+    def run_monte_carlo_full_analysis(
+        self,
+        config: Optional[MonteCarloConfig] = None,
+        cd_tolerance: float = 0.1,
+        cd_target: Optional[float] = None,
+        output_dir: Optional[str] = None,
+        show: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        一站式蒙特卡洛工艺鲁棒性完整分析
+
+        依次执行：蒙特卡洛采样 → 统计分析 → 可视化输出
+
+        Args:
+            config: 蒙特卡洛采样配置，None 则使用默认配置
+            cd_tolerance: CD 相对容差
+            cd_target: 目标 CD (nm)，None 则从目标图自动测量
+            output_dir: 输出目录，None 则不保存图片
+            show: 是否显示图片
+
+        Returns:
+            包含 mc_result, figures 的字典
+        """
+        save_prefix = None
+        if output_dir is not None:
+            save_prefix = Path(output_dir)
+            save_prefix.mkdir(parents=True, exist_ok=True)
+
+        mc_result = self.monte_carlo_analysis(
+            config=config,
+            cd_tolerance=cd_tolerance,
+            cd_target=cd_target,
+            save_samples=True,
+        )
+
+        print(mc_result.summary())
+
+        figures = {}
+
+        if save_prefix is not None:
+            for metric in ['cd_error', 'cd', 'epe', 'mse', 'ssim', 'ils', 'nils']:
+                try:
+                    fig_hist = self.plot_monte_carlo_histogram(
+                        mc_result, metric=metric,
+                        save_path=str(save_prefix / f'mc_hist_{metric}.png'),
+                        show=show,
+                    )
+                    figures[f'hist_{metric}'] = fig_hist
+                except Exception as e:
+                    logger.warning(f"绘制 {metric} 直方图失败: {e}")
+
+            try:
+                fig_scatter = self.plot_monte_carlo_scatter(
+                    mc_result, metric='cd_error',
+                    save_path=str(save_prefix / 'mc_scatter_cd_error.png'),
+                    show=show,
+                    cd_tolerance=cd_tolerance,
+                )
+                figures['scatter_cd_error'] = fig_scatter
+            except Exception as e:
+                logger.warning(f"绘制散点图失败: {e}")
+        else:
+            fig_hist = self.plot_monte_carlo_histogram(
+                mc_result, metric='cd_error', show=show
+            )
+            figures['hist_cd_error'] = fig_hist
+
+            fig_scatter = self.plot_monte_carlo_scatter(
+                mc_result, metric='cd_error', show=show,
+                cd_tolerance=cd_tolerance,
+            )
+            figures['scatter_cd_error'] = fig_scatter
+
+        return {
+            'mc_result': mc_result,
+            'figures': figures,
+        }
+
+
+def quick_monte_carlo_analysis(
+    mask: np.ndarray,
+    target: np.ndarray,
+    optical_system: Optional[OpticalSystem] = None,
+    n_samples: int = 100,
+    focus_std: float = 30.0,
+    dose_std: float = 0.05,
+    aberration_std: Optional[Union[float, Dict[int, float]]] = None,
+    cd_tolerance: float = 0.1,
+    cd_target: Optional[float] = None,
+    pixel_size: float = 1.0,
+    threshold: float = 0.3,
+    random_seed: Optional[int] = None,
+    distribution: str = 'normal',
+    output_dir: Optional[str] = None,
+    show: bool = False,
+) -> Dict[str, Any]:
+    """
+    快速蒙特卡洛工艺鲁棒性分析（便捷入口函数）
+
+    Args:
+        mask: 掩模图案
+        target: 目标图案
+        optical_system: 光学系统参数
+        n_samples: 蒙特卡洛采样数量
+        focus_std: 离焦量标准差 (nm)
+        dose_std: 剂量相对标准差
+        aberration_std: 像差系数标准差（波长λ），float 或 Dict[int, float]
+        cd_tolerance: CD 相对容差
+        cd_target: 目标 CD (nm)
+        pixel_size: 像素尺寸 (nm)
+        threshold: 光刻胶阈值
+        random_seed: 随机种子
+        distribution: 分布类型: 'normal' 或 'uniform'
+        output_dir: 输出目录
+        show: 是否显示图片
+
+    Returns:
+        包含 mc_result, figures 的字典
+    """
+    analyzer = ProcessWindowAnalyzer(
+        mask=mask,
+        target=target,
+        optical_system=optical_system,
+        threshold=threshold,
+        pixel_size=pixel_size,
+    )
+
+    config = MonteCarloConfig(
+        n_samples=n_samples,
+        focus_std=focus_std,
+        dose_std=dose_std,
+        aberration_std=aberration_std,
+        random_seed=random_seed,
+        distribution=distribution,
+    )
+
+    return analyzer.run_monte_carlo_full_analysis(
+        config=config,
+        cd_tolerance=cd_tolerance,
+        cd_target=cd_target,
+        output_dir=output_dir,
+        show=show,
+    )
+
 
 def quick_process_window_analysis(
     mask: np.ndarray,
