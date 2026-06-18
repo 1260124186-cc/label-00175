@@ -1,0 +1,15 @@
+{
+  "workflow_type": "OPC",
+  "workflow_version": "1.0.0",
+  "checkpoint_id": "ckpt_1781768562268_0e9c2fa0",
+  "created_at": 1781768562.268335,
+  "created_at_iso": "2026-06-18T15:42:42",
+  "outer_iteration": 1,
+  "inner_iteration": 0,
+  "current_phase": "opc_iteration",
+  "best_loss": 21.376194355463095,
+  "loss_count": 1,
+  "has_source": false,
+  "has_mask": true,
+  "config_hash": "1cd1f598cbeaf1d5"
+}

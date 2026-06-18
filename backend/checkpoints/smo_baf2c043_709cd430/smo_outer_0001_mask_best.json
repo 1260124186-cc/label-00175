@@ -1,0 +1,15 @@
+{
+  "workflow_type": "SMO",
+  "workflow_version": "1.0.0",
+  "checkpoint_id": "ckpt_1781768636141_785b1691",
+  "created_at": 1781768636.141325,
+  "created_at_iso": "2026-06-18T15:43:56",
+  "outer_iteration": 1,
+  "inner_iteration": 0,
+  "current_phase": "mask",
+  "best_loss": 0.09317626809477636,
+  "loss_count": 2,
+  "has_source": true,
+  "has_mask": true,
+  "config_hash": "e734f0d8b2aacf06"
+}

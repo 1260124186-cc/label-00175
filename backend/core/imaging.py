@@ -22,6 +22,15 @@ from core.fft import (
     remove_padding,
 )
 from core.array_backend import get_backend, DeviceType
+from core.polarization import (
+    JonesVector,
+    ThinFilmStack,
+    VectorPupil,
+    compute_polarized_pupil,
+    compute_partial_coherent_vectorial,
+    create_high_na_immersion_system,
+    create_euv_reflective_system,
+)
 
 
 def _use_gpu() -> bool:
@@ -151,6 +160,10 @@ class ProcessCondition:
         reflective_mask_attenuation: 反射式掩模衰减因子 (0~1)，EUV 特有
         technology_node: 技术节点类型
         zernike_coefficients: Zernike 像差系数（单位: 波长λ）
+        use_vector_pupil: 是否使用矢量光瞳模型（考虑偏振效应）
+        incident_polarization_angle: 入射偏振方向（度），仅线偏振时有效
+        n_immersion: 浸没介质折射率，1.0为干式，1.437为ArF水浸没
+        use_mask_coating: 是否启用掩模涂层（多层膜/抗反射膜）效应
         name: 工艺条件名称，用于日志和结果标识
         weight: 该工艺条件在优化中的权重
     """
@@ -164,6 +177,10 @@ class ProcessCondition:
     reflective_mask_attenuation: float = 0.0
     technology_node: TechnologyNode = TechnologyNode.DUV_ARF
     zernike_coefficients: Dict[int, float] = field(default_factory=dict)
+    use_vector_pupil: bool = False
+    incident_polarization_angle: float = 0.0
+    n_immersion: float = 1.0
+    use_mask_coating: bool = False
     name: str = ""
     weight: float = 1.0
 
@@ -189,6 +206,10 @@ class ProcessCondition:
             reflective_mask_attenuation=optics.reflective_mask_attenuation,
             technology_node=optics.technology_node,
             zernike_coefficients=dict(optics.zernike_coefficients),
+            use_vector_pupil=optics.use_vector_pupil,
+            incident_polarization_angle=optics.incident_polarization_angle,
+            n_immersion=optics.n_immersion,
+            use_mask_coating=optics.use_mask_coating,
             name=name,
             weight=weight
         )
@@ -209,6 +230,10 @@ class ProcessCondition:
             'shadowing_model': self.shadowing_model.value,
             'reflective_mask_attenuation': self.reflective_mask_attenuation,
             'technology_node': self.technology_node.value,
+            'use_vector_pupil': self.use_vector_pupil,
+            'incident_polarization_angle': self.incident_polarization_angle,
+            'n_immersion': self.n_immersion,
+            'use_mask_coating': self.use_mask_coating,
             'name': self.name,
             'weight': self.weight,
             'zernike_coefficients': zernike_out if zernike_out else {}
@@ -243,7 +268,11 @@ class ProcessCondition:
                 shadowing_model=self.shadowing_model,
                 reflective_mask_attenuation=self.reflective_mask_attenuation,
                 technology_node=self.technology_node,
-                zernike_coefficients=merged_zernike
+                zernike_coefficients=merged_zernike,
+                use_vector_pupil=self.use_vector_pupil,
+                incident_polarization_angle=self.incident_polarization_angle,
+                n_immersion=self.n_immersion,
+                use_mask_coating=self.use_mask_coating
             )
         else:
             return OpticalSystem(
@@ -255,7 +284,11 @@ class ProcessCondition:
                 shadowing_model=self.shadowing_model,
                 reflective_mask_attenuation=self.reflective_mask_attenuation,
                 technology_node=self.technology_node,
-                zernike_coefficients=self.zernike_coefficients
+                zernike_coefficients=self.zernike_coefficients,
+                use_vector_pupil=self.use_vector_pupil,
+                incident_polarization_angle=self.incident_polarization_angle,
+                n_immersion=self.n_immersion,
+                use_mask_coating=self.use_mask_coating
             )
 
 
@@ -279,6 +312,10 @@ class ProcessWindow:
         shadowing_model_values: 阴影效应模型扫描值
         reflective_mask_attenuation_values: 反射式掩模衰减因子扫描值
         technology_node_values: 技术节点扫描值
+        use_vector_pupil_values: 是否使用矢量光瞳模型扫描值
+        incident_polarization_angle_values: 入射偏振角度扫描值（度）
+        n_immersion_values: 浸没介质折射率扫描值
+        use_mask_coating_values: 是否使用掩模涂层效应扫描值
         default_weight: 默认权重
     """
     defocus_values: Any = 0.0
@@ -290,6 +327,10 @@ class ProcessWindow:
     shadowing_model_values: Any = ShadowingEffectModel.NONE
     reflective_mask_attenuation_values: Any = 0.0
     technology_node_values: Any = TechnologyNode.DUV_ARF
+    use_vector_pupil_values: Any = False
+    incident_polarization_angle_values: Any = 0.0
+    n_immersion_values: Any = 1.0
+    use_mask_coating_values: Any = False
     default_weight: float = 1.0
 
     @staticmethod
@@ -351,10 +392,15 @@ class ProcessWindow:
         shadowing_list = self._normalize_enum_values(self.shadowing_model_values, ShadowingEffectModel)
         attenuation_list = self._normalize_scan_values(self.reflective_mask_attenuation_values)
         tech_node_list = self._normalize_enum_values(self.technology_node_values, TechnologyNode)
+        use_vec_pupil_list = self._normalize_scan_values(self.use_vector_pupil_values)
+        pol_angle_list = self._normalize_scan_values(self.incident_polarization_angle_values)
+        n_immersion_list = self._normalize_scan_values(self.n_immersion_values)
+        use_mask_coating_list = self._normalize_scan_values(self.use_mask_coating_values)
 
         all_combos = list(product(
             defocus_list, dose_list, na_list, sigma_list, wavelength_list,
-            flare_list, shadowing_list, attenuation_list, tech_node_list
+            flare_list, shadowing_list, attenuation_list, tech_node_list,
+            use_vec_pupil_list, pol_angle_list, n_immersion_list, use_mask_coating_list
         ))
 
         n_conditions = len(all_combos)
@@ -378,9 +424,11 @@ class ProcessWindow:
             wl_center = (min(wavelength_list) + max(wavelength_list)) / 2
             flare_center = (min(flare_list) + max(flare_list)) / 2
             atten_center = (min(attenuation_list) + max(attenuation_list)) / 2
+            pol_angle_center = (min(pol_angle_list) + max(pol_angle_list)) / 2
+            n_immersion_center = (min(n_immersion_list) + max(n_immersion_list)) / 2
 
             distances = []
-            for df, d, na, sg, wl, fl, sh, at, tn in all_combos:
+            for df, d, na, sg, wl, fl, sh, at, tn, uvp, pa, ni, umc in all_combos:
                 dist = np.sqrt(
                     ((df - df_center) / (max(defocus_list) - min(defocus_list) + 1e-12))**2 +
                     ((d - dose_center) / (max(dose_list) - min(dose_list) + 1e-12))**2 +
@@ -388,7 +436,9 @@ class ProcessWindow:
                     ((sg - sigma_center) / (max(sigma_list) - min(sigma_list) + 1e-12))**2 +
                     ((wl - wl_center) / (max(wavelength_list) - min(wavelength_list) + 1e-12))**2 +
                     ((fl - flare_center) / (max(flare_list) - min(flare_list) + 1e-12))**2 +
-                    ((at - atten_center) / (max(attenuation_list) - min(attenuation_list) + 1e-12))**2
+                    ((at - atten_center) / (max(attenuation_list) - min(attenuation_list) + 1e-12))**2 +
+                    ((pa - pol_angle_center) / (max(pol_angle_list) - min(pol_angle_list) + 1e-12))**2 +
+                    ((ni - n_immersion_center) / (max(n_immersion_list) - min(n_immersion_list) + 1e-12))**2
                 )
                 distances.append(dist)
 
@@ -397,9 +447,11 @@ class ProcessWindow:
                 weight_list[min_dist_idx] *= float(center_weight_boost)
 
         conditions = []
-        for idx, (df, d, na, sg, wl, fl, sh, at, tn) in enumerate(all_combos):
+        for idx, (df, d, na, sg, wl, fl, sh, at, tn, uvp, pa, ni, umc) in enumerate(all_combos):
             w = weight_list[idx]
             tech_str = f"_tech={tn.value}" if tn != TechnologyNode.DUV_ARF else ""
+            vec_str = f"_vec={uvp}" if uvp else ""
+            coat_str = f"_coat={umc}" if umc else ""
             cond = ProcessCondition(
                 defocus=df,
                 dose=d,
@@ -410,8 +462,12 @@ class ProcessWindow:
                 shadowing_model=sh,
                 reflective_mask_attenuation=at,
                 technology_node=tn,
+                use_vector_pupil=bool(uvp),
+                incident_polarization_angle=pa,
+                n_immersion=ni,
+                use_mask_coating=bool(umc),
                 weight=w,
-                name=f"cond_{idx:03d}_df={df:.0f}_dose={d:.2f}_NA={na:.2f}_σ={sg:.2f}{tech_str}"
+                name=f"cond_{idx:03d}_df={df:.0f}_dose={d:.2f}_NA={na:.2f}_σ={sg:.2f}{tech_str}{vec_str}{coat_str}"
             )
             conditions.append(cond)
 
@@ -513,6 +569,13 @@ class OpticalSystem:
         flare: Flare 系数 (0~1)，EUV 系统中杂散光的比例
         shadowing_model: 阴影效应近似模型（EUV 特有）
         reflective_mask_attenuation: 反射式掩模衰减因子 (0~1)，EUV 特有
+        use_vector_pupil: 是否使用矢量光瞳模型（考虑偏振效应）
+        incident_polarization_angle: 入射偏振方向（度），仅线偏振时有效
+        n_immersion: 浸没介质折射率，1.0为干式，1.437为ArF水浸没
+        use_mask_coating: 是否启用掩模涂层（多层膜/抗反射膜）效应
+        vector_pupil: 矢量光瞳实例（内部使用，由参数自动构建）
+        mask_stack: 薄膜堆栈实例（内部使用，由参数自动构建）
+        incident_polarization: 入射偏振态（内部使用，由参数自动构建）
     """
     wavelength: float = 193.0  # ArF光源波长
     na: float = 1.35  # 高NA浸没式光刻
@@ -531,6 +594,13 @@ class OpticalSystem:
     shadowing_model: ShadowingEffectModel = ShadowingEffectModel.NONE
     reflective_mask_attenuation: float = 0.0  # 反射式掩模衰减因子
     zernike_coefficients: Dict[int, float] = field(default_factory=dict)
+    use_vector_pupil: bool = False
+    incident_polarization_angle: float = 0.0
+    n_immersion: float = 1.0
+    use_mask_coating: bool = False
+    vector_pupil: Optional[VectorPupil] = None
+    mask_stack: Optional[ThinFilmStack] = None
+    incident_polarization: Optional[JonesVector] = None
 
     def __post_init__(self):
         """初始化后处理：设置默认光源参数，处理 use_socs 向后兼容
@@ -543,6 +613,10 @@ class OpticalSystem:
         技术节点自动配置：
         - EUV 节点自动设置波长 13.5nm、NA 0.33、典型参数
         - DUV ArF 节点保持默认 193nm、NA 1.35
+
+        偏振与薄膜效应自动配置：
+        - 根据技术节点自动创建矢量光瞳和薄膜堆栈
+        - 配置入射偏振态
         """
         if self.technology_node == TechnologyNode.EUV:
             if self.wavelength == 193.0:
@@ -551,6 +625,11 @@ class OpticalSystem:
                 self.na = 0.33
             if self.magnification == 4.0:
                 self.magnification = 4.0
+            if self.n_immersion == 1.0 and self.use_vector_pupil:
+                self.n_immersion = 1.0
+        if self.technology_node == TechnologyNode.DUV_ARF and self.na > 1.0:
+            if self.n_immersion == 1.0 and self.use_vector_pupil:
+                self.n_immersion = 1.437
         if not self.source_params:
             self._set_default_source_params()
         if self.tcc_mode is None:
@@ -561,6 +640,39 @@ class OpticalSystem:
                     self.tcc_mode = TCCMode.FULL_TCC
             else:
                 self.tcc_mode = TCCMode.SOCS
+        self._setup_polarization_and_coating()
+
+    def _setup_polarization_and_coating(self):
+        """配置偏振态和薄膜涂层效应"""
+        if self.incident_polarization is None:
+            self.incident_polarization = JonesVector.linear_polarization(
+                self.incident_polarization_angle
+            )
+        if self.use_mask_coating and self.mask_stack is None:
+            if self.technology_node == TechnologyNode.EUV:
+                self.mask_stack = ThinFilmStack.euv_multilayer(
+                    num_pairs=40, wavelength_nm=self.wavelength
+                )
+            else:
+                self.mask_stack = ThinFilmStack.arf_antireflective(
+                    wavelength_nm=self.wavelength
+                )
+        if self.use_vector_pupil and self.vector_pupil is None:
+            if self.technology_node == TechnologyNode.EUV:
+                self.vector_pupil = create_euv_reflective_system(
+                    wavelength_nm=self.wavelength,
+                    na=self.na,
+                    num_multilayer_pairs=40,
+                    grid_size=(256, 256),
+                    incident_polarization=self.incident_polarization,
+                )
+            else:
+                self.vector_pupil = create_high_na_immersion_system(
+                    wavelength_nm=self.wavelength,
+                    na=self.na,
+                    grid_size=(256, 256),
+                    incident_polarization=self.incident_polarization,
+                )
 
     def _set_default_source_params(self):
         """设置默认光源参数"""
@@ -643,6 +755,11 @@ class OpticalSystem:
         zernike_raw = optics_config.get('zernike_coefficients', {})
         zernike_coefficients = _parse_zernike_coefficients(zernike_raw)
 
+        use_vector_pupil = optics_config.get('use_vector_pupil', False)
+        incident_polarization_angle = optics_config.get('incident_polarization_angle', 0.0)
+        n_immersion = optics_config.get('n_immersion', 1.0)
+        use_mask_coating = optics_config.get('use_mask_coating', False)
+
         return cls(
             wavelength=optics_config.get('wavelength', 193.0),
             na=optics_config.get('na', 1.35),
@@ -658,7 +775,11 @@ class OpticalSystem:
             flare=optics_config.get('flare', 0.0),
             shadowing_model=shadowing_model,
             reflective_mask_attenuation=optics_config.get('reflective_mask_attenuation', 0.0),
-            zernike_coefficients=zernike_coefficients
+            zernike_coefficients=zernike_coefficients,
+            use_vector_pupil=use_vector_pupil,
+            incident_polarization_angle=incident_polarization_angle,
+            n_immersion=n_immersion,
+            use_mask_coating=use_mask_coating
         )
 
     @property
@@ -693,6 +814,10 @@ class OpticalSystem:
             'flare': self.flare,
             'shadowing_model': self.shadowing_model.value,
             'reflective_mask_attenuation': self.reflective_mask_attenuation,
+            'use_vector_pupil': self.use_vector_pupil,
+            'incident_polarization_angle': self.incident_polarization_angle,
+            'n_immersion': self.n_immersion,
+            'use_mask_coating': self.use_mask_coating,
             'zernike_coefficients': zernike_out if zernike_out else {}
         }
 
@@ -706,6 +831,10 @@ class OpticalSystem:
         shadowing_model_values: Any = None,
         reflective_mask_attenuation_values: Any = None,
         technology_node_values: Any = None,
+        use_vector_pupil_values: Any = None,
+        incident_polarization_angle_values: Any = None,
+        n_immersion_values: Any = None,
+        use_mask_coating_values: Any = None,
         center_weight_boost: Optional[float] = None,
         default_weight: float = 1.0
     ) -> Tuple[List['OpticalSystem'], List[float], List[ProcessCondition]]:
@@ -728,6 +857,10 @@ class OpticalSystem:
             shadowing_model_values: 阴影效应模型扫描值，None 则使用当前模型
             reflective_mask_attenuation_values: 反射式掩模衰减因子扫描值，格式同上
             technology_node_values: 技术节点扫描值，None 则使用当前节点
+            use_vector_pupil_values: 是否使用矢量光瞳模型扫描值
+            incident_polarization_angle_values: 入射偏振角度扫描值（度）
+            n_immersion_values: 浸没介质折射率扫描值
+            use_mask_coating_values: 是否使用掩模涂层效应扫描值
             center_weight_boost: 中心条件额外权重倍率，None 则不区分
             default_weight: 所有条件的默认基础权重
 
@@ -764,6 +897,19 @@ class OpticalSystem:
             technology_node_values if technology_node_values is not None else self.technology_node,
             TechnologyNode
         )
+        use_vec_pupil_vals = ProcessWindow._normalize_scan_values(
+            use_vector_pupil_values if use_vector_pupil_values is not None else self.use_vector_pupil
+        )
+        pol_angle_vals = ProcessWindow._normalize_scan_values(
+            incident_polarization_angle_values if incident_polarization_angle_values is not None
+            else self.incident_polarization_angle
+        )
+        n_immersion_vals = ProcessWindow._normalize_scan_values(
+            n_immersion_values if n_immersion_values is not None else self.n_immersion
+        )
+        use_mask_coat_vals = ProcessWindow._normalize_scan_values(
+            use_mask_coating_values if use_mask_coating_values is not None else self.use_mask_coating
+        )
 
         pw = ProcessWindow(
             defocus_values=df_vals,
@@ -775,6 +921,10 @@ class OpticalSystem:
             shadowing_model_values=shadowing_vals,
             reflective_mask_attenuation_values=attenuation_vals,
             technology_node_values=tech_node_vals,
+            use_vector_pupil_values=use_vec_pupil_vals,
+            incident_polarization_angle_values=pol_angle_vals,
+            n_immersion_values=n_immersion_vals,
+            use_mask_coating_values=use_mask_coat_vals,
             default_weight=default_weight
         )
         conditions = pw.generate_conditions(center_weight_boost=center_weight_boost)
@@ -1679,7 +1829,12 @@ class PartialCoherentImaging:
         self.fy = _tonumpy(fy_grid)
 
     def _compute_source_and_pupil(self):
-        """计算光源分布和光瞳函数（含离焦和Zernike像差）"""
+        """计算光源分布和光瞳函数（含离焦和Zernike像差）
+
+        支持两种光瞳计算模式：
+        - 标量模式（默认）：使用传统标量光瞳函数，不考虑偏振效应
+        - 矢量模式：考虑偏振效应和薄膜涂层的矢量光瞳函数
+        """
         cutoff = self.optics.cutoff_frequency
 
         zernike_phase = compute_zernike_phase(
@@ -1687,11 +1842,31 @@ class PartialCoherentImaging:
             self.optics.zernike_coefficients
         )
 
-        self.pupil = _compute_pupil_with_aberrations(
-            self.fx, self.fy, cutoff,
-            self.optics.defocus, self.optics.wavelength,
-            zernike_phase
-        )
+        self.vector_pupil_dict = None
+
+        if self.optics.use_vector_pupil:
+            is_reflection = self.optics.technology_node == TechnologyNode.EUV
+            polarized_result = compute_polarized_pupil(
+                fx=self.fx,
+                fy=self.fy,
+                wavelength_nm=self.optics.wavelength,
+                na=self.optics.na,
+                cutoff=cutoff,
+                defocus_nm=self.optics.defocus,
+                zernike_phase=zernike_phase,
+                incident_polarization=self.optics.incident_polarization,
+                n_immersion=complex(self.optics.n_immersion),
+                mask_stack=self.optics.mask_stack,
+                is_reflection=is_reflection,
+            )
+            self.pupil = polarized_result['pupil_scalar']
+            self.vector_pupil_dict = polarized_result
+        else:
+            self.pupil = _compute_pupil_with_aberrations(
+                self.fx, self.fy, cutoff,
+                self.optics.defocus, self.optics.wavelength,
+                zernike_phase
+            )
 
         self.source = generate_source(
             self.fx, self.fy,
@@ -1733,10 +1908,12 @@ class PartialCoherentImaging:
         """
         计算空间像（晶圆上的光强分布）
 
-        支持三种 TCC 计算模式：
-        - FULL_TCC: 光源积分法（Hopkins公式），精度最高，复杂度 O(M·N² log N)
-        - SOCS: SOCS 低秩近似，复杂度 O(K·N² log N)
-        - KERNEL_2D: 二维 TCC 核对角近似，最快，复杂度 O(N² log N)
+        支持两种成像模式：
+        - 标量模式（默认）：使用传统标量光瞳函数，支持三种 TCC 计算模式
+            * FULL_TCC: 光源积分法（Hopkins公式），精度最高，复杂度 O(M·N² log N)
+            * SOCS: SOCS 低秩近似，复杂度 O(K·N² log N)
+            * KERNEL_2D: 二维 TCC 核对角近似，最快，复杂度 O(N² log N)
+        - 矢量模式：考虑偏振效应和薄膜涂层的矢量成像模型，使用 Abbe 方法
 
         如果初始化时指定了窗函数和/或零填充，会在FFT前对掩模
         做加窗和零填充处理，计算完成后裁剪回原始尺寸。
@@ -1751,67 +1928,79 @@ class PartialCoherentImaging:
         """
         backend = get_backend()
         processed_mask = self._preprocess_mask(mask)
-        mask_c = _asarray(processed_mask).astype(backend.complex128)
-        ny_eff, nx_eff = processed_mask.shape
-        mode = self.optics.tcc_mode
 
-        if mode == TCCMode.SOCS and self.socs_eigenvalues is not None:
-            intensity = backend.zeros((ny_eff, nx_eff), dtype=backend.float64)
-            mask_spectrum = backend.fft2(mask_c)
-            eigenvalues = _asarray(self.socs_eigenvalues)
-            eigenfunctions = _asarray(self.socs_eigenfunctions)
-
-            for i in range(len(eigenvalues)):
-                lam = eigenvalues[i]
-                if lam < 1e-10:
-                    continue
-                phi = eigenfunctions[i]
-                filtered = mask_spectrum * phi
-                field_i = backend.ifft2(filtered)
-                intensity = intensity + lam * backend.abs(field_i)**2
-        elif mode == TCCMode.KERNEL_2D and self.tcc_kernel is not None:
-            mask_spectrum = backend.fft2(mask_c)
-            tcc_kernel = _asarray(self.tcc_kernel)
-            effective_pupil = backend.sqrt(backend.maximum(tcc_kernel, 0.0))
-            filtered = mask_spectrum * effective_pupil
-            field = backend.ifft2(filtered)
-            intensity = backend.abs(field)**2
+        if self.optics.use_vector_pupil and self.vector_pupil_dict is not None:
+            intensity = compute_partial_coherent_vectorial(
+                mask=processed_mask,
+                source=self.source,
+                vector_pupils=self.vector_pupil_dict,
+                dfx=self.dfx,
+                dfy=self.dfy,
+            )
+            intensity_np = intensity
         else:
-            intensity = backend.zeros((ny_eff, nx_eff), dtype=backend.float64)
-            mask_spectrum = backend.fft2(mask_c)
-            cutoff = self.optics.cutoff_frequency
+            mask_c = _asarray(processed_mask).astype(backend.complex128)
+            ny_eff, nx_eff = processed_mask.shape
+            mode = self.optics.tcc_mode
 
-            source = _asarray(self.source)
-            fx = _asarray(self.fx)
-            fy = _asarray(self.fy)
-            pupil = _asarray(self.pupil)
+            if mode == TCCMode.SOCS and self.socs_eigenvalues is not None:
+                intensity = backend.zeros((ny_eff, nx_eff), dtype=backend.float64)
+                mask_spectrum = backend.fft2(mask_c)
+                eigenvalues = _asarray(self.socs_eigenvalues)
+                eigenfunctions = _asarray(self.socs_eigenfunctions)
 
-            source_indices = backend.where_idx(source > 1e-10)
-            source_values = source[source_indices]
-
-            for idx in range(len(source_indices[0])):
-                sy, sx = int(source_indices[0][idx]), int(source_indices[1][idx])
-                src_val = source_values[idx]
-
-                fs_x = fx[sy, sx]
-                fs_y = fy[sy, sx]
-
-                if backend.sqrt(fs_x**2 + fs_y**2) > cutoff:
-                    continue
-
-                pupil_shifted = _shift_pupil(pupil, fs_x, fs_y, self.dfx, self.dfy)
-                filtered = mask_spectrum * pupil_shifted
-                field_i = backend.ifft2(filtered)
-                intensity = intensity + src_val * backend.abs(field_i)**2
-
-        if self.pad_width is not None:
-            if isinstance(self.pad_width, int):
-                py, px = self.pad_width, self.pad_width
+                for i in range(len(eigenvalues)):
+                    lam = eigenvalues[i]
+                    if lam < 1e-10:
+                        continue
+                    phi = eigenfunctions[i]
+                    filtered = mask_spectrum * phi
+                    field_i = backend.ifft2(filtered)
+                    intensity = intensity + lam * backend.abs(field_i)**2
+            elif mode == TCCMode.KERNEL_2D and self.tcc_kernel is not None:
+                mask_spectrum = backend.fft2(mask_c)
+                tcc_kernel = _asarray(self.tcc_kernel)
+                effective_pupil = backend.sqrt(backend.maximum(tcc_kernel, 0.0))
+                filtered = mask_spectrum * effective_pupil
+                field = backend.ifft2(filtered)
+                intensity = backend.abs(field)**2
             else:
-                py, px = self.pad_width
-            intensity = intensity[py:py + self.image_size[0], px:px + self.image_size[1]]
+                intensity = backend.zeros((ny_eff, nx_eff), dtype=backend.float64)
+                mask_spectrum = backend.fft2(mask_c)
+                cutoff = self.optics.cutoff_frequency
 
-        intensity_np = _tonumpy(intensity.astype(backend.float64))
+                source = _asarray(self.source)
+                fx = _asarray(self.fx)
+                fy = _asarray(self.fy)
+                pupil = _asarray(self.pupil)
+
+                source_indices = backend.where_idx(source > 1e-10)
+                source_values = source[source_indices]
+
+                for idx in range(len(source_indices[0])):
+                    sy, sx = int(source_indices[0][idx]), int(source_indices[1][idx])
+                    src_val = source_values[idx]
+
+                    fs_x = fx[sy, sx]
+                    fs_y = fy[sy, sx]
+
+                    if backend.sqrt(fs_x**2 + fs_y**2) > cutoff:
+                        continue
+
+                    pupil_shifted = _shift_pupil(pupil, fs_x, fs_y, self.dfx, self.dfy)
+                    filtered = mask_spectrum * pupil_shifted
+                    field_i = backend.ifft2(filtered)
+                    intensity = intensity + src_val * backend.abs(field_i)**2
+
+            if self.pad_width is not None:
+                if isinstance(self.pad_width, int):
+                    py, px = self.pad_width, self.pad_width
+                else:
+                    py, px = self.pad_width
+                intensity = intensity[py:py + self.image_size[0], px:px + self.image_size[1]]
+
+            intensity_np = _tonumpy(intensity.astype(backend.float64))
+
         intensity_np = self._apply_flare(intensity_np)
 
         if intensity_np.max() > 0:
