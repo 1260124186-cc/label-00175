@@ -37,8 +37,180 @@ from core.litho_metrics import (
     extract_process_window_scan,
     ProcessWindowScanResult,
 )
+from core.metrics import mse, ssim
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MonteCarloConfig:
+    """
+    蒙特卡洛采样配置
+
+    Attributes:
+        n_samples: 采样数量
+        focus_std: 离焦量标准差 (nm)
+        dose_std: 曝光剂量相对标准差（相对于标称剂量1.0的比例）
+        aberration_std: 像差系数标准差（单位: 波长λ），可以是：
+            - float: 所有 Zernike 系数使用相同标准差
+            - Dict[int, float]: 按 Zernike 索引指定标准差
+            - None: 不考虑像差随机扰动
+        zernike_indices: 要考虑随机扰动的 Zernike 系数索引列表，
+                         None 则使用光学系统中已有的所有非零系数
+        nominal_focus: 标称离焦量 (nm)
+        nominal_dose: 标称剂量
+        random_seed: 随机种子，用于结果复现
+        distribution: 分布类型，'normal' 或 'uniform'
+    """
+    n_samples: int = 100
+    focus_std: float = 30.0
+    dose_std: float = 0.05
+    aberration_std: Optional[Union[float, Dict[int, float]]] = None
+    zernike_indices: Optional[List[int]] = None
+    nominal_focus: float = 0.0
+    nominal_dose: float = 1.0
+    random_seed: Optional[int] = None
+    distribution: str = 'normal'
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'n_samples': self.n_samples,
+            'focus_std': self.focus_std,
+            'dose_std': self.dose_std,
+            'aberration_std': self.aberration_std,
+            'zernike_indices': self.zernike_indices,
+            'nominal_focus': self.nominal_focus,
+            'nominal_dose': self.nominal_dose,
+            'random_seed': self.random_seed,
+            'distribution': self.distribution,
+        }
+
+
+@dataclass
+class MonteCarloMetricStats:
+    """
+    蒙特卡洛仿真的单个指标统计结果
+
+    Attributes:
+        mean: 均值
+        std: 标准差
+        variance: 方差
+        min: 最小值
+        max: 最大值
+        median: 中位数
+        percentile_5: 5% 分位数（悲观估计）
+        percentile_95: 95% 分位数（乐观估计）
+        worst_case: 最坏情况值（基于指标类型，越大越差或越小越差）
+        samples: 所有采样值（可选保存）
+    """
+    mean: float
+    std: float
+    variance: float
+    min: float
+    max: float
+    median: float
+    percentile_5: float
+    percentile_95: float
+    worst_case: float
+    samples: Optional[np.ndarray] = None
+
+    def to_dict(self, include_samples: bool = False) -> Dict[str, Any]:
+        result = {
+            'mean': self.mean,
+            'std': self.std,
+            'variance': self.variance,
+            'min': self.min,
+            'max': self.max,
+            'median': self.median,
+            'percentile_5': self.percentile_5,
+            'percentile_95': self.percentile_95,
+            'worst_case': self.worst_case,
+        }
+        if include_samples and self.samples is not None:
+            result['samples'] = self.samples.tolist()
+        return result
+
+
+@dataclass
+class MonteCarloResult:
+    """
+    蒙特卡洛工艺鲁棒性评估结果
+
+    Attributes:
+        n_samples: 采样数量
+        config: 蒙特卡洛配置
+        cd_stats: CD 统计 (nm)
+        cd_error_stats: CD 误差统计 (nm)
+        epe_stats: EPE 统计 (nm)
+        mse_stats: MSE 统计
+        ssim_stats: SSIM 统计
+        ils_stats: ILS 统计
+        nils_stats: NILS 统计
+        sampled_conditions: 采样的工艺条件列表
+        passing_ratio: 可打印条件比例（基于 CD 容差）
+        worst_condition: 最坏工艺条件（CD 误差最大的条件）
+    """
+    n_samples: int
+    config: MonteCarloConfig
+    cd_stats: MonteCarloMetricStats
+    cd_error_stats: MonteCarloMetricStats
+    epe_stats: MonteCarloMetricStats
+    mse_stats: MonteCarloMetricStats
+    ssim_stats: MonteCarloMetricStats
+    ils_stats: MonteCarloMetricStats
+    nils_stats: MonteCarloMetricStats
+    sampled_conditions: List[ProcessCondition]
+    passing_ratio: float
+    worst_condition: ProcessCondition
+
+    def to_dict(self, include_samples: bool = False) -> Dict[str, Any]:
+        return {
+            'n_samples': self.n_samples,
+            'config': self.config.to_dict(),
+            'cd_stats': self.cd_stats.to_dict(include_samples=include_samples),
+            'cd_error_stats': self.cd_error_stats.to_dict(include_samples=include_samples),
+            'epe_stats': self.epe_stats.to_dict(include_samples=include_samples),
+            'mse_stats': self.mse_stats.to_dict(include_samples=include_samples),
+            'ssim_stats': self.ssim_stats.to_dict(include_samples=include_samples),
+            'ils_stats': self.ils_stats.to_dict(include_samples=include_samples),
+            'nils_stats': self.nils_stats.to_dict(include_samples=include_samples),
+            'passing_ratio': self.passing_ratio,
+            'worst_condition': self.worst_condition.to_dict(),
+        }
+
+    def summary(self) -> str:
+        lines = [
+            "=== 蒙特卡洛工艺鲁棒性评估结果 ===",
+            f"  采样数量: {self.n_samples}",
+            f"  分布类型: {self.config.distribution}",
+            f"  Focus 标准差: {self.config.focus_std:.1f} nm",
+            f"  Dose 相对标准差: {self.config.dose_std * 100:.1f}%",
+            "",
+            "  CD (nm):",
+            f"    均值: {self.cd_stats.mean:.2f}, 标准差: {self.cd_stats.std:.2f}",
+            f"    范围: [{self.cd_stats.min:.2f}, {self.cd_stats.max:.2f}]",
+            f"    最坏情况: {self.cd_stats.worst_case:.2f}",
+            "",
+            "  CD 误差 (nm):",
+            f"    均值: {self.cd_error_stats.mean:.2f}, 标准差: {self.cd_error_stats.std:.2f}",
+            f"    范围: [{self.cd_error_stats.min:.2f}, {self.cd_error_stats.max:.2f}]",
+            f"    最坏情况: {self.cd_error_stats.worst_case:.2f}",
+            "",
+            "  EPE (nm):",
+            f"    均值: {self.epe_stats.mean:.2f}, 标准差: {self.epe_stats.std:.2f}",
+            f"    最坏情况: {self.epe_stats.worst_case:.2f}",
+            "",
+            "  MSE:",
+            f"    均值: {self.mse_stats.mean:.6f}, 标准差: {self.mse_stats.std:.6f}",
+            f"    最坏情况: {self.mse_stats.worst_case:.6f}",
+            "",
+            "  SSIM:",
+            f"    均值: {self.ssim_stats.mean:.4f}, 标准差: {self.ssim_stats.std:.4f}",
+            f"    最坏情况: {self.ssim_stats.worst_case:.4f}",
+            "",
+            f"  可打印比例: {self.passing_ratio * 100:.1f}%",
+        ]
+        return "\n".join(lines)
 
 
 @dataclass
@@ -1117,6 +1289,419 @@ class ProcessWindowAnalyzer:
             'metrics': metrics,
             'figures': figures,
         }
+
+    def _generate_monte_carlo_conditions(
+        self,
+        config: MonteCarloConfig,
+    ) -> List[ProcessCondition]:
+        """
+        生成蒙特卡洛采样的工艺条件列表
+
+        Args:
+            config: 蒙特卡洛配置
+
+        Returns:
+            ProcessCondition 列表
+        """
+        rng = np.random.default_rng(config.random_seed)
+        n = config.n_samples
+
+        nominal = ProcessCondition.from_optical_system(
+            self.optical_system,
+            dose=config.nominal_dose,
+        )
+
+        if config.distribution == 'normal':
+            focus_samples = rng.normal(
+                loc=config.nominal_focus,
+                scale=config.focus_std,
+                size=n,
+            )
+            dose_samples = rng.normal(
+                loc=config.nominal_dose,
+                scale=config.dose_std * config.nominal_dose,
+                size=n,
+            )
+        elif config.distribution == 'uniform':
+            half_focus = config.focus_std * np.sqrt(3)
+            half_dose = config.dose_std * config.nominal_dose * np.sqrt(3)
+            focus_samples = rng.uniform(
+                low=config.nominal_focus - half_focus,
+                high=config.nominal_focus + half_focus,
+                size=n,
+            )
+            dose_samples = rng.uniform(
+                low=config.nominal_dose - half_dose,
+                high=config.nominal_dose + half_dose,
+                size=n,
+            )
+        else:
+            raise ValueError(f"未知分布类型: {config.distribution}")
+
+        dose_samples = np.clip(dose_samples, 0.1, 5.0)
+
+        if config.aberration_std is not None:
+            if config.zernike_indices is not None:
+                zernike_indices = list(config.zernike_indices)
+            else:
+                zernike_indices = list(
+                    self.optical_system.zernike_coefficients.keys()
+                )
+                if not zernike_indices:
+                    zernike_indices = [3, 4, 5, 6, 7, 8, 9, 10]
+
+            if isinstance(config.aberration_std, (int, float)):
+                aberration_std_dict = {
+                    j: float(config.aberration_std) for j in zernike_indices
+                }
+            else:
+                aberration_std_dict = dict(config.aberration_std)
+
+            if config.distribution == 'normal':
+                aberration_samples = {}
+                for j in zernike_indices:
+                    std = aberration_std_dict.get(j, 0.0)
+                    base_val = self.optical_system.zernike_coefficients.get(j, 0.0)
+                    aberration_samples[j] = rng.normal(
+                        loc=base_val, scale=std, size=n
+                    )
+            else:
+                aberration_samples = {}
+                for j in zernike_indices:
+                    std = aberration_std_dict.get(j, 0.0)
+                    half = std * np.sqrt(3)
+                    base_val = self.optical_system.zernike_coefficients.get(j, 0.0)
+                    aberration_samples[j] = rng.uniform(
+                        low=base_val - half, high=base_val + half, size=n
+                    )
+        else:
+            aberration_samples = None
+
+        conditions = []
+        for i in range(n):
+            zernike_dict = dict(nominal.zernike_coefficients)
+            if aberration_samples is not None:
+                for j, samples in aberration_samples.items():
+                    zernike_dict[j] = float(samples[i])
+
+            cond = ProcessCondition(
+                defocus=float(focus_samples[i]),
+                dose=float(dose_samples[i]),
+                na=nominal.na,
+                sigma=nominal.sigma,
+                wavelength=nominal.wavelength,
+                flare=nominal.flare,
+                shadowing_model=nominal.shadowing_model,
+                reflective_mask_attenuation=nominal.reflective_mask_attenuation,
+                technology_node=nominal.technology_node,
+                zernike_coefficients=zernike_dict,
+                use_vector_pupil=nominal.use_vector_pupil,
+                incident_polarization_angle=nominal.incident_polarization_angle,
+                n_immersion=nominal.n_immersion,
+                use_mask_coating=nominal.use_mask_coating,
+                name=f"mc_sample_{i:04d}",
+                weight=1.0,
+            )
+            conditions.append(cond)
+
+        return conditions
+
+    @staticmethod
+    def _compute_metric_stats(
+        values: np.ndarray,
+        higher_is_worse: bool = True,
+        save_samples: bool = False,
+    ) -> MonteCarloMetricStats:
+        """
+        计算单个指标的统计量
+
+        Args:
+            values: 采样值数组
+            higher_is_worse: True 表示值越大越差（如 MSE、CD 误差），
+                            False 表示值越小越差（如 SSIM）
+            save_samples: 是否保存原始采样值
+
+        Returns:
+            MonteCarloMetricStats 统计结果
+        """
+        arr = np.asarray(values, dtype=np.float64)
+        if arr.size == 0:
+            return MonteCarloMetricStats(
+                mean=0.0, std=0.0, variance=0.0,
+                min=0.0, max=0.0, median=0.0,
+                percentile_5=0.0, percentile_95=0.0,
+                worst_case=0.0,
+                samples=arr if save_samples else None,
+            )
+
+        mean_val = float(np.mean(arr))
+        std_val = float(np.std(arr))
+        var_val = float(np.var(arr))
+        min_val = float(np.min(arr))
+        max_val = float(np.max(arr))
+        median_val = float(np.median(arr))
+        p5 = float(np.percentile(arr, 5))
+        p95 = float(np.percentile(arr, 95))
+
+        worst_case = max_val if higher_is_worse else min_val
+
+        return MonteCarloMetricStats(
+            mean=mean_val,
+            std=std_val,
+            variance=var_val,
+            min=min_val,
+            max=max_val,
+            median=median_val,
+            percentile_5=p5,
+            percentile_95=p95,
+            worst_case=worst_case,
+            samples=arr if save_samples else None,
+        )
+
+    def monte_carlo_analysis(
+        self,
+        config: Optional[MonteCarloConfig] = None,
+        cd_tolerance: float = 0.1,
+        cd_target: Optional[float] = None,
+        save_samples: bool = False,
+        progress_callback: Optional[Any] = None,
+    ) -> MonteCarloResult:
+        """
+        蒙特卡洛工艺鲁棒性分析
+
+        对 focus、dose、像差系数做 Monte Carlo 采样，
+        统计成像指标分布（均值、方差、最差情况）。
+
+        Args:
+            config: 蒙特卡洛采样配置，None 则使用默认配置
+            cd_tolerance: CD 相对容差，用于计算可打印比例
+            cd_target: 目标 CD (nm)，None 则从目标图自动测量
+            save_samples: 是否保存所有采样的指标值
+            progress_callback: 进度回调函数 callback(current, total)
+
+        Returns:
+            MonteCarloResult，包含各指标的统计分布
+        """
+        if config is None:
+            config = MonteCarloConfig()
+
+        if cd_target is not None:
+            self._cd_target = cd_target
+
+        cd_tgt = self.cd_target
+
+        logger.info(
+            f"开始蒙特卡洛工艺鲁棒性分析: {config.n_samples} 个采样, "
+            f"focus_std={config.focus_std}nm, dose_std={config.dose_std * 100:.1f}%"
+        )
+
+        t_start = time.time()
+
+        conditions = self._generate_monte_carlo_conditions(config)
+
+        multi_result = simulate_multi_process(
+            mask=self.mask,
+            conditions=conditions,
+            base_optics=self.optical_system,
+            threshold=self.threshold,
+            apply_resist=True,
+            resist_model=self.resist_model,
+            window_type=self.window_type,
+            pad_width=self.pad_width,
+            tukey_alpha=self.tukey_alpha,
+        )
+
+        cd_values = []
+        cd_error_values = []
+        epe_values = []
+        mse_values = []
+        ssim_values = []
+        ils_values = []
+        nils_values = []
+        passing_count = 0
+        worst_cd_error = -float('inf')
+        worst_idx = 0
+
+        target_binary = self.target >= 0.5
+
+        for i in range(len(conditions)):
+            wafer_img = multi_result.wafer_images[i]
+            aerial_img = multi_result.aerial_images[i]
+
+            wafer_binary = wafer_img >= self.threshold
+
+            cd_res = compute_cd(wafer_binary, pixel_size=self.pixel_size)
+            cd_val = cd_res['cd_mean']
+            cd_values.append(cd_val)
+
+            cd_err_val = abs(cd_val - cd_tgt)
+            cd_error_values.append(cd_err_val)
+
+            epe_res = compute_epe(wafer_binary, target_binary, pixel_size=self.pixel_size)
+            epe_values.append(epe_res['epe_mean'])
+
+            mse_values.append(mse(wafer_img, self.target))
+            ssim_values.append(ssim(wafer_img, self.target))
+
+            ils_res = compute_ils(aerial_img, threshold=self.threshold,
+                                   pixel_size=self.pixel_size)
+            ils_values.append(ils_res.get('ils_mean', 0.0))
+
+            nils_res = compute_nils(aerial_img, cd_target=cd_tgt,
+                                     threshold=self.threshold,
+                                     pixel_size=self.pixel_size)
+            nils_values.append(nils_res.get('nils_mean', 0.0))
+
+            cd_lower = cd_tgt * (1.0 - cd_tolerance)
+            cd_upper = cd_tgt * (1.0 + cd_tolerance)
+            if cd_lower <= cd_val <= cd_upper:
+                passing_count += 1
+
+            if cd_err_val > worst_cd_error:
+                worst_cd_error = cd_err_val
+                worst_idx = i
+
+            if progress_callback is not None:
+                progress_callback(i + 1, len(conditions))
+
+        cd_arr = np.array(cd_values)
+        cd_err_arr = np.array(cd_error_values)
+        epe_arr = np.array(epe_values)
+        mse_arr = np.array(mse_values)
+        ssim_arr = np.array(ssim_values)
+        ils_arr = np.array(ils_values)
+        nils_arr = np.array(nils_values)
+
+        cd_stats = self._compute_metric_stats(cd_arr, higher_is_worse=False,
+                                               save_samples=save_samples)
+        cd_error_stats = self._compute_metric_stats(cd_err_arr, higher_is_worse=True,
+                                                     save_samples=save_samples)
+        epe_stats = self._compute_metric_stats(epe_arr, higher_is_worse=True,
+                                                save_samples=save_samples)
+        mse_stats = self._compute_metric_stats(mse_arr, higher_is_worse=True,
+                                                save_samples=save_samples)
+        ssim_stats = self._compute_metric_stats(ssim_arr, higher_is_worse=False,
+                                                 save_samples=save_samples)
+        ils_stats = self._compute_metric_stats(ils_arr, higher_is_worse=False,
+                                                save_samples=save_samples)
+        nils_stats = self._compute_metric_stats(nils_arr, higher_is_worse=False,
+                                                 save_samples=save_samples)
+
+        passing_ratio = passing_count / len(conditions) if conditions else 0.0
+        worst_condition = conditions[worst_idx]
+
+        elapsed = time.time() - t_start
+        logger.info(f"蒙特卡洛分析完成, 耗时 {elapsed:.1f}s, 可打印比例: {passing_ratio * 100:.1f}%")
+
+        return MonteCarloResult(
+            n_samples=config.n_samples,
+            config=config,
+            cd_stats=cd_stats,
+            cd_error_stats=cd_error_stats,
+            epe_stats=epe_stats,
+            mse_stats=mse_stats,
+            ssim_stats=ssim_stats,
+            ils_stats=ils_stats,
+            nils_stats=nils_stats,
+            sampled_conditions=conditions,
+            passing_ratio=passing_ratio,
+            worst_condition=worst_condition,
+        )
+
+    def plot_monte_carlo_histogram(
+        self,
+        mc_result: MonteCarloResult,
+        metric: str = 'cd_error',
+        title: Optional[str] = None,
+        save_path: Optional[str] = None,
+        show: bool = True,
+        figsize: Tuple[int, int] = (10, 6),
+        bins: int = 30,
+    ) -> Any:
+        """
+        绘制蒙特卡洛采样指标的直方图
+
+        Args:
+            mc_result: 蒙特卡洛分析结果
+            metric: 要绘制的指标: 'cd', 'cd_error', 'epe', 'mse', 'ssim', 'ils', 'nils'
+            title: 图表标题
+            save_path: 保存路径
+            show: 是否显示
+            figsize: 图像尺寸
+            bins: 直方图分箱数
+
+        Returns:
+            Figure 对象
+        """
+        import matplotlib.pyplot as plt
+
+        metric_map = {
+            'cd': (mc_result.cd_stats, 'CD (nm)'),
+            'cd_error': (mc_result.cd_error_stats, 'CD 误差 (nm)'),
+            'epe': (mc_result.epe_stats, 'EPE (nm)'),
+            'mse': (mc_result.mse_stats, 'MSE'),
+            'ssim': (mc_result.ssim_stats, 'SSIM'),
+            'ils': (mc_result.ils_stats, 'ILS'),
+            'nils': (mc_result.nils_stats, 'NILS'),
+        }
+
+        if metric not in metric_map:
+            raise ValueError(
+                f"未知指标 '{metric}'，可选值: {list(metric_map.keys())}"
+            )
+
+        stats, metric_name = metric_map[metric]
+
+        if stats.samples is None:
+            raise ValueError(
+                "采样值未保存，请在 monte_carlo_analysis 中设置 save_samples=True"
+            )
+
+        fig, ax = plt.subplots(figsize=figsize)
+
+        samples = stats.samples
+        ax.hist(samples, bins=bins, edgecolor='black', alpha=0.7, color='steelblue')
+
+        ax.axvline(stats.mean, color='red', linestyle='--', linewidth=2,
+                   label=f'均值: {stats.mean:.3f}')
+        ax.axvline(stats.worst_case, color='orange', linestyle='-.', linewidth=2,
+                   label=f'最坏情况: {stats.worst_case:.3f}')
+        ax.axvline(stats.percentile_5, color='green', linestyle=':', linewidth=1.5,
+                   label=f'5% 分位: {stats.percentile_5:.3f}')
+        ax.axvline(stats.percentile_95, color='purple', linestyle=':', linewidth=1.5,
+                   label=f'95% 分位: {stats.percentile_95:.3f}')
+
+        ax.set_xlabel(metric_name, fontsize=12)
+        ax.set_ylabel('频数', fontsize=12)
+        if title is None:
+            title = f"蒙特卡洛分布 - {metric_name} (N={mc_result.n_samples})"
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.legend(loc='best', fontsize=10)
+        ax.grid(True, alpha=0.3, linestyle=':')
+
+        info_text = (
+            f"均值: {stats.mean:.3f}\n"
+            f"标准差: {stats.std:.3f}\n"
+            f"范围: [{stats.min:.3f}, {stats.max:.3f}]\n"
+            f"最坏情况: {stats.worst_case:.3f}"
+        )
+        ax.text(0.98, 0.98, info_text, transform=ax.transAxes,
+                fontsize=10, verticalalignment='top', horizontalalignment='right',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+        plt.tight_layout()
+
+        if save_path:
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(save_path, dpi=150, bbox_inches='tight')
+            logger.info(f"图像已保存: {save_path}")
+
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+        return fig
 
 
 def quick_process_window_analysis(

@@ -105,6 +105,7 @@ class LossWeights:
            + w_binary * binary_penalty + w_tv_smooth * TV_smooth
            + w_epe * EPE + w_min_feature * min_feature_size
            + w_weighted_mse * WMSE + w_weighted_mae * WMAE
+           + w_worst_case * worst_case_loss（蒙特卡洛最坏情况损失）
 
     Attributes:
         mse: MSE（均方误差）权重
@@ -117,6 +118,7 @@ class LossWeights:
         min_feature: 最小特征尺寸约束权重
         weighted_mse: 空间加权MSE权重（热点区域更受关注）
         weighted_mae: 空间加权MAE权重
+        worst_case: 蒙特卡洛最坏情况损失权重（需配合 use_monte_carlo=True 使用）
     """
     mse: float = 1.0
     ssim: float = 0.0
@@ -128,6 +130,7 @@ class LossWeights:
     min_feature: float = 0.0
     weighted_mse: float = 0.0
     weighted_mae: float = 0.0
+    worst_case: float = 0.0
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, float]]) -> 'LossWeights':
@@ -137,7 +140,7 @@ class LossWeights:
         defaults = {
             'mse': 1.0, 'ssim': 0.0, 'pvb': 0.0, 'mask_complexity': 0.0,
             'binary_penalty': 0.0, 'tv_smooth': 0.0, 'epe': 0.0, 'min_feature': 0.0,
-            'weighted_mse': 0.0, 'weighted_mae': 0.0
+            'weighted_mse': 0.0, 'weighted_mae': 0.0, 'worst_case': 0.0
         }
         defaults.update(d)
         return cls(**defaults)
@@ -153,13 +156,14 @@ class LossWeights:
             'epe': self.epe,
             'min_feature': self.min_feature,
             'weighted_mse': self.weighted_mse,
-            'weighted_mae': self.weighted_mae
+            'weighted_mae': self.weighted_mae,
+            'worst_case': self.worst_case
         }
 
     def total_weight(self) -> float:
         return (self.mse + self.ssim + self.pvb + self.mask_complexity +
                 self.binary_penalty + self.tv_smooth + self.epe + self.min_feature +
-                self.weighted_mse + self.weighted_mae)
+                self.weighted_mse + self.weighted_mae + self.worst_case)
 
 
 @dataclass
@@ -283,6 +287,17 @@ class OptimizationConfig:
     robustness_loss_weight: float = 0.0  # 0表示不使用鲁棒性正则化
     threshold: float = 0.3
     use_wafer_image_loss: bool = False  # False使用aerial图像计算损失，True使用wafer图像
+
+    # 蒙特卡洛工艺鲁棒性优化
+    use_monte_carlo: bool = False  # 是否启用蒙特卡洛最坏情况优化
+    monte_carlo_n_samples: int = 50  # 蒙特卡洛采样数量
+    monte_carlo_focus_std: float = 30.0  # 离焦量标准差 (nm)
+    monte_carlo_dose_std: float = 0.05  # 剂量相对标准差
+    monte_carlo_aberration_std: Optional[float] = None  # 像差系数标准差（波长λ）
+    monte_carlo_zernike_indices: Optional[List[int]] = None  # 要扰动的Zernike系数索引
+    monte_carlo_distribution: str = 'normal'  # 分布类型: 'normal' 或 'uniform'
+    monte_carlo_seed: Optional[int] = None  # 随机种子
+    monte_carlo_resample_freq: int = 10  # 重新采样频率（每N次迭代重新采样一次），0表示固定采样
 
     # 掩模约束与正则化参数
     binary_penalty_type: str = 'manhattan'  # 'manhattan' 或 'entropy'
@@ -601,6 +616,11 @@ class MaskOptimizer:
         self._multi_conditions: Optional[List[ProcessCondition]] = None
         self._multi_weights: Optional[List[float]] = None
 
+        self._mc_imaging_models: Optional[List[PartialCoherentImaging]] = None
+        self._mc_conditions: Optional[List[ProcessCondition]] = None
+        self._last_mc_losses: Optional[List[float]] = None
+        self._last_mc_worst_idx: Optional[int] = None
+
         self._surrogate_imaging: Optional['SurrogateImaging'] = None
         self._surrogate_multi_models: Optional[List['SurrogateImaging']] = None
 
@@ -850,6 +870,173 @@ class MaskOptimizer:
                 f"训练={self.config.simulation_backend}, "
                 f"评估={'矢量' if self.config.use_vector_backend_for_evaluation else '标量Hopkins'}"
             )
+
+    def _setup_monte_carlo(self, image_size: tuple):
+        """
+        设置蒙特卡洛工艺鲁棒性优化
+
+        初始化蒙特卡洛采样条件和成像模型。
+
+        Args:
+            image_size: 图像尺寸 (height, width)
+        """
+        cfg = self.config
+        if not cfg.use_monte_carlo:
+            return
+
+        if cfg.loss_weights.worst_case <= 0:
+            logger.warning(
+                "use_monte_carlo=True 但 worst_case 权重为 0，"
+                "蒙特卡洛最坏情况优化将不生效"
+            )
+
+        self._mc_conditions = None
+        self._mc_imaging_models = None
+        self._mc_iteration_counter = 0
+
+        self._resample_monte_carlo_conditions(image_size)
+
+        if self.config.verbose:
+            logger.info(
+                f"蒙特卡洛工艺鲁棒性优化已启用: "
+                f"{cfg.monte_carlo_n_samples} 个采样, "
+                f"focus_std={cfg.monte_carlo_focus_std}nm, "
+                f"dose_std={cfg.monte_carlo_dose_std * 100:.1f}%"
+            )
+
+    def _generate_mc_conditions(self) -> List[ProcessCondition]:
+        """
+        生成蒙特卡洛采样的工艺条件
+
+        Returns:
+            ProcessCondition 列表
+        """
+        cfg = self.config
+        n = cfg.monte_carlo_n_samples
+
+        rng_seed = cfg.monte_carlo_seed
+        if rng_seed is not None and cfg.monte_carlo_resample_freq > 0:
+            rng_seed = rng_seed + self._mc_iteration_counter
+        rng = np.random.default_rng(rng_seed)
+
+        nominal = ProcessCondition.from_optical_system(
+            self.optical_system, dose=1.0
+        )
+
+        if cfg.monte_carlo_distribution == 'normal':
+            focus_samples = rng.normal(
+                loc=0.0, scale=cfg.monte_carlo_focus_std, size=n
+            )
+            dose_samples = rng.normal(
+                loc=1.0, scale=cfg.monte_carlo_dose_std, size=n
+            )
+        elif cfg.monte_carlo_distribution == 'uniform':
+            half_focus = cfg.monte_carlo_focus_std * np.sqrt(3)
+            half_dose = cfg.monte_carlo_dose_std * np.sqrt(3)
+            focus_samples = rng.uniform(
+                low=-half_focus, high=half_focus, size=n
+            )
+            dose_samples = rng.uniform(
+                low=1.0 - half_dose, high=1.0 + half_dose, size=n
+            )
+        else:
+            raise ValueError(f"未知分布类型: {cfg.monte_carlo_distribution}")
+
+        dose_samples = np.clip(dose_samples, 0.1, 5.0)
+
+        if cfg.monte_carlo_aberration_std is not None:
+            if cfg.monte_carlo_zernike_indices is not None:
+                zernike_indices = list(cfg.monte_carlo_zernike_indices)
+            else:
+                zernike_indices = list(
+                    self.optical_system.zernike_coefficients.keys()
+                )
+                if not zernike_indices:
+                    zernike_indices = [3, 4, 5, 6, 7, 8, 9, 10]
+
+            aberration_std = float(cfg.monte_carlo_aberration_std)
+            if cfg.monte_carlo_distribution == 'normal':
+                aberration_samples = {}
+                for j in zernike_indices:
+                    base_val = self.optical_system.zernike_coefficients.get(j, 0.0)
+                    aberration_samples[j] = rng.normal(
+                        loc=base_val, scale=aberration_std, size=n
+                    )
+            else:
+                aberration_samples = {}
+                half = aberration_std * np.sqrt(3)
+                for j in zernike_indices:
+                    base_val = self.optical_system.zernike_coefficients.get(j, 0.0)
+                    aberration_samples[j] = rng.uniform(
+                        low=base_val - half, high=base_val + half, size=n
+                    )
+        else:
+            aberration_samples = None
+
+        conditions = []
+        for i in range(n):
+            zernike_dict = dict(nominal.zernike_coefficients)
+            if aberration_samples is not None:
+                for j, samples in aberration_samples.items():
+                    zernike_dict[j] = float(samples[i])
+
+            cond = ProcessCondition(
+                defocus=float(focus_samples[i]),
+                dose=float(dose_samples[i]),
+                na=nominal.na,
+                sigma=nominal.sigma,
+                wavelength=nominal.wavelength,
+                flare=nominal.flare,
+                shadowing_model=nominal.shadowing_model,
+                reflective_mask_attenuation=nominal.reflective_mask_attenuation,
+                technology_node=nominal.technology_node,
+                zernike_coefficients=zernike_dict,
+                use_vector_pupil=nominal.use_vector_pupil,
+                incident_polarization_angle=nominal.incident_polarization_angle,
+                n_immersion=nominal.n_immersion,
+                use_mask_coating=nominal.use_mask_coating,
+                name=f"mc_{i:04d}",
+                weight=1.0,
+            )
+            conditions.append(cond)
+
+        return conditions
+
+    def _resample_monte_carlo_conditions(self, image_size: tuple):
+        """
+        重新采样蒙特卡洛工艺条件，并更新成像模型
+
+        Args:
+            image_size: 图像尺寸
+        """
+        cfg = self.config
+        if not cfg.use_monte_carlo:
+            return
+
+        self._mc_conditions = self._generate_mc_conditions()
+
+        self._mc_imaging_models = []
+        for cond in self._mc_conditions:
+            optics = cond.to_optical_system(base_optics=self.optical_system)
+            model = PartialCoherentImaging(optics, image_size)
+            self._mc_imaging_models.append(model)
+
+    def _should_resample_monte_carlo(self, epoch: int) -> bool:
+        """
+        判断是否需要在当前迭代重新采样蒙特卡洛条件
+
+        Args:
+            epoch: 当前迭代次数
+
+        Returns:
+            是否需要重新采样
+        """
+        cfg = self.config
+        if not cfg.use_monte_carlo:
+            return False
+        if cfg.monte_carlo_resample_freq <= 0:
+            return False
+        return epoch > 0 and epoch % cfg.monte_carlo_resample_freq == 0
 
     # ------------------------------------------------------------------
     # 统一仿真后端集成接口
@@ -1302,6 +1489,9 @@ class MaskOptimizer:
             if epoch % proj_freq == 0:
                 x_new = self._apply_bandlimit_projection(x_new)
                 x_new = self._clip_to_bounds(x_new)
+
+            if self._should_resample_monte_carlo(epoch):
+                self._resample_monte_carlo_conditions(x.shape)
 
             f_new = self._compute_loss(x_new)
             nfev += 1
@@ -2144,6 +2334,49 @@ class MaskOptimizer:
 
         return gradient
 
+    def _compute_monte_carlo_loss(self, mask: np.ndarray) -> Tuple[float, float, int]:
+        """
+        计算蒙特卡洛最坏情况损失
+
+        对所有蒙特卡洛采样条件计算损失，返回最坏情况损失值。
+
+        Args:
+            mask: 掩模图案
+
+        Returns:
+            (worst_case_loss, mean_loss, worst_idx) 三元组：
+            - worst_case_loss: 最坏情况损失值
+            - mean_loss: 平均损失值
+            - worst_idx: 最坏情况的索引
+        """
+        cfg = self.config
+        if not cfg.use_monte_carlo or self._mc_imaging_models is None:
+            return 0.0, 0.0, -1
+
+        per_losses = []
+        for idx, (model, cond) in enumerate(zip(
+            self._mc_imaging_models, self._mc_conditions
+        )):
+            if cfg.use_composite_loss:
+                loss_i, _, _ = self._compute_composite_single_condition(
+                    mask, model, cond.dose, multi_idx=None
+                )
+            else:
+                loss_i = self._compute_single_condition_loss(
+                    mask, model, cond.dose, multi_idx=None
+                )
+            per_losses.append(loss_i)
+
+        loss_arr = np.array(per_losses)
+        worst_idx = int(np.argmax(loss_arr))
+        worst_case_loss = float(loss_arr[worst_idx])
+        mean_loss = float(np.mean(loss_arr))
+
+        self._last_mc_losses = per_losses
+        self._last_mc_worst_idx = worst_idx
+
+        return worst_case_loss, mean_loss, worst_idx
+
     def _compute_loss(self, mask: np.ndarray) -> float:
         """
         计算损失函数
@@ -2153,6 +2386,7 @@ class MaskOptimizer:
 
         当 use_composite_loss=True 时，使用复合损失：
         L = w_mse*MSE + w_ssim*(1-SSIM) + w_mask_complexity*TV(mask) + R(mask)
+          + w_worst_case * worst_case_loss（蒙特卡洛最坏情况）
 
         Args:
             mask: 掩模图案
@@ -2161,48 +2395,52 @@ class MaskOptimizer:
             损失值
         """
         if self.config.use_multi_process and self._multi_imaging_models is not None:
-            return self._compute_multi_process_loss(mask)
-
-        if self.config.use_composite_loss:
-            lw = self.config.loss_weights
-            loss, _, _ = self._compute_composite_single_condition(
-                mask, self._imaging_model, dose=1.0
-            )
-            if lw.mask_complexity > 0:
-                loss += lw.mask_complexity * total_variation(mask)
-
-            mask_constraints = self._compute_mask_constraints(mask)
-            loss += (mask_constraints.binary_penalty +
-                     mask_constraints.tv_smooth +
-                     mask_constraints.epe +
-                     mask_constraints.min_feature)
-
-            loss += self._compute_regularization_loss(mask)
-            return loss
-
-        wafer_image = self._surrogate_compute_aerial(mask)
-        if wafer_image is None:
-            wafer_image = self._imaging_model.compute_aerial_image(mask)
-
-        if self.config.use_wafer_image_loss:
-            wafer_image = _apply_threshold_for_loss(wafer_image, self.config.threshold)
-
-        metric = self.config.metric.lower()
-        if metric == 'mse':
-            return mse(wafer_image, self._target_image)
-        elif metric == 'mae':
-            return mae(wafer_image, self._target_image)
-        elif metric == 'ssim':
-            return 1.0 - ssim(wafer_image, self._target_image)
+            base_loss = self._compute_multi_process_loss(mask)
         else:
-            raise ValueError(f"未知的评估指标: {metric}")
+            if self.config.use_composite_loss:
+                lw = self.config.loss_weights
+                base_loss, _, _ = self._compute_composite_single_condition(
+                    mask, self._imaging_model, dose=1.0
+                )
+                if lw.mask_complexity > 0:
+                    base_loss += lw.mask_complexity * total_variation(mask)
 
-    def _compute_gradient(self, mask: np.ndarray) -> np.ndarray:
+                mask_constraints = self._compute_mask_constraints(mask)
+                base_loss += (mask_constraints.binary_penalty +
+                              mask_constraints.tv_smooth +
+                              mask_constraints.epe +
+                              mask_constraints.min_feature)
+
+                base_loss += self._compute_regularization_loss(mask)
+            else:
+                wafer_image = self._surrogate_compute_aerial(mask)
+                if wafer_image is None:
+                    wafer_image = self._imaging_model.compute_aerial_image(mask)
+
+                if self.config.use_wafer_image_loss:
+                    wafer_image = _apply_threshold_for_loss(wafer_image, self.config.threshold)
+
+                metric = self.config.metric.lower()
+                if metric == 'mse':
+                    base_loss = mse(wafer_image, self._target_image)
+                elif metric == 'mae':
+                    base_loss = mae(wafer_image, self._target_image)
+                elif metric == 'ssim':
+                    base_loss = 1.0 - ssim(wafer_image, self._target_image)
+                else:
+                    raise ValueError(f"未知的评估指标: {metric}")
+
+        if self.config.use_monte_carlo and self.config.loss_weights.worst_case > 0:
+            worst_case_loss, _, _ = self._compute_monte_carlo_loss(mask)
+            base_loss += self.config.loss_weights.worst_case * worst_case_loss
+
+        return base_loss
+
+    def _compute_monte_carlo_gradient(self, mask: np.ndarray) -> np.ndarray:
         """
-        计算损失函数对掩模的梯度
+        计算蒙特卡洛最坏情况损失的梯度
 
-        当启用多工艺条件联合优化时，自动调度到
-        _compute_multi_process_gradient。
+        最坏情况损失 = max_i L_i，其梯度为最坏情况样本的梯度（次梯度）。
 
         Args:
             mask: 掩模图案
@@ -2210,22 +2448,23 @@ class MaskOptimizer:
         Returns:
             梯度数组
         """
-        if self.config.use_multi_process and self._multi_imaging_models is not None:
-            return self._compute_multi_process_gradient(mask)
-
         cfg = self.config
+        if not cfg.use_monte_carlo or self._mc_imaging_models is None:
+            return np.zeros_like(mask)
+
+        if self._last_mc_worst_idx is None:
+            _, _, worst_idx = self._compute_monte_carlo_loss(mask)
+        else:
+            worst_idx = self._last_mc_worst_idx
+
+        worst_model = self._mc_imaging_models[worst_idx]
+        worst_cond = self._mc_conditions[worst_idx]
 
         if cfg.use_composite_loss:
             lw = cfg.loss_weights
 
-            aerial = self._surrogate_compute_aerial(mask)
-            if aerial is None:
-                aerial = self._imaging_model.compute_aerial_image(mask)
-            image = self._prepare_image(aerial, dose=1.0)
-
-            imaging_grad = self._surrogate_compute_gradient(mask)
-            if imaging_grad is None:
-                imaging_grad = self._imaging_model.compute_image_gradient(mask)
+            aerial = worst_model.compute_aerial_image(mask)
+            image = self._prepare_image(aerial, worst_cond.dose)
 
             error_grad = np.zeros_like(image)
 
@@ -2245,48 +2484,147 @@ class MaskOptimizer:
                     image, self._target_image, self._spatial_weight_mask
                 )
 
+            imaging_grad = worst_model.compute_image_gradient(mask)
+
+            if worst_cond.dose != 1.0:
+                error_grad = error_grad * worst_cond.dose
+
             if cfg.use_wafer_image_loss:
-                threshold_grad = (aerial >= cfg.threshold).astype(np.float64)
+                aerial_dosed = aerial if worst_cond.dose == 1.0 else np.clip(aerial * worst_cond.dose, 0.0, 1.0)
+                threshold_grad = (aerial_dosed >= cfg.threshold).astype(np.float64)
+                error_grad = error_grad * threshold_grad
+
+            gradient = error_grad * imaging_grad
+        else:
+            metric = cfg.metric.lower()
+            aerial = worst_model.compute_aerial_image(mask)
+
+            if worst_cond.dose != 1.0:
+                aerial_dosed = np.clip(aerial * worst_cond.dose, 0.0, 1.0)
+            else:
+                aerial_dosed = aerial
+
+            if cfg.use_wafer_image_loss:
+                image = _apply_threshold_for_loss(aerial_dosed, cfg.threshold)
+            else:
+                image = aerial_dosed
+
+            if metric == 'mse':
+                error_grad = 2 * (image - self._target_image) / mask.size
+            elif metric == 'mae':
+                error_grad = np.sign(image - self._target_image) / mask.size
+            elif metric == 'ssim':
+                error_grad = ssim_loss_gradient(image, self._target_image)
+            else:
+                return np.zeros_like(mask)
+
+            imaging_grad = worst_model.compute_image_gradient(mask)
+
+            if worst_cond.dose != 1.0:
+                error_grad = error_grad * worst_cond.dose
+
+            if cfg.use_wafer_image_loss:
+                threshold_grad = (aerial_dosed >= cfg.threshold).astype(np.float64)
                 error_grad = error_grad * threshold_grad
 
             gradient = error_grad * imaging_grad
 
-            if lw.mask_complexity > 0:
-                gradient += lw.mask_complexity * total_variation_gradient(mask)
+        return gradient
 
-            gradient += self._compute_mask_constraints_gradient(mask)
+    def _compute_gradient(self, mask: np.ndarray) -> np.ndarray:
+        """
+        计算损失函数对掩模的梯度
 
-            gradient += self._compute_regularization_gradient(mask)
+        当启用多工艺条件联合优化时，自动调度到
+        _compute_multi_process_gradient。
 
-            return gradient
+        当启用蒙特卡洛最坏情况优化时，额外加上最坏情况损失的梯度。
 
-        wafer_image = self._surrogate_compute_aerial(mask)
-        if wafer_image is None:
-            wafer_image = self._imaging_model.compute_aerial_image(mask)
+        Args:
+            mask: 掩模图案
 
-        if self.config.use_wafer_image_loss:
-            wafer_image_for_grad = _apply_threshold_for_loss(wafer_image, self.config.threshold)
+        Returns:
+            梯度数组
+        """
+        if self.config.use_multi_process and self._multi_imaging_models is not None:
+            gradient = self._compute_multi_process_gradient(mask).copy()
         else:
-            wafer_image_for_grad = wafer_image
+            cfg = self.config
 
-        if self.config.metric.lower() == 'mse':
-            error_grad = 2 * (wafer_image_for_grad - self._target_image) / mask.size
-        elif self.config.metric.lower() == 'mae':
-            error_grad = np.sign(wafer_image_for_grad - self._target_image) / mask.size
-        elif self.config.metric.lower() == 'ssim':
-            error_grad = ssim_loss_gradient(wafer_image_for_grad, self._target_image)
-        else:
-            return self._numerical_gradient(mask)
+            if cfg.use_composite_loss:
+                lw = cfg.loss_weights
 
-        imaging_grad = self._surrogate_compute_gradient(mask)
-        if imaging_grad is None:
-            imaging_grad = self._imaging_model.compute_image_gradient(mask)
+                aerial = self._surrogate_compute_aerial(mask)
+                if aerial is None:
+                    aerial = self._imaging_model.compute_aerial_image(mask)
+                image = self._prepare_image(aerial, dose=1.0)
 
-        if self.config.use_wafer_image_loss:
-            threshold_grad = (wafer_image >= self.config.threshold).astype(np.float64)
-            error_grad = error_grad * threshold_grad
+                imaging_grad = self._surrogate_compute_gradient(mask)
+                if imaging_grad is None:
+                    imaging_grad = self._imaging_model.compute_image_gradient(mask)
 
-        gradient = error_grad * imaging_grad
+                error_grad = np.zeros_like(image)
+
+                if lw.mse > 0:
+                    error_grad += lw.mse * (2.0 * (image - self._target_image) / mask.size)
+
+                if lw.ssim > 0:
+                    error_grad += lw.ssim * ssim_loss_gradient(image, self._target_image)
+
+                if lw.weighted_mse > 0 and self._spatial_weight_mask is not None:
+                    error_grad += lw.weighted_mse * weighted_mse_gradient(
+                        image, self._target_image, self._spatial_weight_mask
+                    )
+
+                if lw.weighted_mae > 0 and self._spatial_weight_mask is not None:
+                    error_grad += lw.weighted_mae * weighted_mae_gradient(
+                        image, self._target_image, self._spatial_weight_mask
+                    )
+
+                if cfg.use_wafer_image_loss:
+                    threshold_grad = (aerial >= cfg.threshold).astype(np.float64)
+                    error_grad = error_grad * threshold_grad
+
+                gradient = error_grad * imaging_grad
+
+                if lw.mask_complexity > 0:
+                    gradient += lw.mask_complexity * total_variation_gradient(mask)
+
+                gradient += self._compute_mask_constraints_gradient(mask)
+
+                gradient += self._compute_regularization_gradient(mask)
+            else:
+                wafer_image = self._surrogate_compute_aerial(mask)
+                if wafer_image is None:
+                    wafer_image = self._imaging_model.compute_aerial_image(mask)
+
+                if self.config.use_wafer_image_loss:
+                    wafer_image_for_grad = _apply_threshold_for_loss(wafer_image, self.config.threshold)
+                else:
+                    wafer_image_for_grad = wafer_image
+
+                if self.config.metric.lower() == 'mse':
+                    error_grad = 2 * (wafer_image_for_grad - self._target_image) / mask.size
+                elif self.config.metric.lower() == 'mae':
+                    error_grad = np.sign(wafer_image_for_grad - self._target_image) / mask.size
+                elif self.config.metric.lower() == 'ssim':
+                    error_grad = ssim_loss_gradient(wafer_image_for_grad, self._target_image)
+                else:
+                    return self._numerical_gradient(mask)
+
+                imaging_grad = self._surrogate_compute_gradient(mask)
+                if imaging_grad is None:
+                    imaging_grad = self._imaging_model.compute_image_gradient(mask)
+
+                if self.config.use_wafer_image_loss:
+                    threshold_grad = (wafer_image >= self.config.threshold).astype(np.float64)
+                    error_grad = error_grad * threshold_grad
+
+                gradient = error_grad * imaging_grad
+
+        if self.config.use_monte_carlo and self.config.loss_weights.worst_case > 0:
+            mc_grad = self._compute_monte_carlo_gradient(mask)
+            gradient += self.config.loss_weights.worst_case * mc_grad
 
         return gradient
 
@@ -2474,6 +2812,14 @@ class MaskOptimizer:
             self._multi_imaging_models = None
             self._multi_conditions = None
             self._multi_weights = None
+
+        if self.config.use_monte_carlo:
+            self._setup_monte_carlo(initial_mask.shape)
+        else:
+            self._mc_imaging_models = None
+            self._mc_conditions = None
+            self._last_mc_losses = None
+            self._last_mc_worst_idx = None
 
         self._setup_surrogate_model(initial_mask.shape)
 
