@@ -892,7 +892,7 @@ class MaskOptimizer:
 
         self._mc_conditions = None
         self._mc_imaging_models = None
-        self._mc_iteration_counter = 0
+        self._mc_resample_counter = 0
 
         self._resample_monte_carlo_conditions(image_size)
 
@@ -916,7 +916,7 @@ class MaskOptimizer:
 
         rng_seed = cfg.monte_carlo_seed
         if rng_seed is not None and cfg.monte_carlo_resample_freq > 0:
-            rng_seed = rng_seed + self._mc_iteration_counter
+            rng_seed = rng_seed + self._mc_resample_counter
         rng = np.random.default_rng(rng_seed)
 
         nominal = ProcessCondition.from_optical_system(
@@ -1006,6 +1006,9 @@ class MaskOptimizer:
         """
         重新采样蒙特卡洛工艺条件，并更新成像模型
 
+        每次调用后推进 _mc_resample_counter，确保配置固定 seed 时
+        各轮重采样产出不同的随机样本。
+
         Args:
             image_size: 图像尺寸
         """
@@ -1020,6 +1023,8 @@ class MaskOptimizer:
             optics = cond.to_optical_system(base_optics=self.optical_system)
             model = PartialCoherentImaging(optics, image_size)
             self._mc_imaging_models.append(model)
+
+        self._mc_resample_counter += 1
 
     def _should_resample_monte_carlo(self, epoch: int) -> bool:
         """
