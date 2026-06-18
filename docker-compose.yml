@@ -113,27 +113,52 @@ services:
 
   # ------------------------------------------------------------------
   # 批处理调度：分布式模式需要的 Redis 消息队列
+  #   - 作为 Celery Broker（db 0）和 Result Backend（db 1）
+  #   - 开启 AOF 持久化，防止重启后任务丢失
+  #   - 最大内存 512MB，使用 allkeys-lru 策略淘汰
   # ------------------------------------------------------------------
   redis:
     image: ${IMAGE_REGISTRY:-docker.io/}library/redis:7-alpine
     container_name: litho-redis
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --tcp-keepalive 60
+      --timeout 300
+      --loglevel notice
     volumes:
-      - ./redis_data:/data
+      - redis_data:/data
+    expose:
+      - "6379"
     ports:
       - "6379:6379"
     profiles:
       - distributed
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "sh", "-c", "redis-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '2.0'
+        reservations:
+          memory: 256M
 
   # ------------------------------------------------------------------
   # Celery Worker（分布式优化执行节点，可水平扩展）
-  #   启动多 worker 示例：
-  #     docker compose up --scale celery_worker=4
+  #   启动多副本示例：
+  #     docker compose up -d --scale celery_worker=4
+  #   调整单容器内并发数（每个worker进程数）：
+  #     CELERY_CONCURRENCY=4 docker compose up -d celery_worker
+  #   健康检查：通过 celery inspect ping 验证 worker 存活
   # ------------------------------------------------------------------
   celery_worker:
     build:
@@ -150,23 +175,27 @@ services:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
       - CELERY_QUEUE=litho_batch
+      - CELERY_CONCURRENCY=${CELERY_CONCURRENCY:-2}
+      - TZ=Asia/Shanghai
     command: >
-      sh -c "
-        pip install -q 'celery>=5.3' 'redis>=4.5' || true &&
-        celery -A pipeline.batch_runner.celery_app
-               worker
-               -Q $${CELERY_QUEUE:-litho_batch}
-               --concurrency=$${CELERY_CONCURRENCY:-2}
-               --loglevel=INFO
-               --hostname=worker@%h
-               --pool=prefork
-      "
+      celery -A pipeline.batch_runner.celery_app
+             worker
+             -Q $${CELERY_QUEUE:-litho_batch}
+             --concurrency=$${CELERY_CONCURRENCY:-2}
+             --loglevel=INFO
+             --hostname=worker@%h
+             --pool=prefork
+             --task-events
+             --without-mingle
+             --without-gossip
     depends_on:
       redis:
         condition: service_healthy
     profiles:
       - distributed
     deploy:
+      mode: replicated
+      replicas: 2
       resources:
         limits:
           memory: 8G
@@ -174,7 +203,18 @@ services:
         reservations:
           memory: 2G
           cpus: '1.0'
-    restart: on-failure
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+    healthcheck:
+      test: ["CMD", "sh", "-c", "celery -A pipeline.batch_runner.celery_app inspect ping -d worker@$$(hostname) 2>/dev/null | grep -q 'pong'"]
+      interval: 20s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
 
   # ------------------------------------------------------------------
   # 批处理调度器服务（本地多进程模式；若需分布式，可改调用 runner=distributed）
@@ -212,6 +252,10 @@ services:
 
   # ------------------------------------------------------------------
   # 批处理调度器（分布式模式 - 提交任务到 Redis/Celery 集群）
+  #   用法：
+  #     docker compose run --rm batch_scheduler \
+  #       --source /app/layout_library --layer 0 \
+  #       --output-dir /app/results/batch_run
   # ------------------------------------------------------------------
   batch_scheduler:
     build:
@@ -228,10 +272,13 @@ services:
       - NUMBA_CACHE_DIR=/tmp/numba_cache
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - TZ=Asia/Shanghai
     entrypoint: ["python", "-m", "pipeline.batch_runner_cli"]
     command: ["--mode", "distributed"]
     depends_on:
       redis:
+        condition: service_healthy
+      celery_worker:
         condition: service_healthy
     profiles:
       - distributed
@@ -239,8 +286,56 @@ services:
       resources:
         limits:
           memory: 4G
+          cpus: '2.0'
         reservations:
           memory: 1G
+
+  # ------------------------------------------------------------------
+  # Celery Flower 监控面板（可选，用于查看 worker 状态和任务进度）
+  #   访问: http://localhost:5555
+  # ------------------------------------------------------------------
+  celery_flower:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      <<: *common-build
+    container_name: litho-celery-flower
+    ports:
+      - "5555:5555"
+    environment:
+      - PYTHONPATH=/app
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - TZ=Asia/Shanghai
+    command: >
+      celery -A pipeline.batch_runner.celery_app flower
+             --port=5555
+             --broker_api=redis://redis:6379/0
+             --basic_auth=${FLOWER_AUTH:-admin:admin123}
+             --persistent=True
+             --db=/app/results/flower.db
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./results:/app/results
+    profiles:
+      - distributed
+      - monitoring
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget --no-verbose --tries=1 --spider http://127.0.0.1:5555/ || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+        reservations:
+          memory: 128M
+    restart: unless-stopped
 
   # 性能测试服务
   benchmark:

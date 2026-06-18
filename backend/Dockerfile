@@ -48,8 +48,10 @@ COPY requirements.txt .
 # 安装 Python 依赖
 #   - numpy<2 是 numba/scipy/matplotlib 共同要求的稳定版本
 #   - 若某非关键包（如 gdstk）编译失败则跳过，保证主流程可用
+#   - celery/redis 用于分布式批处理调度
 RUN pip install --no-cache-dir "numpy<2.0" "numba>=0.58,<1.0" \
- && pip install --no-cache-dir -r requirements.txt || true
+ && pip install --no-cache-dir -r requirements.txt \
+ && pip install --no-cache-dir "celery>=5.3.0,<6.0" "redis>=4.5.0,<6.0" || true
 
 # 复制项目代码
 COPY . .
