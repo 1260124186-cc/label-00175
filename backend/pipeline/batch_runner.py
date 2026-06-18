@@ -253,6 +253,7 @@ class ResourceConfig:
         memory_limit_gb: 总内存限制（GB），None=不限制
         per_task_timeout_sec: 单任务超时（秒），0=不限
         auto_detect: 是否自动检测可用资源
+        executor_type: 执行器类型 'process'(默认多进程) 或 'thread'(多线程，适合测试)
     """
     max_workers: Optional[int] = None
     cpu_per_worker: int = 1
@@ -260,6 +261,7 @@ class ResourceConfig:
     memory_limit_gb: Optional[float] = None
     per_task_timeout_sec: int = 0
     auto_detect: bool = True
+    executor_type: str = 'process'
 
     def resolve(self) -> 'ResourceConfig':
         """根据 auto_detect 计算实际参数，返回新实例"""
@@ -270,6 +272,7 @@ class ResourceConfig:
             memory_limit_gb=self.memory_limit_gb,
             per_task_timeout_sec=self.per_task_timeout_sec,
             auto_detect=False,
+            executor_type=self.executor_type,
         )
 
         if cfg.auto_detect or cfg.max_workers is None:
@@ -304,7 +307,16 @@ class ResourceConfig:
             'memory_limit_gb': self.memory_limit_gb,
             'per_task_timeout_sec': self.per_task_timeout_sec,
             'auto_detect': self.auto_detect,
+            'executor_type': self.executor_type,
         }
+
+    def get_executor_class(self):
+        """根据 executor_type 返回对应的 Executor 类"""
+        if not HAS_CONCURRENT:
+            raise RuntimeError("concurrent.futures 不可用")
+        if str(self.executor_type).lower() in ('thread', 'threading', 'threads'):
+            return ThreadPoolExecutor
+        return ProcessPoolExecutor
 
 
 @dataclass
@@ -647,10 +659,11 @@ class LocalBatchRunner:
                     logger.debug(f"progress_callback 异常: {e}")
 
         try:
-            with ProcessPoolExecutor(
-                max_workers=self.resource_config.max_workers,
-                initializer=_worker_initializer,
-            ) as executor:
+            ExecutorClass = self.resource_config.get_executor_class()
+            executor_kwargs = {'max_workers': self.resource_config.max_workers}
+            if ExecutorClass is ProcessPoolExecutor:
+                executor_kwargs['initializer'] = _worker_initializer
+            with ExecutorClass(**executor_kwargs) as executor:
                 worker_counter = 0
                 # 主循环：不断入队新任务，等待结果
                 while not self._stop_event.is_set():
@@ -1419,10 +1432,11 @@ class HierarchicalBatchRunner:
                     logger.debug(f"progress_callback 异常: {e}")
 
         try:
-            with ProcessPoolExecutor(
-                max_workers=self.resource_config.max_workers,
-                initializer=_worker_initializer,
-            ) as executor:
+            ExecutorClass = self.resource_config.get_executor_class()
+            executor_kwargs = {'max_workers': self.resource_config.max_workers}
+            if ExecutorClass is ProcessPoolExecutor:
+                executor_kwargs['initializer'] = _worker_initializer
+            with ExecutorClass(**executor_kwargs) as executor:
                 self._run_hierarchical(
                     executor, queue, hierarchy_plan, hierarchy_graph,
                     _on_progress, pixel_size,
