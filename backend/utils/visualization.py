@@ -815,3 +815,1118 @@ def plot_multi_metric_heatmaps(
         plt.close(fig)
 
     return fig
+
+
+# ============================================================================
+# Plotly 交互式可视化模块
+# ============================================================================
+
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import plotly.express as px
+    from plotly.io import to_html
+    _PLOTLY_AVAILABLE = True
+except ImportError:
+    _PLOTLY_AVAILABLE = False
+    logger.warning("Plotly 未安装，交互式可视化功能不可用。请运行: pip install plotly")
+
+
+def _check_plotly_available():
+    """检查 Plotly 是否可用"""
+    if not _PLOTLY_AVAILABLE:
+        raise ImportError(
+            "Plotly 未安装，交互式可视化功能不可用。"
+            "请运行: pip install plotly"
+        )
+
+
+def plot_bossung_interactive(
+        focus_values: np.ndarray,
+        dose_values: np.ndarray,
+        cd_matrix: np.ndarray,
+        cd_target: Optional[float] = None,
+        cd_tolerance: float = 0.1,
+        title: str = "Bossung 图 (CD vs Focus) - 交互式",
+        xlabel: str = "离焦量 Focus (nm)",
+        ylabel: str = "关键尺寸 CD (nm)",
+        height: int = 600,
+        width: Optional[int] = None) -> go.Figure:
+    """
+    绘制交互式 Bossung 图（可缩放、可悬停查看数据）
+
+    Args:
+        focus_values: 唯一 focus 值数组 (nm)，形状 (n_focus,)
+        dose_values: 唯一 dose 值数组，形状 (n_dose,)
+        cd_matrix: CD 值矩阵，形状 (n_focus, n_dose)
+        cd_target: 目标 CD 值 (nm)；提供则绘制目标线与容差带
+        cd_tolerance: CD 相对容差 (默认 10%)
+        title: 图表标题
+        xlabel: X 轴标签
+        ylabel: Y 轴标签
+        height: 图表高度 (px)
+        width: 图表宽度 (px)，None 则自适应
+
+    Returns:
+        Plotly Figure 对象（支持 .show() 显示，或 .write_html() 导出）
+    """
+    _check_plotly_available()
+
+    n_focus = len(focus_values)
+    n_dose = len(dose_values)
+
+    if cd_matrix.shape != (n_focus, n_dose):
+        raise ValueError(
+            f"cd_matrix 形状 {cd_matrix.shape} 与 "
+            f"focus_values ({n_focus}) x dose_values ({n_dose}) 不匹配"
+        )
+
+    fig = go.Figure()
+
+    colors = px.colors.sequential.Viridis
+    color_step = max(1, len(colors) // max(n_dose, 1))
+
+    for j, dose in enumerate(dose_values):
+        cd_series = cd_matrix[:, j]
+        valid_mask = ~np.isnan(cd_series)
+        if np.any(valid_mask):
+            color_idx = min(j * color_step, len(colors) - 1)
+            fig.add_trace(go.Scatter(
+                x=focus_values[valid_mask],
+                y=cd_series[valid_mask],
+                mode='lines+markers',
+                name=f'Dose = {dose:.3f}',
+                line=dict(color=colors[color_idx], width=2),
+                marker=dict(size=6, color=colors[color_idx]),
+                hovertemplate=(
+                    f'Focus: %{{x:.1f}} nm<br>'
+                    f'CD: %{{y:.2f}} nm<br>'
+                    f'Dose: {dose:.3f}<extra></extra>'
+                ),
+            ))
+
+    if cd_target is not None:
+        fig.add_hline(
+            y=cd_target,
+            line_dash="dash",
+            line_color="black",
+            line_width=2,
+            annotation_text=f"目标 CD = {cd_target:.1f} nm",
+            annotation_position="bottom right",
+        )
+        cd_lower = cd_target * (1.0 - cd_tolerance)
+        cd_upper = cd_target * (1.0 + cd_tolerance)
+        fig.add_hrect(
+            y0=cd_lower,
+            y1=cd_upper,
+            line_width=0,
+            fillcolor="green",
+            opacity=0.15,
+            annotation_text=f"容差带 ±{cd_tolerance * 100:.0f}%",
+            annotation_position="bottom left",
+        )
+
+    fig.update_layout(
+        title=dict(
+            text=title,
+            font=dict(size=16, family="Arial, sans-serif"),
+            x=0.5,
+        ),
+        xaxis_title=xlabel,
+        yaxis_title=ylabel,
+        hovermode='x unified',
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+        ),
+        height=height,
+        width=width,
+        margin=dict(l=60, r=40, t=80, b=60),
+        template='plotly_white',
+    )
+
+    fig.update_xaxes(
+        showgrid=True,
+        gridwidth=1,
+        gridcolor='rgba(200, 200, 200, 0.3)',
+        zeroline=False,
+    )
+    fig.update_yaxes(
+        showgrid=True,
+        gridwidth=1,
+        gridcolor='rgba(200, 200, 200, 0.3)',
+        zeroline=False,
+    )
+
+    return fig
+
+
+def plot_epe_heatmap_interactive(
+        focus_values: np.ndarray,
+        dose_values: np.ndarray,
+        epe_matrix: np.ndarray,
+        passing_mask: Optional[np.ndarray] = None,
+        title: str = "EPE 热力图（可点击热点）",
+        xlabel: str = "离焦量 Focus (nm)",
+        ylabel: str = "曝光剂量 Dose",
+        height: int = 600,
+        width: Optional[int] = None,
+        hotspot_threshold: Optional[float] = None) -> go.Figure:
+    """
+    绘制交互式 EPE 热力图（可点击热点、可缩放）
+
+    Args:
+        focus_values: 唯一 focus 值数组 (nm)，形状 (n_focus,)
+        dose_values: 唯一 dose 值数组，形状 (n_dose,)
+        epe_matrix: EPE 值矩阵，形状 (n_focus, n_dose)，单位 nm
+        passing_mask: 布尔矩阵，True 表示通过规格
+        title: 图表标题
+        xlabel: X 轴标签
+        ylabel: Y 轴标签
+        height: 图表高度
+        width: 图表宽度
+        hotspot_threshold: 热点阈值 (nm)，超过此值标记为热点；None 则自动取 75% 分位数
+
+    Returns:
+        Plotly Figure 对象
+    """
+    _check_plotly_available()
+
+    n_focus = len(focus_values)
+    n_dose = len(dose_values)
+
+    if epe_matrix.shape != (n_focus, n_dose):
+        raise ValueError(
+            f"epe_matrix 形状 {epe_matrix.shape} 与 "
+            f"focus_values ({n_focus}) x dose_values ({n_dose}) 不匹配"
+        )
+
+    valid_epe = epe_matrix[~np.isnan(epe_matrix)]
+    if len(valid_epe) == 0:
+        logger.warning("EPE 矩阵全为 NaN，无法绘制热力图")
+        return go.Figure()
+
+    if hotspot_threshold is None:
+        hotspot_threshold = float(np.percentile(valid_epe, 75))
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Heatmap(
+        z=epe_matrix,
+        x=dose_values,
+        y=focus_values,
+        colorscale='YlOrRd',
+        colorbar=dict(
+            title="EPE (nm)",
+            titleside="right",
+        ),
+        hovertemplate=(
+            'Focus: %{y:.1f} nm<br>'
+            'Dose: %{x:.3f}<br>'
+            'EPE: %{z:.3f} nm<extra></extra>'
+        ),
+        name='EPE 热力图',
+    ))
+
+    if passing_mask is not None:
+        fig.add_trace(go.Contour(
+            z=passing_mask.astype(float),
+            x=dose_values,
+            y=focus_values,
+            contours=dict(
+                start=0.5,
+                end=0.5,
+                size=1,
+                coloring='none',
+            ),
+            line=dict(color='black', width=2, dash='dash'),
+            name='工艺窗口边界',
+            showscale=False,
+            hoverinfo='skip',
+        ))
+
+    hotspot_data = []
+    for i in range(n_focus):
+        for j in range(n_dose):
+            if not np.isnan(epe_matrix[i, j]) and epe_matrix[i, j] >= hotspot_threshold:
+                hotspot_data.append(dict(
+                    focus=focus_values[i],
+                    dose=dose_values[j],
+                    epe=float(epe_matrix[i, j]),
+                    is_passing=bool(passing_mask[i, j]) if passing_mask is not None else True,
+                ))
+
+    if hotspot_data:
+        fig.add_trace(go.Scatter(
+            x=[d['dose'] for d in hotspot_data],
+            y=[d['focus'] for d in hotspot_data],
+            mode='markers',
+            marker=dict(
+                symbol='circle',
+                size=10,
+                color='red',
+                line=dict(color='white', width=2),
+            ),
+            name='热点 (High EPE)',
+            text=[
+                f"Focus: {d['focus']:.1f} nm<br>Dose: {d['dose']:.3f}<br>"
+                f"EPE: {d['epe']:.3f} nm<br>"
+                f"状态: {'通过' if d['is_passing'] else '失败'}"
+                for d in hotspot_data
+            ],
+            hoverinfo='text',
+            visible='legendonly',
+        ))
+
+    if len(focus_values) >= 2 and len(dose_values) >= 2:
+        mid_f = (focus_values.min() + focus_values.max()) / 2
+        mid_d = (dose_values.min() + dose_values.max()) / 2
+        fig.add_trace(go.Scatter(
+            x=[mid_d],
+            y=[mid_f],
+            mode='markers',
+            marker=dict(
+                symbol='star',
+                size=15,
+                color='white',
+                line=dict(color='black', width=2),
+            ),
+            name='标称工作点',
+            hovertemplate=f'标称点<br>Focus: {mid_f:.1f} nm<br>Dose: {mid_d:.3f}<extra></extra>',
+        ))
+
+    fig.update_layout(
+        title=dict(
+            text=title,
+            font=dict(size=16, family="Arial, sans-serif"),
+            x=0.5,
+        ),
+        xaxis_title=xlabel,
+        yaxis_title=ylabel,
+        height=height,
+        width=width,
+        margin=dict(l=60, r=40, t=80, b=60),
+        template='plotly_white',
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+        ),
+        clickmode='event+select',
+    )
+
+    return fig
+
+
+def plot_experiment_comparison_interactive(
+        experiments: List[Dict[str, Any]],
+        metric_names: Optional[List[str]] = None,
+        title: str = "多实验对比（可拖拽排序）",
+        height: int = 500,
+        width: Optional[int] = None) -> go.Figure:
+    """
+    绘制交互式多组实验对比图（柱状图，支持图例拖拽排序）
+
+    Args:
+        experiments: 实验列表，每个实验为字典，需包含:
+                     - 'name': 实验名称
+                     - 'metrics': 指标字典 {metric_name: value}
+        metric_names: 要显示的指标名称列表；None 则使用所有实验的指标并集
+        title: 图表标题
+        height: 图表高度
+        width: 图表宽度
+
+    Returns:
+        Plotly Figure 对象
+    """
+    _check_plotly_available()
+
+    if not experiments:
+        logger.warning("没有实验数据可对比")
+        return go.Figure()
+
+    if metric_names is None:
+        all_metrics = set()
+        for exp in experiments:
+            all_metrics.update(exp.get('metrics', {}).keys())
+        metric_names = sorted(all_metrics)
+
+    if not metric_names:
+        logger.warning("没有可对比的指标")
+        return go.Figure()
+
+    colors = px.colors.qualitative.Plotly
+
+    fig = go.Figure()
+
+    for i, exp in enumerate(experiments):
+        exp_name = exp.get('name', f'实验 {i+1}')
+        metrics = exp.get('metrics', {})
+        values = []
+        for m in metric_names:
+            v = metrics.get(m)
+            values.append(v if v is not None else None)
+
+        color = colors[i % len(colors)]
+        fig.add_trace(go.Bar(
+            x=metric_names,
+            y=values,
+            name=exp_name,
+            marker_color=color,
+            text=[f'{v:.4e}' if isinstance(v, (int, float)) and v is not None else 'N/A' for v in values],
+            textposition='outside',
+            hovertemplate=(
+                f'<b>{exp_name}</b><br>'
+                '指标: %{x}<br>'
+                '数值: %{y:.4e}<extra></extra>'
+            ),
+        ))
+
+    fig.update_layout(
+        title=dict(
+            text=title,
+            font=dict(size=16, family="Arial, sans-serif"),
+            x=0.5,
+        ),
+        barmode='group',
+        height=height,
+        width=width,
+        margin=dict(l=60, r=40, t=80, b=100),
+        template='plotly_white',
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+            itemclick='toggleothers',
+            itemdoubleclick='toggle',
+        ),
+        xaxis=dict(
+            tickangle=-45,
+            title=None,
+        ),
+        yaxis=dict(
+            title="指标数值",
+        ),
+    )
+
+    return fig
+
+
+def plot_loss_curves_interactive(
+        experiments: List[Dict[str, Any]],
+        title: str = "多实验收敛曲线对比",
+        xlabel: str = "迭代次数",
+        ylabel: str = "损失值",
+        log_y: bool = True,
+        height: int = 500,
+        width: Optional[int] = None) -> go.Figure:
+    """
+    绘制多组实验的损失收敛曲线对比（交互式，可缩放）
+
+    Args:
+        experiments: 实验列表，每个实验为字典，需包含:
+                     - 'name': 实验名称
+                     - 'loss_history': 损失值列表
+        title: 图表标题
+        xlabel: X 轴标签
+        ylabel: Y 轴标签
+        log_y: Y 轴是否使用对数刻度
+        height: 图表高度
+        width: 图表宽度
+
+    Returns:
+        Plotly Figure 对象
+    """
+    _check_plotly_available()
+
+    if not experiments:
+        logger.warning("没有实验数据可对比")
+        return go.Figure()
+
+    colors = px.colors.qualitative.Plotly
+
+    fig = go.Figure()
+
+    for i, exp in enumerate(experiments):
+        exp_name = exp.get('name', f'实验 {i+1}')
+        loss_history = exp.get('loss_history', [])
+        if not loss_history:
+            continue
+
+        iterations = list(range(len(loss_history)))
+        color = colors[i % len(colors)]
+
+        fig.add_trace(go.Scatter(
+            x=iterations,
+            y=loss_history,
+            mode='lines',
+            name=exp_name,
+            line=dict(color=color, width=2),
+            hovertemplate=(
+                f'<b>{exp_name}</b><br>'
+                f'迭代: %{{x}}<br>'
+                f'损失: %{{y:.6e}}<extra></extra>'
+            ),
+        ))
+
+        if loss_history:
+            fig.add_annotation(
+                x=len(loss_history) - 1,
+                y=loss_history[-1],
+                text=f"{loss_history[-1]:.4e}",
+                showarrow=True,
+                arrowhead=1,
+                ax=40,
+                ay=0,
+                font=dict(color=color, size=10),
+            )
+
+    fig.update_layout(
+        title=dict(
+            text=title,
+            font=dict(size=16, family="Arial, sans-serif"),
+            x=0.5,
+        ),
+        xaxis_title=xlabel,
+        yaxis_title=ylabel,
+        height=height,
+        width=width,
+        margin=dict(l=60, r=80, t=80, b=60),
+        template='plotly_white',
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+        ),
+        hovermode='x unified',
+    )
+
+    if log_y:
+        fig.update_yaxes(type='log')
+
+    fig.update_xaxes(
+        showgrid=True,
+        gridwidth=1,
+        gridcolor='rgba(200, 200, 200, 0.3)',
+    )
+    fig.update_yaxes(
+        showgrid=True,
+        gridwidth=1,
+        gridcolor='rgba(200, 200, 200, 0.3)',
+    )
+
+    return fig
+
+
+def plot_process_window_dashboard(
+        scan_result,
+        cd_target: Optional[float] = None,
+        cd_tolerance: float = 0.1,
+        title: str = "工艺窗口综合分析面板",
+        height: int = 800,
+        width: Optional[int] = None) -> go.Figure:
+    """
+    绘制工艺窗口综合分析面板（多子图交互式）
+
+    包含：
+    1. Bossung 曲线 (CD vs Focus)
+    2. CD 误差热力图
+    3. EPE 热力图
+    4. MSE 热力图
+
+    Args:
+        scan_result: ProcessWindowScanResult 实例
+        cd_target: 目标 CD (nm)；None 则自动推断
+        cd_tolerance: CD 相对容差
+        title: 主标题
+        height: 图表高度
+        width: 图表宽度
+
+    Returns:
+        Plotly Figure 对象
+    """
+    _check_plotly_available()
+
+    focus = scan_result.unique_focus
+    dose = scan_result.unique_dose
+
+    if cd_target is None:
+        mid_f_idx = len(focus) // 2
+        mid_d_idx = len(dose) // 2
+        cd_target = float(scan_result.cd_matrix[mid_f_idx, mid_d_idx]) if not np.isnan(
+            scan_result.cd_matrix[mid_f_idx, mid_d_idx]
+        ) else None
+
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        subplot_titles=(
+            "Bossung 图: CD vs Focus",
+            "CD 误差分布",
+            "EPE 分布",
+            "MSE 分布与工艺窗口",
+        ),
+        vertical_spacing=0.12,
+        horizontal_spacing=0.1,
+    )
+
+    n_dose = len(dose)
+    colors = px.colors.sequential.Viridis
+    color_step = max(1, len(colors) // max(n_dose, 1))
+
+    for j, d in enumerate(dose):
+        cd_series = scan_result.cd_matrix[:, j]
+        valid = ~np.isnan(cd_series)
+        if np.any(valid):
+            color_idx = min(j * color_step, len(colors) - 1)
+            fig.add_trace(
+                go.Scatter(
+                    x=focus[valid],
+                    y=cd_series[valid],
+                    mode='lines+markers',
+                    name=f'Dose={d:.3f}',
+                    line=dict(color=colors[color_idx], width=2),
+                    marker=dict(size=4),
+                    legendgroup='bossung',
+                    showlegend=(j == 0),
+                    hovertemplate=(
+                        'Focus: %{x:.1f} nm<br>'
+                        f'Dose: {d:.3f}<br>'
+                        'CD: %{y:.2f} nm<extra></extra>'
+                    ),
+                ),
+                row=1,
+                col=1,
+            )
+
+    if cd_target is not None:
+        fig.add_hline(
+            y=cd_target,
+            line_dash="dash",
+            line_color="black",
+            line_width=2,
+            row=1,
+            col=1,
+        )
+        cd_lower = cd_target * (1.0 - cd_tolerance)
+        cd_upper = cd_target * (1.0 + cd_tolerance)
+        fig.add_hrect(
+            y0=cd_lower,
+            y1=cd_upper,
+            line_width=0,
+            fillcolor="green",
+            opacity=0.15,
+            row=1,
+            col=1,
+        )
+
+    fig.add_trace(
+        go.Heatmap(
+            z=scan_result.cd_error_matrix,
+            x=dose,
+            y=focus,
+            colorscale='RdBu_r',
+            colorbar=dict(title="CD Error (nm)", len=0.4, y=0.8),
+            hovertemplate=(
+                'Focus: %{y:.1f} nm<br>'
+                'Dose: %{x:.3f}<br>'
+                'CD Error: %{z:.3f} nm<extra></extra>'
+            ),
+            showscale=True,
+        ),
+        row=1,
+        col=2,
+    )
+
+    fig.add_trace(
+        go.Heatmap(
+            z=scan_result.epe_matrix,
+            x=dose,
+            y=focus,
+            colorscale='YlOrRd',
+            colorbar=dict(title="EPE (nm)", len=0.4, y=0.2),
+            hovertemplate=(
+                'Focus: %{y:.1f} nm<br>'
+                'Dose: %{x:.3f}<br>'
+                'EPE: %{z:.3f} nm<extra></extra>'
+            ),
+            showscale=True,
+        ),
+        row=2,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Heatmap(
+            z=scan_result.mse_matrix,
+            x=dose,
+            y=focus,
+            colorscale='hot_r',
+            colorbar=dict(title="MSE", len=0.4, y=0.2),
+            hovertemplate=(
+                'Focus: %{y:.1f} nm<br>'
+                'Dose: %{x:.3f}<br>'
+                'MSE: %{z:.4e}<extra></extra>'
+            ),
+            showscale=True,
+        ),
+        row=2,
+        col=2,
+    )
+
+    if scan_result.passing_mask is not None:
+        fig.add_trace(
+            go.Contour(
+                z=scan_result.passing_mask.astype(float),
+                x=dose,
+                y=focus,
+                contours=dict(
+                    start=0.5,
+                    end=0.5,
+                    size=1,
+                    coloring='none',
+                ),
+                line=dict(color='lime', width=3, dash='solid'),
+                name='可打印区域',
+                showscale=False,
+            ),
+            row=2,
+            col=2,
+        )
+
+    if len(focus) >= 2 and len(dose) >= 2:
+        mid_f = (focus.min() + focus.max()) / 2
+        mid_d = (dose.min() + dose.max()) / 2
+        for r in range(1, 3):
+            for c in range(1, 3):
+                fig.add_trace(
+                    go.Scatter(
+                        x=[mid_d],
+                        y=[mid_f],
+                        mode='markers',
+                        marker=dict(
+                            symbol='star',
+                            size=12,
+                            color='white',
+                            line=dict(color='black', width=2),
+                        ),
+                        name='标称点',
+                        showlegend=(r == 1 and c == 1),
+                        legendgroup='nominal',
+                    ),
+                    row=r,
+                    col=c,
+                )
+
+    fig.update_xaxes(title_text="Focus (nm)", row=1, col=1)
+    fig.update_yaxes(title_text="CD (nm)", row=1, col=1)
+    fig.update_xaxes(title_text="Dose", row=1, col=2)
+    fig.update_yaxes(title_text="Focus (nm)", row=1, col=2)
+    fig.update_xaxes(title_text="Dose", row=2, col=1)
+    fig.update_yaxes(title_text="Focus (nm)", row=2, col=1)
+    fig.update_xaxes(title_text="Dose", row=2, col=2)
+    fig.update_yaxes(title_text="Focus (nm)", row=2, col=2)
+
+    fig.update_layout(
+        title=dict(
+            text=title,
+            font=dict(size=18, family="Arial, sans-serif"),
+            x=0.5,
+        ),
+        height=height,
+        width=width,
+        template='plotly_white',
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+        ),
+    )
+
+    return fig
+
+
+def generate_html_report(
+        figures: List,
+        title: str = "光刻仿真分析报告",
+        output_path: Optional[str] = None,
+        include_summary: bool = True,
+        summary_data: Optional[Dict[str, Any]] = None,
+        custom_css: Optional[str] = None) -> str:
+    """
+    生成交互式 HTML 分析报告
+
+    Args:
+        figures: Plotly Figure 对象列表
+        title: 报告标题
+        output_path: 输出 HTML 文件路径；None 则仅返回 HTML 字符串
+        include_summary: 是否包含摘要卡片
+        summary_data: 摘要数据字典，用于生成数据卡片
+        custom_css: 自定义 CSS 样式字符串
+
+    Returns:
+        HTML 字符串内容
+    """
+    _check_plotly_available()
+
+    default_css = """
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+            background: #f5f7fa;
+            color: #303133;
+            padding: 20px;
+        }
+        .report-container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        .report-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px 40px;
+            border-radius: 12px;
+            margin-bottom: 24px;
+            box-shadow: 0 4px 20px rgba(102, 126, 234, 0.3);
+        }
+        .report-header h1 {
+            font-size: 28px;
+            margin-bottom: 8px;
+            font-weight: 600;
+        }
+        .report-header .subtitle {
+            font-size: 14px;
+            opacity: 0.9;
+        }
+        .summary-section {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .summary-card {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+            transition: transform 0.2s;
+        }
+        .summary-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.12);
+        }
+        .summary-card .label {
+            font-size: 13px;
+            color: #909399;
+            margin-bottom: 8px;
+        }
+        .summary-card .value {
+            font-size: 24px;
+            font-weight: 600;
+            color: #303133;
+            font-family: 'SF Mono', Consolas, monospace;
+        }
+        .summary-card .unit {
+            font-size: 12px;
+            color: #909399;
+            font-weight: 400;
+            margin-left: 4px;
+        }
+        .chart-section {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+            margin-bottom: 24px;
+        }
+        .chart-section h2 {
+            font-size: 18px;
+            margin-bottom: 16px;
+            color: #303133;
+            font-weight: 600;
+            padding-bottom: 12px;
+            border-bottom: 2px solid #ebeef5;
+        }
+        .chart-container {
+            width: 100%;
+        }
+        .report-footer {
+            text-align: center;
+            padding: 20px;
+            color: #909399;
+            font-size: 12px;
+        }
+    </style>
+    """
+
+    css = custom_css if custom_css is not None else default_css
+
+    summary_html = ""
+    if include_summary and summary_data:
+        cards_html = ""
+        for key, data in summary_data.items():
+            label = data.get('label', key)
+            value = data.get('value', '—')
+            unit = data.get('unit', '')
+            cards_html += f"""
+            <div class="summary-card">
+                <div class="label">{label}</div>
+                <div class="value">{value}<span class="unit">{unit}</span></div>
+            </div>
+            """
+        summary_html = f"""
+        <div class="summary-section">
+            {cards_html}
+        </div>
+        """
+
+    figures_html = ""
+    for i, fig in enumerate(figures):
+        fig_html = to_html(
+            fig,
+            include_plotlyjs='cdn',
+            full_html=False,
+            config={
+                'responsive': True,
+                'displayModeBar': True,
+                'displaylogo': False,
+                'modeBarButtonsToRemove': ['lasso2d', 'select2d'],
+            },
+        )
+        fig_title = fig.layout.title.text if fig.layout.title else f"图表 {i+1}"
+        figures_html += f"""
+        <div class="chart-section">
+            <h2>{fig_title}</h2>
+            <div class="chart-container">
+                {fig_html}
+            </div>
+        </div>
+        """
+
+    from datetime import datetime
+    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title}</title>
+    {css}
+</head>
+<body>
+    <div class="report-container">
+        <div class="report-header">
+            <h1>{title}</h1>
+            <div class="subtitle">生成时间: {current_time} | 交互式分析报告</div>
+        </div>
+        {summary_html}
+        {figures_html}
+        <div class="report-footer">
+            本报告由光刻仿真分析工具自动生成 · 所有图表支持缩放、悬停、下载等交互操作
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+    if output_path:
+        output_path_obj = Path(output_path)
+        output_path_obj.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path_obj, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        logger.info(f"HTML 报告已导出: {output_path}")
+
+    return html_content
+
+
+def export_process_window_report(
+        scan_result,
+        output_path: str,
+        cd_target: Optional[float] = None,
+        cd_tolerance: float = 0.1,
+        title: str = "工艺窗口分析报告") -> str:
+    """
+    导出工艺窗口完整分析报告（HTML 格式）
+
+    一键生成包含 Bossung 图、各指标热力图、摘要统计的完整交互式报告，
+    便于课题组内部分享。
+
+    Args:
+        scan_result: ProcessWindowScanResult 实例
+        output_path: 输出 HTML 文件路径
+        cd_target: 目标 CD (nm)
+        cd_tolerance: CD 相对容差
+        title: 报告标题
+
+    Returns:
+        HTML 字符串内容
+    """
+    _check_plotly_available()
+
+    focus = scan_result.unique_focus
+    dose = scan_result.unique_dose
+
+    bossung_fig = plot_bossung_interactive(
+        focus_values=focus,
+        dose_values=dose,
+        cd_matrix=scan_result.cd_matrix,
+        cd_target=cd_target,
+        cd_tolerance=cd_tolerance,
+        title="Bossung 曲线",
+    )
+
+    epe_fig = plot_epe_heatmap_interactive(
+        focus_values=focus,
+        dose_values=dose,
+        epe_matrix=scan_result.epe_matrix,
+        passing_mask=scan_result.passing_mask,
+        title="EPE 热力图",
+    )
+
+    dashboard_fig = plot_process_window_dashboard(
+        scan_result=scan_result,
+        cd_target=cd_target,
+        cd_tolerance=cd_tolerance,
+        title="综合分析面板",
+    )
+
+    valid_cd = scan_result.cd_matrix[~np.isnan(scan_result.cd_matrix)]
+    valid_epe = scan_result.epe_matrix[~np.isnan(scan_result.epe_matrix)]
+    valid_mse = scan_result.mse_matrix[~np.isnan(scan_result.mse_matrix)]
+
+    pw_area_pct = 0.0
+    if scan_result.passing_mask is not None:
+        total = scan_result.passing_mask.size
+        passed = np.sum(scan_result.passing_mask)
+        pw_area_pct = (passed / total * 100) if total > 0 else 0.0
+
+    summary_data = {
+        'nominal_cd': {
+            'label': '标称 CD',
+            'value': f"{np.median(valid_cd):.2f}" if len(valid_cd) > 0 else '—',
+            'unit': ' nm',
+        },
+        'cd_uniformity': {
+            'label': 'CD 均匀性',
+            'value': f"{(np.std(valid_cd) / np.mean(valid_cd) * 100) if len(valid_cd) > 0 and np.mean(valid_cd) > 0 else 0:.2f}",
+            'unit': ' %',
+        },
+        'epe_mean': {
+            'label': '平均 EPE',
+            'value': f"{np.mean(valid_epe):.3f}" if len(valid_epe) > 0 else '—',
+            'unit': ' nm',
+        },
+        'pw_ratio': {
+            'label': '工艺窗口比例',
+            'value': f"{pw_area_pct:.1f}",
+            'unit': ' %',
+        },
+        'scan_points': {
+            'label': '扫描点数',
+            'value': f"{len(focus)} × {len(dose)}",
+            'unit': '',
+        },
+        'mse_avg': {
+            'label': '平均 MSE',
+            'value': f"{np.mean(valid_mse):.4e}" if len(valid_mse) > 0 else '—',
+            'unit': '',
+        },
+    }
+
+    figures = [dashboard_fig, bossung_fig, epe_fig]
+
+    html = generate_html_report(
+        figures=figures,
+        title=title,
+        output_path=output_path,
+        include_summary=True,
+        summary_data=summary_data,
+    )
+
+    return html
+
+
+def export_experiment_comparison_report(
+        experiments: List[Dict[str, Any]],
+        output_path: str,
+        title: str = "多实验对比分析报告",
+        metric_names: Optional[List[str]] = None) -> str:
+    """
+    导出多实验对比分析报告（HTML 格式）
+
+    Args:
+        experiments: 实验列表，每个实验为字典，需包含:
+                     - 'name': 实验名称
+                     - 'metrics': 指标字典 {metric_name: value}
+                     - 'loss_history': 损失历史列表（可选）
+        output_path: 输出 HTML 文件路径
+        title: 报告标题
+        metric_names: 要显示的指标名称列表
+
+    Returns:
+        HTML 字符串内容
+    """
+    _check_plotly_available()
+
+    figures = []
+
+    has_loss_history = any('loss_history' in exp and exp['loss_history'] for exp in experiments)
+
+    if has_loss_history:
+        loss_fig = plot_loss_curves_interactive(
+            experiments=experiments,
+            title="收敛曲线对比",
+        )
+        figures.append(loss_fig)
+
+    compare_fig = plot_experiment_comparison_interactive(
+        experiments=experiments,
+        metric_names=metric_names,
+        title="指标对比",
+    )
+    figures.append(compare_fig)
+
+    summary_data = {}
+    for i, exp in enumerate(experiments):
+        exp_name = exp.get('name', f'实验 {i+1}')
+        metrics = exp.get('metrics', {})
+        loss_hist = exp.get('loss_history', [])
+
+        final_loss = loss_hist[-1] if loss_hist else None
+        if final_loss is not None:
+            summary_data[f'exp{i}_final_loss'] = {
+                'label': f'{exp_name} - 最终损失',
+                'value': f"{final_loss:.4e}",
+                'unit': '',
+            }
+
+        best_mse = metrics.get('mse') or metrics.get('final_mse')
+        if best_mse is not None:
+            summary_data[f'exp{i}_mse'] = {
+                'label': f'{exp_name} - MSE',
+                'value': f"{best_mse:.4e}",
+                'unit': '',
+            }
+
+    html = generate_html_report(
+        figures=figures,
+        title=title,
+        output_path=output_path,
+        include_summary=bool(summary_data),
+        summary_data=summary_data if summary_data else None,
+    )
+
+    return html
