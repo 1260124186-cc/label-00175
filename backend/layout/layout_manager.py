@@ -16,6 +16,8 @@
 import os
 import logging
 import hashlib
+import time
+import re
 from pathlib import Path
 from typing import (
     Optional, List, Dict, Any, Union, Tuple, Iterator,
@@ -23,7 +25,7 @@ from typing import (
 )
 from dataclasses import dataclass, field
 from enum import Enum
-from collections import deque
+from collections import deque, defaultdict
 
 import numpy as np
 
@@ -1204,3 +1206,1441 @@ class LayoutManager:
                              'require_mask_loaded')}
         queue = self.build_queue(lib, **q_kwargs)
         return lib, queue
+
+
+# ============================================================================
+# 层次化数据结构
+# ============================================================================
+
+
+@dataclass
+class CellInstance:
+    """
+    单个 cell 引用实例
+
+    表示父 cell 中对子 cell 的一次引用（SRef 或 ARef 中的一个实例）。
+    包含完整的变换信息，用于从子 cell 结果重建父 cell。
+
+    Attributes:
+        child_cell_name: 被引用的子 cell 名（GDS 原始名）
+        origin: 引用原点 (x, y)，单位与 GDS 一致
+        rotation: 旋转角度（度）
+        magnification: 缩放比例
+        x_reflection: 是否 X 轴镜像
+        transform: 3x3 齐次变换矩阵（累积了以上所有变换）
+        is_array_member: 是否为阵列引用的成员
+        array_index: 若为阵列成员则为 (row, col)，否则 None
+    """
+    child_cell_name: str
+    origin: Tuple[float, float] = (0.0, 0.0)
+    rotation: float = 0.0
+    magnification: float = 1.0
+    x_reflection: bool = False
+    transform: Optional[np.ndarray] = None
+    is_array_member: bool = False
+    array_index: Optional[Tuple[int, int]] = None
+
+    def __post_init__(self):
+        if self.transform is None:
+            self.transform = self._build_transform()
+
+    def _build_transform(self) -> np.ndarray:
+        """构建 3x3 齐次变换矩阵"""
+        mat = np.eye(3, dtype=np.float64)
+        ox, oy = self.origin
+        mat[0, 2] = ox
+        mat[1, 2] = oy
+        if self.rotation != 0.0:
+            rad = np.radians(self.rotation)
+            cos_r, sin_r = np.cos(rad), np.sin(rad)
+            rot = np.eye(3, dtype=np.float64)
+            rot[0, 0] = cos_r
+            rot[0, 1] = -sin_r
+            rot[1, 0] = sin_r
+            rot[1, 1] = cos_r
+            mat = rot @ mat
+        if self.magnification != 1.0:
+            scale = np.eye(3, dtype=np.float64)
+            scale[0, 0] = self.magnification
+            scale[1, 1] = self.magnification
+            mat = scale @ mat
+        if self.x_reflection:
+            mirror = np.eye(3, dtype=np.float64)
+            mirror[1, 1] = -1.0
+            mat = mirror @ mat
+        return mat
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'child_cell_name': self.child_cell_name,
+            'origin': list(self.origin),
+            'rotation': self.rotation,
+            'magnification': self.magnification,
+            'x_reflection': self.x_reflection,
+            'is_array_member': self.is_array_member,
+            'array_index': list(self.array_index) if self.array_index else None,
+        }
+
+
+@dataclass
+class ArrayReferenceInfo:
+    """
+    阵列引用（ARef）信息
+
+    Attributes:
+        child_cell_name: 被引用的子 cell 名
+        rows: 阵列行数
+        cols: 阵列列数
+        spacing_x: 列间距
+        spacing_y: 行间距
+        base_origin: 阵列第一个实例的原点
+        rotation: 整体旋转角度
+        magnification: 整体缩放
+        x_reflection: 是否整体 X 轴镜像
+    """
+    child_cell_name: str
+    rows: int = 1
+    cols: int = 1
+    spacing_x: float = 0.0
+    spacing_y: float = 0.0
+    base_origin: Tuple[float, float] = (0.0, 0.0)
+    rotation: float = 0.0
+    magnification: float = 1.0
+    x_reflection: bool = False
+
+    @property
+    def total_instances(self) -> int:
+        return self.rows * self.cols
+
+    def expand_instances(self) -> List[CellInstance]:
+        """将阵列展开为单个 CellInstance 列表"""
+        instances = []
+        for row in range(self.rows):
+            for col in range(self.cols):
+                ox = self.base_origin[0] + col * self.spacing_x
+                oy = self.base_origin[1] + row * self.spacing_y
+                instances.append(CellInstance(
+                    child_cell_name=self.child_cell_name,
+                    origin=(ox, oy),
+                    rotation=self.rotation,
+                    magnification=self.magnification,
+                    x_reflection=self.x_reflection,
+                    is_array_member=True,
+                    array_index=(row, col),
+                ))
+        return instances
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'child_cell_name': self.child_cell_name,
+            'rows': self.rows,
+            'cols': self.cols,
+            'spacing': [self.spacing_x, self.spacing_y],
+            'base_origin': list(self.base_origin),
+            'rotation': self.rotation,
+            'magnification': self.magnification,
+            'x_reflection': self.x_reflection,
+            'total_instances': self.total_instances,
+        }
+
+
+@dataclass
+class HierarchyNode:
+    """
+    层次树中的单个 cell 节点
+
+    Attributes:
+        cell_name: cell 名（GDS 原始名）
+        depth: 在层次树中的深度（顶层 = 0）
+        is_leaf: 是否为叶节点（无任何子引用）
+        is_top: 是否为顶层 cell（无父引用）
+        children: 子 cell 引用列表（直接子节点）
+        parents: 父 cell 名列表
+        single_refs: 非阵列的单引用列表
+        array_refs: 阵列引用列表
+        total_child_instances: 所有子实例总数（含阵列展开）
+        polygon_count: 本 cell 自身的多边形数（不含子引用）
+        bounds: 本 cell 自身的包围盒（不含子引用）
+    """
+    cell_name: str
+    depth: int = 0
+    is_leaf: bool = True
+    is_top: bool = True
+    children: List[str] = field(default_factory=list)
+    parents: List[str] = field(default_factory=list)
+    single_refs: List[CellInstance] = field(default_factory=list)
+    array_refs: List[ArrayReferenceInfo] = field(default_factory=list)
+    total_child_instances: int = 0
+    polygon_count: int = 0
+    bounds: Optional[Tuple[float, float, float, float]] = None
+
+    @property
+    def all_child_instances(self) -> List[CellInstance]:
+        """获取所有子引用实例（包括阵列展开）"""
+        instances = list(self.single_refs)
+        for aref in self.array_refs:
+            instances.extend(aref.expand_instances())
+        return instances
+
+    @property
+    def unique_children(self) -> Set[str]:
+        """本 cell 直接引用的唯一子 cell 集合"""
+        children = {r.child_cell_name for r in self.single_refs}
+        for aref in self.array_refs:
+            children.add(aref.child_cell_name)
+        return children
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            'cell_name': self.cell_name,
+            'depth': self.depth,
+            'is_leaf': self.is_leaf,
+            'is_top': self.is_top,
+            'parent_count': len(self.parents),
+            'unique_children': sorted(self.unique_children),
+            'single_ref_count': len(self.single_refs),
+            'array_ref_count': len(self.array_refs),
+            'total_child_instances': self.total_child_instances,
+            'polygon_count': self.polygon_count,
+        }
+
+
+@dataclass
+class HierarchyGraph:
+    """
+    GDS 完整层次图
+
+    提供拓扑排序、层次遍历、重复检测等功能。
+
+    Attributes:
+        nodes: cell_name -> HierarchyNode
+        top_cells: 顶层 cell 名列表
+        leaf_cells: 叶节点 cell 名列表
+    """
+    nodes: Dict[str, HierarchyNode] = field(default_factory=dict)
+    top_cells: List[str] = field(default_factory=list)
+    leaf_cells: List[str] = field(default_factory=list)
+
+    def __contains__(self, cell_name: str) -> bool:
+        return cell_name in self.nodes
+
+    def __getitem__(self, cell_name: str) -> HierarchyNode:
+        return self.nodes[cell_name]
+
+    def __len__(self) -> int:
+        return len(self.nodes)
+
+    # ------------------------------------------------------------------
+    # 拓扑排序
+    # ------------------------------------------------------------------
+
+    def topological_order(self, bottom_up: bool = True) -> List[str]:
+        """
+        拓扑排序
+
+        Args:
+            bottom_up: True=叶节点优先（自底向上，先处理子 cell）
+                       False=顶层优先（自顶向下）
+
+        Returns:
+            cell 名的排序列表
+        """
+        in_degree = {name: len(node.parents) for name, node in self.nodes.items()}
+        queue: deque = deque()
+        for name, deg in in_degree.items():
+            if deg == 0:
+                queue.append(name)
+
+        top_down: List[str] = []
+        while queue:
+            name = queue.popleft()
+            top_down.append(name)
+            for child in self.nodes[name].unique_children:
+                in_degree[child] -= 1
+                if in_degree[child] == 0:
+                    queue.append(child)
+
+        if len(top_down) != len(self.nodes):
+            remaining = set(self.nodes.keys()) - set(top_down)
+            logger.warning(
+                f"层次图存在循环引用: {remaining}. 忽略环。"
+            )
+            for name in remaining:
+                top_down.append(name)
+
+        return list(reversed(top_down)) if bottom_up else top_down
+
+    # ------------------------------------------------------------------
+    # 层次遍历
+    # ------------------------------------------------------------------
+
+    def bfs_from_top(self) -> Iterator[Tuple[int, str]]:
+        """从顶层 cell 开始 BFS，产生 (depth, cell_name)"""
+        visited: Set[str] = set()
+        queue: deque = deque()
+        for t in self.top_cells:
+            if t in self.nodes:
+                queue.append((0, t))
+                visited.add(t)
+        while queue:
+            depth, name = queue.popleft()
+            yield depth, name
+            for child in self.nodes[name].unique_children:
+                if child not in visited and child in self.nodes:
+                    visited.add(child)
+                    queue.append((depth + 1, child))
+
+    def compute_depths(self) -> None:
+        """
+        基于最长路径计算每个节点的深度（顶层为 0）
+
+        使用拓扑排序进行动态规划，确保获得从顶层到该节点的最大深度。
+        """
+        topo = self.topological_order(bottom_up=False)
+
+        for name in topo:
+            self.nodes[name].depth = 0
+
+        for name in topo:
+            current_depth = self.nodes[name].depth
+            for child in self.nodes[name].unique_children:
+                if child in self.nodes:
+                    if self.nodes[child].depth < current_depth + 1:
+                        self.nodes[child].depth = current_depth + 1
+
+    # ------------------------------------------------------------------
+    # 重复检测
+    # ------------------------------------------------------------------
+
+    def find_duplicate_leaves(self) -> Dict[str, List[str]]:
+        """
+        找出重复的叶节点（被多次引用的相同几何）
+
+        Returns:
+            child_cell_name -> 引用它的父 cell 名列表
+        """
+        result: Dict[str, List[str]] = {}
+        for name in self.leaf_cells:
+            if name in self.nodes:
+                parents = self.nodes[name].parents
+                if len(parents) > 1:
+                    result[name] = list(parents)
+        return result
+
+    def find_array_cells(self) -> Dict[str, int]:
+        """
+        找出被阵列引用的 cell 及其总实例数
+
+        Returns:
+            cell_name -> 总阵列实例数
+        """
+        counts: Dict[str, int] = defaultdict(int)
+        for name, node in self.nodes.items():
+            for aref in node.array_refs:
+                counts[aref.child_cell_name] += aref.total_instances
+        return dict(counts)
+
+    def compute_reference_counts(self) -> Dict[str, int]:
+        """
+        统计每个 cell 被引用的总次数（含阵列展开）
+
+        Returns:
+            cell_name -> 总引用次数
+        """
+        counts: Dict[str, int] = defaultdict(int)
+        for name, node in self.nodes.items():
+            counts[name] += len(node.single_refs)
+            for aref in node.array_refs:
+                counts[aref.child_cell_name] += aref.total_instances
+        return dict(counts)
+
+    # ------------------------------------------------------------------
+    # 统计与导出
+    # ------------------------------------------------------------------
+
+    def summary(self) -> Dict[str, Any]:
+        ref_counts = self.compute_reference_counts()
+        array_cells = self.find_array_cells()
+        dup_leaves = self.find_duplicate_leaves()
+        return {
+            'total_cells': len(self.nodes),
+            'top_cells': self.top_cells,
+            'leaf_cells_count': len(self.leaf_cells),
+            'array_cells_count': len(array_cells),
+            'array_total_instances': sum(array_cells.values()),
+            'duplicate_leaves_count': len(dup_leaves),
+            'max_depth': max((n.depth for n in self.nodes.values()), default=0),
+            'most_referenced': sorted(
+                ref_counts.items(), key=lambda x: -x[1]
+            )[:10],
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'summary': self.summary(),
+            'top_cells': self.top_cells,
+            'leaf_cells': self.leaf_cells,
+            'nodes': {name: node.summary() for name, node in self.nodes.items()},
+        }
+
+
+# ============================================================================
+# 层次化分析器
+# ============================================================================
+
+
+class LayoutHierarchyAnalyzer:
+    """
+    GDS 层次结构分析器
+
+    解析 GDS/OASIS 文件中的 cell 引用关系，构建 HierarchyGraph。
+    识别：
+    - 父子 cell 关系
+    - 单引用 (SRef) 与阵列引用 (ARef)
+    - 顶层 / 叶节点 cell
+    - 重复引用模式
+
+    使用示例:
+        analyzer = LayoutHierarchyAnalyzer()
+        graph = analyzer.analyze_file("chip.gds", layer=0)
+        order = graph.topological_order(bottom_up=True)  # 叶子优先
+        array_cells = graph.find_array_cells()
+    """
+
+    def __init__(self, backend: Optional[str] = None):
+        if backend is None:
+            if HAS_GDSTK:
+                backend = 'gdstk'
+            elif HAS_GDSPY:
+                backend = 'gdspy'
+            else:
+                backend = None
+        self.backend = backend
+        if self.backend == 'gdstk' and not HAS_GDSTK:
+            raise ImportError("gdstk 未安装")
+        if self.backend == 'gdspy' and not HAS_GDSPY:
+            raise ImportError("gdspy 未安装")
+
+    # ------------------------------------------------------------------
+    # 公共 API
+    # ------------------------------------------------------------------
+
+    def analyze_file(self,
+                     filepath: Union[str, Path],
+                     layer: Optional[int] = None,
+                     datatype: int = 0) -> HierarchyGraph:
+        """
+        分析单个 GDS 文件的层次结构
+
+        Args:
+            filepath: GDS/OASIS 文件路径
+            layer: 指定层号（用于统计多边形数和包围盒），None 则跳过
+            datatype: 数据类型号
+
+        Returns:
+            HierarchyGraph
+        """
+        filepath = Path(filepath)
+        if not filepath.exists():
+            raise FileNotFoundError(f"GDS 文件不存在: {filepath}")
+
+        if self.backend == 'gdstk':
+            return self._analyze_gdstk(str(filepath), layer, datatype)
+        elif self.backend == 'gdspy':
+            return self._analyze_gdspy(str(filepath), layer, datatype)
+        else:
+            raise ImportError("需要安装 gdstk 或 gdspy")
+
+    # ------------------------------------------------------------------
+    # gdstk 后端
+    # ------------------------------------------------------------------
+
+    def _analyze_gdstk(self,
+                       filepath: str,
+                       layer: Optional[int],
+                       datatype: int) -> HierarchyGraph:
+        lib = gdstk.read_gds(filepath)
+        cells = lib.cells
+        cell_map = {c.name: c for c in cells}
+
+        graph = HierarchyGraph()
+        for c in cells:
+            graph.nodes[c.name] = HierarchyNode(cell_name=c.name)
+
+        top_cell_names = [c.name for c in lib.top_level()] or [c.name for c in cells]
+        graph.top_cells = top_cell_names
+
+        for c in cells:
+            node = graph.nodes[c.name]
+            node.is_top = c.name in top_cell_names
+
+            if layer is not None:
+                poly_cnt = 0
+                for p in c.polygons:
+                    if p.layer == layer and p.datatype == datatype:
+                        poly_cnt += 1
+                node.polygon_count = poly_cnt
+                if poly_cnt > 0:
+                    try:
+                        bb = c.bounding_box()
+                        if bb is not None:
+                            node.bounds = (float(bb[0][0]), float(bb[0][1]),
+                                           float(bb[1][0]), float(bb[1][1]))
+                    except Exception:
+                        pass
+
+            for ref in c.references:
+                child_name = self._get_ref_cell_name_gdstk(ref)
+                if child_name is None or child_name not in graph.nodes:
+                    continue
+
+                if self._is_array_ref_gdstk(ref):
+                    aref = self._parse_array_ref_gdstk(ref, child_name)
+                    node.array_refs.append(aref)
+                    node.total_child_instances += aref.total_instances
+                else:
+                    inst = self._parse_single_ref_gdstk(ref, child_name)
+                    node.single_refs.append(inst)
+                    node.total_child_instances += 1
+
+                if child_name not in node.children:
+                    node.children.append(child_name)
+                if c.name not in graph.nodes[child_name].parents:
+                    graph.nodes[child_name].parents.append(c.name)
+                graph.nodes[child_name].is_top = False
+
+            node.is_leaf = len(node.single_refs) == 0 and len(node.array_refs) == 0
+
+        graph.leaf_cells = [name for name, n in graph.nodes.items() if n.is_leaf]
+        graph.compute_depths()
+
+        logger.info(
+            f"层次分析完成: {len(graph.nodes)} cells, "
+            f"{len(graph.top_cells)} 顶层, "
+            f"{len(graph.leaf_cells)} 叶节点, "
+            f"最大深度 {graph.summary()['max_depth']}"
+        )
+        return graph
+
+    @staticmethod
+    def _get_ref_cell_name_gdstk(ref) -> Optional[str]:
+        cell = getattr(ref, 'cell', None)
+        if cell is None:
+            return None
+        return getattr(cell, 'name', None)
+
+    @staticmethod
+    def _is_array_ref_gdstk(ref) -> bool:
+        rep = getattr(ref, 'repetition', None)
+        if rep is None:
+            return False
+        cols = getattr(rep, 'columns', None) or 1
+        rows = getattr(rep, 'rows', None) or 1
+        return cols > 1 or rows > 1
+
+    @staticmethod
+    def _parse_single_ref_gdstk(ref, child_name: str) -> CellInstance:
+        origin = tuple(getattr(ref, 'origin', (0.0, 0.0))) or (0.0, 0.0)
+        origin = (float(origin[0]), float(origin[1]))
+        return CellInstance(
+            child_cell_name=child_name,
+            origin=origin,
+            rotation=float(getattr(ref, 'rotation', 0.0) or 0.0),
+            magnification=float(getattr(ref, 'magnification', 1.0) or 1.0),
+            x_reflection=bool(getattr(ref, 'x_reflection', False)),
+            is_array_member=False,
+            array_index=None,
+        )
+
+    @staticmethod
+    def _parse_array_ref_gdstk(ref, child_name: str) -> ArrayReferenceInfo:
+        origin = tuple(getattr(ref, 'origin', (0.0, 0.0))) or (0.0, 0.0)
+        origin = (float(origin[0]), float(origin[1]))
+        rep = getattr(ref, 'repetition', None)
+        cols = 1
+        rows = 1
+        sx, sy = 0.0, 0.0
+        if rep is not None:
+            cols = int(getattr(rep, 'columns', None) or 1)
+            rows = int(getattr(rep, 'rows', None) or 1)
+            spacing = getattr(rep, 'spacing', None)
+            if spacing is not None and len(spacing) >= 2:
+                sx, sy = float(spacing[0]), float(spacing[1])
+            else:
+                v1 = getattr(rep, 'v1', None)
+                v2 = getattr(rep, 'v2', None)
+                if v1 is not None and len(v1) >= 2:
+                    sx = float(v1[0]) / max(1, cols - 1) if cols > 1 else 0.0
+                if v2 is not None and len(v2) >= 2:
+                    sy = float(v2[1]) / max(1, rows - 1) if rows > 1 else 0.0
+        return ArrayReferenceInfo(
+            child_cell_name=child_name,
+            rows=rows,
+            cols=cols,
+            spacing_x=sx,
+            spacing_y=sy,
+            base_origin=origin,
+            rotation=float(getattr(ref, 'rotation', 0.0) or 0.0),
+            magnification=float(getattr(ref, 'magnification', 1.0) or 1.0),
+            x_reflection=bool(getattr(ref, 'x_reflection', False)),
+        )
+
+    # ------------------------------------------------------------------
+    # gdspy 后端
+    # ------------------------------------------------------------------
+
+    def _analyze_gdspy(self,
+                       filepath: str,
+                       layer: Optional[int],
+                       datatype: int) -> HierarchyGraph:
+        lib = gdspy.GdsLibrary(infile=filepath)
+        cells = lib.cells
+
+        graph = HierarchyGraph()
+        for name in cells.keys():
+            graph.nodes[name] = HierarchyNode(cell_name=name)
+
+        top_cells = lib.top_level()
+        top_names = list(top_cells.keys()) if isinstance(top_cells, dict) else [c.name for c in top_cells]
+        if not top_names:
+            top_names = list(cells.keys())
+        graph.top_cells = top_names
+
+        for name, cell in cells.items():
+            node = graph.nodes[name]
+            node.is_top = name in top_names
+
+            if layer is not None:
+                poly_cnt = 0
+                for ps in getattr(cell, 'polygons', []):
+                    if (getattr(ps, 'layers', None) and ps.layers[0] == layer
+                            and getattr(ps, 'datatypes', None)
+                            and ps.datatypes[0] == datatype):
+                        poly_cnt += len(ps.polygons)
+                node.polygon_count = poly_cnt
+
+            for ref in getattr(cell, 'references', []):
+                child_name = self._get_ref_cell_name_gdspy(ref, lib)
+                if child_name is None or child_name not in graph.nodes:
+                    continue
+
+                if self._is_array_ref_gdspy(ref):
+                    aref = self._parse_array_ref_gdspy(ref, child_name)
+                    node.array_refs.append(aref)
+                    node.total_child_instances += aref.total_instances
+                else:
+                    inst = self._parse_single_ref_gdspy(ref, child_name)
+                    node.single_refs.append(inst)
+                    node.total_child_instances += 1
+
+                if child_name not in node.children:
+                    node.children.append(child_name)
+                if name not in graph.nodes[child_name].parents:
+                    graph.nodes[child_name].parents.append(name)
+                graph.nodes[child_name].is_top = False
+
+            node.is_leaf = len(node.single_refs) == 0 and len(node.array_refs) == 0
+
+        graph.leaf_cells = [name for name, n in graph.nodes.items() if n.is_leaf]
+        graph.compute_depths()
+
+        logger.info(
+            f"层次分析完成: {len(graph.nodes)} cells, "
+            f"{len(graph.top_cells)} 顶层, "
+            f"{len(graph.leaf_cells)} 叶节点"
+        )
+        return graph
+
+    @staticmethod
+    def _get_ref_cell_name_gdspy(ref, lib) -> Optional[str]:
+        ref_cell = getattr(ref, 'ref_cell', None)
+        if ref_cell is None:
+            return None
+        if isinstance(ref_cell, str):
+            return ref_cell
+        return getattr(ref_cell, 'name', None)
+
+    @staticmethod
+    def _is_array_ref_gdspy(ref) -> bool:
+        rows = getattr(ref, 'rows', 1) or 1
+        cols = getattr(ref, 'cols', 1) or 1
+        return rows > 1 or cols > 1
+
+    @staticmethod
+    def _parse_single_ref_gdspy(ref, child_name: str) -> CellInstance:
+        origin = tuple(getattr(ref, 'origin', (0.0, 0.0))) or (0.0, 0.0)
+        origin = (float(origin[0]), float(origin[1]))
+        return CellInstance(
+            child_cell_name=child_name,
+            origin=origin,
+            rotation=float(getattr(ref, 'rotation', 0.0) or 0.0),
+            magnification=float(getattr(ref, 'magnification', 1.0) or 1.0),
+            x_reflection=bool(getattr(ref, 'x_reflection', False)),
+            is_array_member=False,
+            array_index=None,
+        )
+
+    @staticmethod
+    def _parse_array_ref_gdspy(ref, child_name: str) -> ArrayReferenceInfo:
+        origin = tuple(getattr(ref, 'origin', (0.0, 0.0))) or (0.0, 0.0)
+        origin = (float(origin[0]), float(origin[1]))
+        spacing = getattr(ref, 'spacing', None)
+        sx, sy = 0.0, 0.0
+        if spacing is not None and len(spacing) >= 2:
+            sx, sy = float(spacing[0]), float(spacing[1])
+        rows = getattr(ref, 'rows', 1) or 1
+        cols = getattr(ref, 'cols', 1) or 1
+        return ArrayReferenceInfo(
+            child_cell_name=child_name,
+            rows=int(rows),
+            cols=int(cols),
+            spacing_x=sx,
+            spacing_y=sy,
+            base_origin=origin,
+            rotation=float(getattr(ref, 'rotation', 0.0) or 0.0),
+            magnification=float(getattr(ref, 'magnification', 1.0) or 1.0),
+            x_reflection=bool(getattr(ref, 'x_reflection', False)),
+        )
+
+
+# ============================================================================
+# 层次化任务分解
+# ============================================================================
+
+
+@dataclass
+class HierarchicalTask:
+    """
+    层次化优化任务
+
+    Attributes:
+        task_type: 'leaf' | 'composite'
+            leaf: 叶节点，直接仿真该 cell
+            composite: 复合节点，复用子 cell 结果 + 自身几何
+        cell_name: 目标 cell 名
+        unique_cell_key: 唯一标识（相同几何的 cell 共享结果）
+        parent_tasks: 依赖此任务结果的父任务 cell 名列表
+        child_results_needed: 需要从哪些子 cell 获取结果
+            child_name -> list of (instance_transform, bounds)
+        priority: 调度优先级
+        needs_full_simulation: 是否需要完整仿真（无法复用子结果时）
+        estimated_size: 预估掩模尺寸（像素数），用于优先级排序
+    """
+    task_type: str
+    cell_name: str
+    unique_cell_key: str
+    parent_tasks: List[str] = field(default_factory=list)
+    child_results_needed: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    priority: int = 50
+    needs_full_simulation: bool = False
+    estimated_size: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'task_type': self.task_type,
+            'cell_name': self.cell_name,
+            'unique_cell_key': self.unique_cell_key,
+            'parent_count': len(self.parent_tasks),
+            'child_count': len(self.child_results_needed),
+            'total_child_instances': sum(
+                len(v) for v in self.child_results_needed.values()
+            ),
+            'priority': self.priority,
+            'needs_full_simulation': self.needs_full_simulation,
+            'estimated_size': self.estimated_size,
+        }
+
+
+@dataclass
+class HierarchyTaskPlan:
+    """
+    层次化任务分解计划
+
+    由 HierarchyTaskPlanner 生成，描述了哪些 cell 需要独立仿真，
+    哪些可以复用子 cell 结果，以及任务的执行顺序。
+
+    Attributes:
+        tasks: cell_name -> HierarchicalTask
+        execution_order: 建议的执行顺序（cell_name 列表，叶节点优先）
+        unique_tasks: 需要独立仿真的唯一 cell 数（按 unique_cell_key 去重）
+        potential_savings: 预估节省的仿真次数
+            = (原始扁平 cell 数) - (实际需要仿真的唯一 cell 数)
+        graph: 关联的 HierarchyGraph
+    """
+    tasks: Dict[str, HierarchicalTask] = field(default_factory=dict)
+    execution_order: List[str] = field(default_factory=list)
+    unique_tasks: int = 0
+    potential_savings: int = 0
+    graph: Optional[HierarchyGraph] = None
+
+    def summary(self) -> Dict[str, Any]:
+        leaf_tasks = sum(1 for t in self.tasks.values() if t.task_type == 'leaf')
+        composite_tasks = len(self.tasks) - leaf_tasks
+        full_sim = sum(1 for t in self.tasks.values() if t.needs_full_simulation)
+        return {
+            'total_tasks': len(self.tasks),
+            'leaf_tasks': leaf_tasks,
+            'composite_tasks': composite_tasks,
+            'unique_tasks': self.unique_tasks,
+            'full_simulation_required': full_sim,
+            'potential_savings': self.potential_savings,
+            'execution_order_length': len(self.execution_order),
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'summary': self.summary(),
+            'execution_order': self.execution_order,
+            'tasks': {name: t.to_dict() for name, t in self.tasks.items()},
+            'graph_summary': self.graph.summary() if self.graph else None,
+        }
+
+
+class HierarchyTaskPlanner:
+    """
+    层次化任务规划器
+
+    基于 HierarchyGraph 分析哪些 cell 需要独立仿真，
+    哪些可以通过复用子 cell 的仿真结果来加速。
+
+    优化策略：
+    1. 叶节点必须独立仿真
+    2. 被多个父 cell 引用的 cell，只需仿真一次，结果被所有父复用
+    3. 阵列引用的 cell，只需仿真一次，然后按阵列实例变换复制结果
+    4. 如果复合 cell 自身有大量多边形且子 cell 少，则退化到完整仿真
+
+    使用示例:
+        planner = HierarchyTaskPlanner()
+        plan = planner.plan(graph, options=HierarchyPlanOptions())
+        for cell_name in plan.execution_order:
+            task = plan.tasks[cell_name]
+            # 执行仿真或复用
+    """
+
+    def __init__(self):
+        pass
+
+    # ------------------------------------------------------------------
+    # 公共 API
+    # ------------------------------------------------------------------
+
+    def plan(self,
+             graph: HierarchyGraph,
+             options: Optional['HierarchyPlanOptions'] = None) -> HierarchyTaskPlan:
+        """
+        根据层次图生成任务计划
+
+        Args:
+            graph: HierarchyGraph
+            options: 规划选项
+
+        Returns:
+            HierarchyTaskPlan
+        """
+        opts = options or HierarchyPlanOptions()
+
+        plan = HierarchyTaskPlan(graph=graph)
+        plan.execution_order = graph.topological_order(bottom_up=True)
+
+        cell_to_unique: Dict[str, str] = {}
+        seen_unique: Set[str] = set()
+
+        for cell_name in plan.execution_order:
+            node = graph[cell_name]
+
+            unique_key = self._compute_unique_key(cell_name, node, opts)
+            cell_to_unique[cell_name] = unique_key
+
+            task_type = 'leaf' if node.is_leaf else 'composite'
+
+            task = HierarchicalTask(
+                task_type=task_type,
+                cell_name=cell_name,
+                unique_cell_key=unique_key,
+                parent_tasks=list(node.parents),
+            )
+
+            if not node.is_leaf:
+                task.child_results_needed = self._collect_child_needs(node, opts)
+                task.needs_full_simulation = self._should_full_simulate(node, opts)
+
+            est_size = self._estimate_size(node, opts)
+            task.estimated_size = est_size
+            task.priority = self._compute_priority(node, est_size, opts)
+
+            plan.tasks[cell_name] = task
+
+            if unique_key not in seen_unique:
+                seen_unique.add(unique_key)
+                plan.unique_tasks += 1
+
+        plan.potential_savings = max(0, len(graph.nodes) - plan.unique_tasks)
+
+        logger.info(
+            f"层次化任务规划: {len(plan.tasks)} 个任务, "
+            f"{plan.unique_tasks} 个唯一仿真, "
+            f"预估节省 {plan.potential_savings} 次冗余仿真"
+        )
+        return plan
+
+    # ------------------------------------------------------------------
+    # 内部辅助
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_unique_key(cell_name: str,
+                            node: HierarchyNode,
+                            options: 'HierarchyPlanOptions') -> str:
+        """
+        计算 cell 的唯一标识 key
+
+        相同几何的 cell（同名单例、内容 checksum 相同）共享 key。
+        当前基于 cell_name 唯一（GDS 中 cell_name 本身就是唯一的），
+        未来可扩展为基于几何内容的 hash。
+        """
+        return cell_name
+
+    @staticmethod
+    def _collect_child_needs(
+        node: HierarchyNode,
+        options: 'HierarchyPlanOptions',
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        收集本 cell 需要从子 cell 获取的结果列表
+
+        Returns:
+            child_name -> list of {
+                'transform': 3x3 齐次矩阵,
+                'is_array_member': bool,
+                'array_index': (row, col) or None,
+            }
+        """
+        needs: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for inst in node.all_child_instances:
+            needs[inst.child_cell_name].append({
+                'transform': inst.transform,
+                'is_array_member': inst.is_array_member,
+                'array_index': inst.array_index,
+            })
+        return dict(needs)
+
+    @staticmethod
+    def _should_full_simulate(node: HierarchyNode,
+                              options: 'HierarchyPlanOptions') -> bool:
+        """
+        判断复合 cell 是否应该退化到完整仿真
+
+        当自身多边形占比过高、或子 cell 数量过少时，
+        复用的收益低于合成开销，直接完整仿真更高效。
+        """
+        if node.is_leaf:
+            return False
+
+        self_polys = max(1, node.polygon_count)
+        total_child = node.total_child_instances
+        ratio = self_polys / max(1, self_polys + total_child * options.child_polygon_estimate)
+
+        if ratio > options.self_polygon_ratio_threshold:
+            return True
+        if total_child < options.min_child_instances_for_reuse:
+            return True
+
+        return False
+
+    @staticmethod
+    def _estimate_size(node: HierarchyNode,
+                       options: 'HierarchyPlanOptions') -> int:
+        """预估 cell 掩模的像素尺寸（用于优先级排序）"""
+        if node.bounds:
+            xmin, ymin, xmax, ymax = node.bounds
+            w = (xmax - xmin) / max(options.pixel_size, 1e-6)
+            h = (ymax - ymin) / max(options.pixel_size, 1e-6)
+            return max(1, int(w * h))
+        return max(1, node.polygon_count * options.polygon_pixel_estimate)
+
+    @staticmethod
+    def _compute_priority(node: HierarchyNode,
+                          est_size: int,
+                          options: 'HierarchyPlanOptions') -> int:
+        """
+        计算任务优先级
+
+        - 叶节点优先（子任务先完成，父任务才能开始）
+        - 被多次引用的 cell 优先（尽早解锁多个父任务）
+        - 大面积 cell 优先（更容易成为瓶颈）
+        """
+        base = 50
+        if node.is_leaf:
+            base += 30
+        parent_boost = min(20, len(node.parents) * 5)
+        size_boost = min(10, est_size // 10000)
+        return max(0, min(100, base + parent_boost + size_boost))
+
+
+@dataclass
+class HierarchyPlanOptions:
+    """
+    层次化任务规划选项
+
+    Attributes:
+        pixel_size: 栅格化像素尺寸（用于预估掩模尺寸）
+        self_polygon_ratio_threshold: 自身多边形占比阈值，超过则完整仿真
+        min_child_instances_for_reuse: 最少子实例数，低于则不值得复用
+        child_polygon_estimate: 每个子 cell 预估的多边形数（用于阈值计算）
+        polygon_pixel_estimate: 每个多边形预估占用像素数
+        prioritize_by_reference_count: 是否按被引用次数提升优先级
+    """
+    pixel_size: float = 1.0
+    self_polygon_ratio_threshold: float = 0.7
+    min_child_instances_for_reuse: int = 3
+    child_polygon_estimate: int = 50
+    polygon_pixel_estimate: int = 100
+    prioritize_by_reference_count: bool = True
+
+
+# ============================================================================
+# 层次化结果合并器
+# ============================================================================
+
+
+class HierarchyResultMerger:
+    """
+    层次化仿真结果合并器
+
+    将子 cell 的仿真/优化结果按引用变换合成到父 cell，
+    避免对大芯片中重复单元做冗余全图仿真。
+
+    核心功能：
+    1. 结果缓存：按 unique_cell_key 缓存已完成的仿真结果
+    2. 掩模合成：将子 cell 结果通过仿射变换拼接到父 cell 掩模上
+    3. 指标聚合：将子 cell 的 MSE/EPE 等指标聚合为父 cell 的指标估计
+
+    使用示例:
+        merger = HierarchyResultMerger()
+        merger.cache_result("SUB_CELL", optimized_mask, metrics)
+        # 当需要合成父 cell 时:
+        parent_mask = merger.compose_parent_mask("TOP", task, child_masks, parent_bounds)
+    """
+
+    def __init__(self, pixel_size: float = 1.0):
+        self.pixel_size = pixel_size
+        self._mask_cache: Dict[str, np.ndarray] = {}
+        self._metrics_cache: Dict[str, Dict[str, Any]] = {}
+
+    # ------------------------------------------------------------------
+    # 缓存管理
+    # ------------------------------------------------------------------
+
+    def cache_result(self,
+                     unique_key: str,
+                     optimized_mask: np.ndarray,
+                     metrics: Optional[Dict[str, Any]] = None) -> None:
+        """缓存 cell 的仿真/优化结果"""
+        self._mask_cache[unique_key] = optimized_mask.astype(np.float64)
+        if metrics is not None:
+            self._metrics_cache[unique_key] = dict(metrics)
+
+    def has_cached(self, unique_key: str) -> bool:
+        return unique_key in self._mask_cache
+
+    def get_cached_mask(self, unique_key: str) -> Optional[np.ndarray]:
+        return self._mask_cache.get(unique_key)
+
+    def get_cached_metrics(self, unique_key: str) -> Optional[Dict[str, Any]]:
+        return self._metrics_cache.get(unique_key)
+
+    # ------------------------------------------------------------------
+    # 掩模合成
+    # ------------------------------------------------------------------
+
+    def compose_parent_mask(self,
+                            parent_task: HierarchicalTask,
+                            parent_self_mask: Optional[np.ndarray],
+                            parent_bounds: Tuple[float, float, float, float],
+                            target_size: Optional[Tuple[int, int]] = None) -> np.ndarray:
+        """
+        将子 cell 结果与父 cell 自身几何合成为完整掩模
+
+        Args:
+            parent_task: 父 cell 的 HierarchicalTask
+            parent_self_mask: 父 cell 自身几何的栅格化掩模（不含子引用）
+            parent_bounds: 父 cell 的完整包围盒 (xmin, ymin, xmax, ymax)
+            target_size: 目标尺寸 (H, W)，None 则根据 bounds 和 pixel_size 计算
+
+        Returns:
+            合成后的完整掩模 (H, W) float64，值域 [0, 1]
+        """
+        xmin, ymin, xmax, ymax = parent_bounds
+        if target_size is not None:
+            ny, nx = target_size
+        else:
+            nx = max(1, int(np.ceil((xmax - xmin) / self.pixel_size)))
+            ny = max(1, int(np.ceil((ymax - ymin) / self.pixel_size)))
+
+        if parent_self_mask is not None:
+            result = parent_self_mask.astype(np.float64).copy()
+            if result.shape != (ny, nx):
+                result = self._resize_mask(result, ny, nx)
+        else:
+            result = np.zeros((ny, nx), dtype=np.float64)
+
+        for child_name, instances in parent_task.child_results_needed.items():
+            child_mask = self.get_cached_mask(child_name)
+            if child_mask is None:
+                logger.warning(
+                    f"合并父 cell {parent_task.cell_name}: "
+                    f"子 cell {child_name} 结果未缓存，跳过"
+                )
+                continue
+
+            for inst_info in instances:
+                transform = inst_info.get('transform')
+                if transform is None:
+                    continue
+                self._paste_child_mask(
+                    result, child_mask, transform,
+                    xmin, ymax, nx, ny
+                )
+
+        result = np.clip(result, 0.0, 1.0)
+        return result
+
+    @staticmethod
+    def _paste_child_mask(parent_mask: np.ndarray,
+                          child_mask: np.ndarray,
+                          transform: np.ndarray,
+                          parent_xmin: float,
+                          parent_ymax: float,
+                          parent_nx: int,
+                          parent_ny: int) -> None:
+        """
+        将子 cell 掩模通过仿射变换粘贴到父 cell 掩模上
+
+        原地修改 parent_mask。
+        """
+        ch, cw = child_mask.shape
+
+        corners_child = np.array([
+            [0.0, 0.0],      # 左上角
+            [cw, 0.0],       # 右上角
+            [cw, ch],        # 右下角
+            [0.0, ch],       # 左下角
+        ], dtype=np.float64)
+
+        corners_parent_px = HierarchyResultMerger._transform_corners(
+            corners_child, transform, parent_xmin, parent_ymax, parent_ny
+        )
+
+        x_coords = corners_parent_px[:, 0]
+        y_coords = corners_parent_px[:, 1]
+        x0, x1 = int(np.floor(x_coords.min())), int(np.ceil(x_coords.max()))
+        y0, y1 = int(np.floor(y_coords.min())), int(np.ceil(y_coords.max()))
+
+        x0 = max(0, x0)
+        y0 = max(0, y0)
+        x1 = min(parent_nx, x1)
+        y1 = min(parent_ny, y1)
+        if x1 <= x0 or y1 <= y0:
+            return
+
+        try:
+            inv_transform = np.linalg.inv(transform)
+        except np.linalg.LinAlgError:
+            return
+
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        px = xx.ravel().astype(np.float64)
+        py = yy.ravel().astype(np.float64)
+
+        world_x = parent_xmin + px * 1.0
+        world_y = parent_ymax - py * 1.0
+        pts_h = np.column_stack([world_x, world_y, np.ones_like(world_x)])
+        child_world = (inv_transform @ pts_h.T).T[:, :2]
+
+        child_px = child_world[:, 0] / 1.0
+        child_py = (ch - 1) - child_world[:, 1] / 1.0
+
+        valid = (
+            (child_px >= 0) & (child_px < cw - 1)
+            & (child_py >= 0) & (child_py < ch - 1)
+        )
+        if not np.any(valid):
+            return
+
+        cx_valid = child_px[valid]
+        cy_valid = child_py[valid]
+        px_idx = np.clip(np.floor(cx_valid).astype(int), 0, cw - 2)
+        py_idx = np.clip(np.floor(cy_valid).astype(int), 0, ch - 2)
+        fx = cx_valid - px_idx
+        fy = cy_valid - py_idx
+
+        v00 = child_mask[py_idx, px_idx]
+        v10 = child_mask[py_idx, px_idx + 1]
+        v01 = child_mask[py_idx + 1, px_idx]
+        v11 = child_mask[py_idx + 1, px_idx + 1]
+        interp = (
+            v00 * (1 - fx) * (1 - fy)
+            + v10 * fx * (1 - fy)
+            + v01 * (1 - fx) * fy
+            + v11 * fx * fy
+        )
+
+        dest = parent_mask[y0:y1, x0:x1]
+        dest_flat = dest.ravel()
+        valid_idx = np.where(valid)[0]
+        dest_flat[valid_idx] = np.maximum(dest_flat[valid_idx], interp)
+        parent_mask[y0:y1, x0:x1] = dest_flat.reshape(dest.shape)
+
+    @staticmethod
+    def _transform_corners(corners: np.ndarray,
+                           transform: np.ndarray,
+                           parent_xmin: float,
+                           parent_ymax: float,
+                           parent_ny: int) -> np.ndarray:
+        """将子 cell 角点从子像素坐标变换到父像素坐标"""
+        pts_h = np.column_stack([corners[:, 0], corners[:, 1], np.ones(len(corners))])
+        world = (transform @ pts_h.T).T[:, :2]
+        px = (world[:, 0] - parent_xmin)
+        py = (parent_ymax - world[:, 1])
+        return np.column_stack([px, py])
+
+    @staticmethod
+    def _resize_mask(mask: np.ndarray, ny: int, nx: int) -> np.ndarray:
+        """将掩模调整到目标尺寸（使用最近邻，保持二值性）"""
+        h, w = mask.shape
+        if h == ny and w == nx:
+            return mask
+        try:
+            import cv2
+            resized = cv2.resize(
+                mask, (nx, ny),
+                interpolation=cv2.INTER_NEAREST
+            )
+            return resized.astype(np.float64)
+        except ImportError:
+            yy_idx = np.clip(
+                (np.arange(ny) * h / max(1, ny)).astype(int), 0, h - 1
+            )
+            xx_idx = np.clip(
+                (np.arange(nx) * w / max(1, nx)).astype(int), 0, w - 1
+            )
+            return mask[np.ix_(yy_idx, xx_idx)]
+
+    # ------------------------------------------------------------------
+    # 指标聚合
+    # ------------------------------------------------------------------
+
+    def aggregate_parent_metrics(self,
+                                 parent_task: HierarchicalTask,
+                                 parent_self_metrics: Optional[Dict[str, Any]] = None,
+                                 ) -> Dict[str, Any]:
+        """
+        从子 cell 指标聚合估算父 cell 指标
+
+        这是一个近似估计，用于快速预览。精确指标需要对合成后的完整掩模
+        做一次光刻仿真。
+
+        Args:
+            parent_task: 父任务
+            parent_self_metrics: 父 cell 自身几何（不含子引用）的指标
+
+        Returns:
+            聚合后的指标字典
+        """
+        child_metrics_list = []
+        weights = []
+        for child_name, instances in parent_task.child_results_needed.items():
+            m = self.get_cached_metrics(child_name)
+            if m is None:
+                continue
+            n_inst = len(instances)
+            child_metrics_list.append(m)
+            weights.append(n_inst)
+
+        if not child_metrics_list and parent_self_metrics is None:
+            return {}
+
+        aggregated: Dict[str, Any] = {}
+        for metric_key in ['mse', 'epe_mean', 'ssim']:
+            values = []
+            ws = []
+            for m, w in zip(child_metrics_list, weights):
+                if metric_key in m and m[metric_key] is not None:
+                    values.append(float(m[metric_key]))
+                    ws.append(w)
+            if parent_self_metrics and metric_key in parent_self_metrics:
+                if parent_self_metrics[metric_key] is not None:
+                    values.append(float(parent_self_metrics[metric_key]))
+                    ws.append(1)
+            if values:
+                if metric_key == 'ssim':
+                    aggregated[metric_key] = float(np.mean(values))
+                else:
+                    total_w = sum(ws) or 1
+                    aggregated[metric_key] = float(
+                        sum(v * w for v, w in zip(values, ws)) / total_w
+                    )
+
+        if parent_self_metrics:
+            for k, v in parent_self_metrics.items():
+                if k not in aggregated:
+                    aggregated[k] = v
+
+        aggregated['_note'] = (
+            '指标由子 cell 聚合估算，非精确值。'
+            '精确值请对合成掩模做完整仿真。'
+        )
+        return aggregated
+
+
+# ============================================================================
+# LayoutManager 层次化扩展
+# ============================================================================
+
+
+def _extend_layout_manager():
+    """为 LayoutManager 动态添加层次化相关方法（保持向后兼容）"""
+
+    def analyze_hierarchy(self,
+                          filepath: Union[str, Path],
+                          layer: Optional[int] = None,
+                          datatype: int = 0) -> HierarchyGraph:
+        """
+        分析 GDS 文件的层次结构
+
+        Args:
+            filepath: GDS/OASIS 文件路径
+            layer: 用于统计多边形的层号，None 则跳过统计
+            datatype: 数据类型号
+
+        Returns:
+            HierarchyGraph
+        """
+        analyzer = LayoutHierarchyAnalyzer(backend=self.loader.backend)
+        return analyzer.analyze_file(filepath, layer=layer, datatype=datatype)
+
+    def plan_hierarchical_tasks(self,
+                                graph: HierarchyGraph,
+                                options: Optional[HierarchyPlanOptions] = None,
+                                ) -> HierarchyTaskPlan:
+        """
+        根据层次图生成优化任务计划
+
+        Args:
+            graph: HierarchyGraph
+            options: 规划选项
+
+        Returns:
+            HierarchyTaskPlan
+        """
+        planner = HierarchyTaskPlanner()
+        return planner.plan(graph, options=options)
+
+    def create_merger(self, pixel_size: float = 1.0) -> HierarchyResultMerger:
+        """创建层次化结果合并器"""
+        return HierarchyResultMerger(pixel_size=pixel_size)
+
+    def load_and_queue_hierarchical(
+        self,
+        filepath: Union[str, Path],
+        layer: int,
+        **kwargs,
+    ) -> Tuple[LayoutLibrary, LayoutQueue, HierarchyGraph, HierarchyTaskPlan]:
+        """
+        层次化加载与建队（推荐入口）
+
+        相比 load_and_queue 的额外返回：
+        - HierarchyGraph: 层次图，供分析
+        - HierarchyTaskPlan: 任务计划，含执行顺序与复用信息
+
+        队列中的 LayoutCell 会附带层次相关 tags：
+        - 'hier:leaf' / 'hier:composite'
+        - 'hier:top'（顶层 cell）
+        - 'hier:depth_N'
+
+        Args:
+            filepath: GDS/OASIS 文件路径
+            layer: GDS 层号
+            **kwargs: 其他 LayoutLoadOptions / HierarchyPlanOptions 参数
+
+        Returns:
+            (LayoutLibrary, LayoutQueue, HierarchyGraph, HierarchyTaskPlan)
+        """
+        opts_kwargs = {'layer': layer, **{
+            k: v for k, v in kwargs.items()
+            if k in LayoutLoadOptions.__dataclass_fields__
+        }}
+        load_opts = LayoutLoadOptions(**opts_kwargs)
+        load_opts.include_subcells = True
+
+        plan_kwargs = {k: v for k, v in kwargs.items()
+                       if k in HierarchyPlanOptions.__dataclass_fields__}
+        plan_opts = HierarchyPlanOptions(
+            pixel_size=load_opts.pixel_size,
+            **plan_kwargs,
+        )
+
+        graph = self.analyze_hierarchy(filepath, layer=layer, datatype=load_opts.datatype)
+        plan = self.plan_hierarchical_tasks(graph, options=plan_opts)
+
+        lib = self.load_gds_file(filepath, options=load_opts)
+
+        for cell in lib.cells():
+            raw_name = cell.cell_name
+            if raw_name in graph.nodes:
+                node = graph.nodes[raw_name]
+                cell.tags.add(f"hier:{'leaf' if node.is_leaf else 'composite'}")
+                if node.is_top:
+                    cell.tags.add('hier:top')
+                cell.tags.add(f"hier:depth_{node.depth}")
+                if raw_name in plan.tasks:
+                    task = plan.tasks[raw_name]
+                    cell.priority = task.priority
+                    if task.needs_full_simulation:
+                        cell.tags.add('hier:full_sim')
+                    cell.metadata.extra['hierarchy'] = {
+                        'depth': node.depth,
+                        'is_leaf': node.is_leaf,
+                        'is_top': node.is_top,
+                        'parent_count': len(node.parents),
+                        'child_instances': node.total_child_instances,
+                        'unique_key': task.unique_cell_key,
+                    }
+
+        q_kwargs = {k: v for k, v in kwargs.items()
+                    if k in ('priority_by_size', 'priority_by_polygons',
+                             'size_priority_reverse', 'max_retries',
+                             'require_mask_loaded')}
+        queue = self.build_queue(lib, **q_kwargs)
+
+        return lib, queue, graph, plan
+
+    LayoutManager.analyze_hierarchy = analyze_hierarchy
+    LayoutManager.plan_hierarchical_tasks = plan_hierarchical_tasks
+    LayoutManager.create_merger = create_merger
+    LayoutManager.load_and_queue_hierarchical = load_and_queue_hierarchical
+
+
+_extend_layout_manager()
+
+
+__all__ = [
+    'LayoutCell',
+    'LayoutLibrary',
+    'LayoutManager',
+    'GDSLoader',
+    'LayoutQueue',
+    'LayoutLoadOptions',
+    'LayoutCellMetadata',
+    'LayoutSourceType',
+    'CellInstance',
+    'ArrayReferenceInfo',
+    'HierarchyNode',
+    'HierarchyGraph',
+    'LayoutHierarchyAnalyzer',
+    'HierarchicalTask',
+    'HierarchyTaskPlan',
+    'HierarchyTaskPlanner',
+    'HierarchyPlanOptions',
+    'HierarchyResultMerger',
+]
