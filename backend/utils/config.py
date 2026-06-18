@@ -199,18 +199,39 @@ def load_results(result_path: Union[str, Path]) -> Dict[str, Any]:
         raise ValueError(f"不支持的文件格式: {suffix}")
 
 
-def create_default_config() -> Dict[str, Any]:
+def create_default_config(technology_node: str = 'duv_arf') -> Dict[str, Any]:
     """
     创建默认配置
+
+    Args:
+        technology_node: 技术节点类型，'duv_arf' 或 'euv'
 
     Returns:
         默认配置字典
     """
-    return {
-        'system': {
-            'device': 'cpu',
-        },
-        'optical_system': {
+    if technology_node == 'euv':
+        optical_system = {
+            'wavelength': 13.5,
+            'na': 0.33,
+            'sigma': 0.75,
+            'pixel_size': 0.5,
+            'defocus': 0.0,
+            'magnification': 4.0,
+            'illumination_type': 'conventional',
+            'source_params': {
+                'sigma_inner': 0.0,
+                'sigma_outer': 0.75
+            },
+            'use_socs': True,
+            'socs_num_terms': 5,
+            'tcc_mode': 'socs',
+            'technology_node': 'euv',
+            'flare': 0.05,
+            'shadowing_model': 'approximate',
+            'reflective_mask_attenuation': 0.6
+        }
+    else:
+        optical_system = {
             'wavelength': 193.0,
             'na': 1.35,
             'sigma': 0.75,
@@ -224,8 +245,18 @@ def create_default_config() -> Dict[str, Any]:
             },
             'use_socs': True,
             'socs_num_terms': 5,
-            'tcc_mode': 'socs'
+            'tcc_mode': 'socs',
+            'technology_node': 'duv_arf',
+            'flare': 0.0,
+            'shadowing_model': 'none',
+            'reflective_mask_attenuation': 0.0
+        }
+
+    return {
+        'system': {
+            'device': 'cpu',
         },
+        'optical_system': optical_system,
         'optimization': {
             'optimizer_type': 'gradient_descent',
             'max_iter': 100,
@@ -341,6 +372,39 @@ def validate_config(config: Dict[str, Any]) -> bool:
         if not 0 < opening_angle <= 180:
             logger.error("opening_angle必须在(0, 180]度范围内")
             return False
+
+    # 验证技术节点
+    valid_tech_nodes = ['duv_arf', 'euv']
+    tech_node = optics.get('technology_node', 'duv_arf')
+    if tech_node not in valid_tech_nodes:
+        logger.error(f"technology_node 必须为以下之一: {valid_tech_nodes}")
+        return False
+
+    # 验证 EUV 特有参数
+    flare = optics.get('flare', 0.0)
+    if not 0 <= flare <= 1:
+        logger.error("flare 系数必须在 [0, 1] 范围内")
+        return False
+
+    valid_shadowing_models = ['none', 'approximate', 'rigorous']
+    shadowing_model = optics.get('shadowing_model', 'none')
+    if shadowing_model not in valid_shadowing_models:
+        logger.error(f"shadowing_model 必须为以下之一: {valid_shadowing_models}")
+        return False
+
+    attenuation = optics.get('reflective_mask_attenuation', 0.0)
+    if not 0 <= attenuation <= 1:
+        logger.error("reflective_mask_attenuation 必须在 [0, 1] 范围内")
+        return False
+
+    # EUV 模式下的参数一致性检查
+    if tech_node == 'euv':
+        wl = optics.get('wavelength', 193.0)
+        if abs(wl - 13.5) > 1.0:
+            logger.warning(f"EUV 模式下波长 {wl}nm 偏离典型值 13.5nm")
+        na_val = optics.get('na', 1.35)
+        if na_val > 0.5:
+            logger.warning(f"EUV 模式下 NA {na_val} 偏高，典型值为 0.33")
 
     # 验证Zernike像差系数
     zernike = optics.get('zernike_coefficients', {})

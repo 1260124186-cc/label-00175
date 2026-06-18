@@ -1,30 +1,32 @@
-# 计算光刻仿真框架默认配置文件
-# Default Configuration for Lithography Simulation Framework
+# 极紫外（EUV）光刻仿真框架默认配置文件
+# EUV Default Configuration for Lithography Simulation Framework
+# 技术节点: 7nm及以下，波长13.5nm
 
 # 系统配置
 system:
   device: cpu                     # 计算设备: cpu 或 cuda (GPU加速，需要安装CuPy)
 
-# 光学系统参数
+# 光学系统参数 - EUV 特有配置
 optical_system:
-  # 技术节点类型: duv_arf (ArF深紫外193nm), euv (极紫外13.5nm)
-  technology_node: duv_arf
+  # 技术节点类型: duv_arf (ArF深紫外), euv (极紫外)
+  technology_node: euv
 
-  # 核心光学参数
-  wavelength: 193.0      # 光源波长 (nm), ArF光源: 193.0, EUV: 13.5
-  na: 1.35               # 数值孔径 (Numerical Aperture), ArF: 1.35, EUV: 0.33
+  # EUV 核心参数
+  wavelength: 13.5       # 光源波长 (nm)，EUV标准波长
+  na: 0.33               # 数值孔径 (Numerical Aperture)，EUV典型值
   sigma: 0.75            # 部分相干因子 (0~1)
-  pixel_size: 1.0        # 像素尺寸 (nm), ArF: 1.0, EUV: 0.5
+  pixel_size: 0.5        # 像素尺寸 (nm)，EUV需要更高分辨率
   defocus: 0.0           # 离焦量 (nm)
   magnification: 4.0     # 放大倍率
 
-  # EUV 特有参数（DUV模式下可忽略，保持默认值即可）
-  flare: 0.0             # Flare 系数 (0~1)，杂散光比例，EUV典型值3%~10%
-  shadowing_model: none  # 阴影效应模型: none (DUV), approximate, rigorous (EUV)
-  reflective_mask_attenuation: 0.0  # 反射式掩模衰减因子 (0~1)，EUV特有
+  # EUV 特有参数
+  flare: 0.05            # Flare 系数 (0~1)，杂散光比例，典型值3%~10%
+  shadowing_model: approximate  # 阴影效应模型: none, approximate, rigorous
+  reflective_mask_attenuation: 0.6  # 反射式掩模衰减因子 (0~1)，吸收层衰减
 
   # 照明模式: conventional, annular, dipole, quasar, custom
   illumination_type: conventional
+
   # 光源形状参数
   source_params:
     # conventional/annular: sigma_inner, sigma_outer
@@ -33,6 +35,7 @@ optical_system:
     # dipole/quasar: angle, opening_angle
     # angle: 0.0           # 极角 (度)
     # opening_angle: 60.0  # 开口角 (度)
+
   # SOCS低秩分解配置
   # tcc_mode: TCC 计算模式: full_tcc, socs, kernel_2d
   #   - full_tcc: 完整TCC（光源积分法），精度最高，速度最慢
@@ -41,6 +44,7 @@ optical_system:
   tcc_mode: socs
   socs_num_terms: 5      # SOCS分解项数（仅 socs 模式生效）
   use_socs: true         # [已弃用] 旧版配置，向后兼容
+
   # Zernike像差系数（单位: 波长λ）
   # 支持名称和索引两种格式，名称对照:
   #   piston=0, tilt_x=1, tilt_y=2, defocus=3,
@@ -116,7 +120,7 @@ optimization:
 
 # 输出配置
 output:
-  save_dir: ./results               # 结果保存目录
+  save_dir: ./results/euv           # 结果保存目录
   save_images: true                 # 是否保存图像
   save_history: true                # 是否保存历史数据
   image_format: png                 # 图像格式: png, tiff

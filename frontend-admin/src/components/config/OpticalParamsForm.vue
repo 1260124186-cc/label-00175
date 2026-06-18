@@ -1,7 +1,20 @@
 <template>
   <div class="form-group-wrap">
     <h3 class="form-section-title">光学系统参数</h3>
-    <el-form :model="formData" label-width="140px" label-position="right">
+    <el-form :model="formData" label-width="160px" label-position="right">
+      <el-row :gutter="24">
+        <el-col :span="24">
+          <el-form-item label="技术节点">
+            <el-select v-model="formData.technology_node" style="width: 100%" @change="onTechNodeChange">
+              <el-option label="DUV ArF (193nm)" value="duv_arf" />
+              <el-option label="EUV (13.5nm)" value="euv" />
+            </el-select>
+          </el-form-item>
+        </el-col>
+      </el-row>
+
+      <el-divider content-position="left">核心光学参数</el-divider>
+
       <el-row :gutter="24">
         <el-col :span="12">
           <el-form-item label="光源波长 (nm)">
@@ -170,6 +183,49 @@
         </el-col>
       </el-row>
 
+      <el-divider content-position="left">EUV 特有参数</el-divider>
+
+      <el-row :gutter="24" v-if="formData.technology_node === 'euv'">
+        <el-col :span="12">
+          <el-form-item label="Flare 系数">
+            <el-input-number
+              v-model="formData.flare"
+              :min="0"
+              :max="1"
+              :step="0.01"
+              :precision="3"
+              controls-position="right"
+              style="width: 100%"
+            />
+          </el-form-item>
+        </el-col>
+        <el-col :span="12">
+          <el-form-item label="反射式掩模衰减">
+            <el-input-number
+              v-model="formData.reflective_mask_attenuation"
+              :min="0"
+              :max="1"
+              :step="0.05"
+              :precision="3"
+              controls-position="right"
+              style="width: 100%"
+            />
+          </el-form-item>
+        </el-col>
+      </el-row>
+
+      <el-row :gutter="24" v-if="formData.technology_node === 'euv'">
+        <el-col :span="12">
+          <el-form-item label="阴影效应模型">
+            <el-select v-model="formData.shadowing_model" style="width: 100%">
+              <el-option label="不考虑 (None)" value="none" />
+              <el-option label="近似几何模型 (Approximate)" value="approximate" />
+              <el-option label="严格电磁模型 (Rigorous)" value="rigorous" />
+            </el-select>
+          </el-form-item>
+        </el-col>
+      </el-row>
+
       <el-divider content-position="left">SOCS 与像差</el-divider>
 
       <el-row :gutter="24">
@@ -268,6 +324,24 @@ function syncZernikeFromDict() {
   )
 }
 syncZernikeFromDict()
+
+function onTechNodeChange(techNode: string) {
+  if (techNode === 'euv') {
+    formData.wavelength = 13.5
+    formData.na = 0.33
+    formData.pixel_size = 0.5
+    formData.flare = 0.05
+    formData.shadowing_model = 'approximate'
+    formData.reflective_mask_attenuation = 0.6
+  } else {
+    formData.wavelength = 193.0
+    formData.na = 1.35
+    formData.pixel_size = 1.0
+    formData.flare = 0.0
+    formData.shadowing_model = 'none'
+    formData.reflective_mask_attenuation = 0.0
+  }
+}
 
 function onZernikeChange() {
   syncToDict()

@@ -11,7 +11,7 @@
 
 import numpy as np
 from numba import jit, prange
-from typing import Tuple, Optional, Dict, Any, List, Union
+from typing import Tuple, Optional, Dict, Any, List, Union, Type
 from dataclasses import dataclass, field
 from enum import Enum
 from itertools import product
@@ -111,6 +111,28 @@ class TCCMode(Enum):
     KERNEL_2D = "kernel_2d"
 
 
+class TechnologyNode(Enum):
+    """光刻技术节点类型
+
+    - DUV_ARF: ArF 深紫外光刻 (193nm)，适用于 130nm ~ 7nm 技术节点
+    - EUV: 极紫外光刻 (13.5nm)，适用于 7nm 及以下技术节点
+    """
+    DUV_ARF = "duv_arf"
+    EUV = "euv"
+
+
+class ShadowingEffectModel(Enum):
+    """EUV 阴影效应近似模型
+
+    - NONE: 不考虑阴影效应
+    - APPROXIMATE: 近似几何阴影模型，计算速度快
+    - RIGOROUS: 严格电磁阴影模型，精度高但计算量大
+    """
+    NONE = "none"
+    APPROXIMATE = "approximate"
+    RIGOROUS = "rigorous"
+
+
 @dataclass
 class ProcessCondition:
     """
@@ -124,6 +146,11 @@ class ProcessCondition:
         na: 数值孔径 (Numerical Aperture)
         sigma: 部分相干因子 (0~1)
         wavelength: 光源波长 (nm)
+        flare: Flare 系数 (0~1)，EUV 系统中杂散光的比例
+        shadowing_model: 阴影效应近似模型（EUV 特有）
+        reflective_mask_attenuation: 反射式掩模衰减因子 (0~1)，EUV 特有
+        technology_node: 技术节点类型
+        zernike_coefficients: Zernike 像差系数（单位: 波长λ）
         name: 工艺条件名称，用于日志和结果标识
         weight: 该工艺条件在优化中的权重
     """
@@ -132,13 +159,18 @@ class ProcessCondition:
     na: float = 1.35
     sigma: float = 0.75
     wavelength: float = 193.0
+    flare: float = 0.0
+    shadowing_model: ShadowingEffectModel = ShadowingEffectModel.NONE
+    reflective_mask_attenuation: float = 0.0
+    technology_node: TechnologyNode = TechnologyNode.DUV_ARF
     zernike_coefficients: Dict[int, float] = field(default_factory=dict)
     name: str = ""
     weight: float = 1.0
 
     def __post_init__(self):
         if not self.name:
-            self.name = f"df={self.defocus:.0f}nm_dose={self.dose:.2f}_NA={self.na:.2f}_σ={self.sigma:.2f}"
+            tech_str = f"_tech={self.technology_node.value}" if self.technology_node != TechnologyNode.DUV_ARF else ""
+            self.name = f"df={self.defocus:.0f}nm_dose={self.dose:.2f}_NA={self.na:.2f}_σ={self.sigma:.2f}{tech_str}"
 
     @classmethod
     def from_optical_system(cls, optics: 'OpticalSystem',
@@ -152,6 +184,10 @@ class ProcessCondition:
             na=optics.na,
             sigma=optics.sigma,
             wavelength=optics.wavelength,
+            flare=optics.flare,
+            shadowing_model=optics.shadowing_model,
+            reflective_mask_attenuation=optics.reflective_mask_attenuation,
+            technology_node=optics.technology_node,
             zernike_coefficients=dict(optics.zernike_coefficients),
             name=name,
             weight=weight
@@ -169,6 +205,10 @@ class ProcessCondition:
             'na': self.na,
             'sigma': self.sigma,
             'wavelength': self.wavelength,
+            'flare': self.flare,
+            'shadowing_model': self.shadowing_model.value,
+            'reflective_mask_attenuation': self.reflective_mask_attenuation,
+            'technology_node': self.technology_node.value,
             'name': self.name,
             'weight': self.weight,
             'zernike_coefficients': zernike_out if zernike_out else {}
@@ -199,6 +239,10 @@ class ProcessCondition:
                 tcc_mode=base_optics.tcc_mode,
                 socs_num_terms=base_optics.socs_num_terms,
                 custom_source=base_optics.custom_source,
+                flare=self.flare,
+                shadowing_model=self.shadowing_model,
+                reflective_mask_attenuation=self.reflective_mask_attenuation,
+                technology_node=self.technology_node,
                 zernike_coefficients=merged_zernike
             )
         else:
@@ -207,6 +251,10 @@ class ProcessCondition:
                 na=self.na,
                 sigma=self.sigma,
                 defocus=self.defocus,
+                flare=self.flare,
+                shadowing_model=self.shadowing_model,
+                reflective_mask_attenuation=self.reflective_mask_attenuation,
+                technology_node=self.technology_node,
                 zernike_coefficients=self.zernike_coefficients
             )
 
@@ -227,6 +275,10 @@ class ProcessWindow:
         na_values: 数值孔径扫描值
         sigma_values: 部分相干因子扫描值
         wavelength_values: 波长扫描值 (nm)
+        flare_values: Flare 系数扫描值 (0~1)
+        shadowing_model_values: 阴影效应模型扫描值
+        reflective_mask_attenuation_values: 反射式掩模衰减因子扫描值
+        technology_node_values: 技术节点扫描值
         default_weight: 默认权重
     """
     defocus_values: Any = 0.0
@@ -234,6 +286,10 @@ class ProcessWindow:
     na_values: Any = 1.35
     sigma_values: Any = 0.75
     wavelength_values: Any = 193.0
+    flare_values: Any = 0.0
+    shadowing_model_values: Any = ShadowingEffectModel.NONE
+    reflective_mask_attenuation_values: Any = 0.0
+    technology_node_values: Any = TechnologyNode.DUV_ARF
     default_weight: float = 1.0
 
     @staticmethod
@@ -250,6 +306,26 @@ class ProcessWindow:
             return [float(values)]
         else:
             return [float(values)]
+
+    @staticmethod
+    def _normalize_enum_values(values: Any, enum_cls: Type[Enum]) -> List[Enum]:
+        """规范化枚举类型扫描值输入为列表"""
+        if isinstance(values, list):
+            result = []
+            for v in values:
+                if isinstance(v, enum_cls):
+                    result.append(v)
+                elif isinstance(v, str):
+                    result.append(enum_cls(v))
+                else:
+                    result.append(enum_cls(str(v)))
+            return result
+        elif isinstance(values, enum_cls):
+            return [values]
+        elif isinstance(values, str):
+            return [enum_cls(values)]
+        else:
+            return [enum_cls(str(values))]
 
     def generate_conditions(self,
                             weights: Optional[Union[float, List[float], np.ndarray]] = None,
@@ -271,8 +347,15 @@ class ProcessWindow:
         na_list = self._normalize_scan_values(self.na_values)
         sigma_list = self._normalize_scan_values(self.sigma_values)
         wavelength_list = self._normalize_scan_values(self.wavelength_values)
+        flare_list = self._normalize_scan_values(self.flare_values)
+        shadowing_list = self._normalize_enum_values(self.shadowing_model_values, ShadowingEffectModel)
+        attenuation_list = self._normalize_scan_values(self.reflective_mask_attenuation_values)
+        tech_node_list = self._normalize_enum_values(self.technology_node_values, TechnologyNode)
 
-        all_combos = list(product(defocus_list, dose_list, na_list, sigma_list, wavelength_list))
+        all_combos = list(product(
+            defocus_list, dose_list, na_list, sigma_list, wavelength_list,
+            flare_list, shadowing_list, attenuation_list, tech_node_list
+        ))
 
         n_conditions = len(all_combos)
 
@@ -293,15 +376,19 @@ class ProcessWindow:
             na_center = (min(na_list) + max(na_list)) / 2
             sigma_center = (min(sigma_list) + max(sigma_list)) / 2
             wl_center = (min(wavelength_list) + max(wavelength_list)) / 2
+            flare_center = (min(flare_list) + max(flare_list)) / 2
+            atten_center = (min(attenuation_list) + max(attenuation_list)) / 2
 
             distances = []
-            for df, d, na, sg, wl in all_combos:
+            for df, d, na, sg, wl, fl, sh, at, tn in all_combos:
                 dist = np.sqrt(
                     ((df - df_center) / (max(defocus_list) - min(defocus_list) + 1e-12))**2 +
                     ((d - dose_center) / (max(dose_list) - min(dose_list) + 1e-12))**2 +
                     ((na - na_center) / (max(na_list) - min(na_list) + 1e-12))**2 +
                     ((sg - sigma_center) / (max(sigma_list) - min(sigma_list) + 1e-12))**2 +
-                    ((wl - wl_center) / (max(wavelength_list) - min(wavelength_list) + 1e-12))**2
+                    ((wl - wl_center) / (max(wavelength_list) - min(wavelength_list) + 1e-12))**2 +
+                    ((fl - flare_center) / (max(flare_list) - min(flare_list) + 1e-12))**2 +
+                    ((at - atten_center) / (max(attenuation_list) - min(attenuation_list) + 1e-12))**2
                 )
                 distances.append(dist)
 
@@ -310,16 +397,21 @@ class ProcessWindow:
                 weight_list[min_dist_idx] *= float(center_weight_boost)
 
         conditions = []
-        for idx, (df, d, na, sg, wl) in enumerate(all_combos):
+        for idx, (df, d, na, sg, wl, fl, sh, at, tn) in enumerate(all_combos):
             w = weight_list[idx]
+            tech_str = f"_tech={tn.value}" if tn != TechnologyNode.DUV_ARF else ""
             cond = ProcessCondition(
                 defocus=df,
                 dose=d,
                 na=na,
                 sigma=sg,
                 wavelength=wl,
+                flare=fl,
+                shadowing_model=sh,
+                reflective_mask_attenuation=at,
+                technology_node=tn,
                 weight=w,
-                name=f"cond_{idx:03d}_df={df:.0f}_dose={d:.2f}_NA={na:.2f}_σ={sg:.2f}"
+                name=f"cond_{idx:03d}_df={df:.0f}_dose={d:.2f}_NA={na:.2f}_σ={sg:.2f}{tech_str}"
             )
             conditions.append(cond)
 
@@ -417,6 +509,10 @@ class OpticalSystem:
         socs_num_terms: SOCS 分解项数（仅 SOCS 模式生效）
         use_socs: [已弃用] 是否使用 SOCS 低秩分解近似，向后兼容
         custom_source: 自定义光源分布（当illumination_type=CUSTOM时使用）
+        technology_node: 技术节点类型 (DUV_ARF / EUV)
+        flare: Flare 系数 (0~1)，EUV 系统中杂散光的比例
+        shadowing_model: 阴影效应近似模型（EUV 特有）
+        reflective_mask_attenuation: 反射式掩模衰减因子 (0~1)，EUV 特有
     """
     wavelength: float = 193.0  # ArF光源波长
     na: float = 1.35  # 高NA浸没式光刻
@@ -430,6 +526,10 @@ class OpticalSystem:
     socs_num_terms: int = 5
     use_socs: Optional[bool] = None
     custom_source: Optional[np.ndarray] = None
+    technology_node: TechnologyNode = TechnologyNode.DUV_ARF
+    flare: float = 0.0  # Flare 系数
+    shadowing_model: ShadowingEffectModel = ShadowingEffectModel.NONE
+    reflective_mask_attenuation: float = 0.0  # 反射式掩模衰减因子
     zernike_coefficients: Dict[int, float] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -439,7 +539,18 @@ class OpticalSystem:
         - 若显式指定 tcc_mode，直接使用
         - 否则若指定 use_socs，从 use_socs 推导
         - 否则默认为 SOCS 模式
+
+        技术节点自动配置：
+        - EUV 节点自动设置波长 13.5nm、NA 0.33、典型参数
+        - DUV ArF 节点保持默认 193nm、NA 1.35
         """
+        if self.technology_node == TechnologyNode.EUV:
+            if self.wavelength == 193.0:
+                self.wavelength = 13.5
+            if self.na == 1.35:
+                self.na = 0.33
+            if self.magnification == 4.0:
+                self.magnification = 4.0
         if not self.source_params:
             self._set_default_source_params()
         if self.tcc_mode is None:
@@ -515,6 +626,18 @@ class OpticalSystem:
             else:
                 tcc_mode = TCCMode.SOCS
 
+        tech_node_str = optics_config.get('technology_node', 'duv_arf')
+        try:
+            technology_node = TechnologyNode(tech_node_str)
+        except ValueError:
+            technology_node = TechnologyNode.DUV_ARF
+
+        shadowing_str = optics_config.get('shadowing_model', 'none')
+        try:
+            shadowing_model = ShadowingEffectModel(shadowing_str)
+        except ValueError:
+            shadowing_model = ShadowingEffectModel.NONE
+
         source_params = optics_config.get('source_params', {})
 
         zernike_raw = optics_config.get('zernike_coefficients', {})
@@ -531,6 +654,10 @@ class OpticalSystem:
             source_params=source_params,
             tcc_mode=tcc_mode,
             socs_num_terms=optics_config.get('socs_num_terms', 5),
+            technology_node=technology_node,
+            flare=optics_config.get('flare', 0.0),
+            shadowing_model=shadowing_model,
+            reflective_mask_attenuation=optics_config.get('reflective_mask_attenuation', 0.0),
             zernike_coefficients=zernike_coefficients
         )
 
@@ -562,6 +689,10 @@ class OpticalSystem:
             'source_params': self.source_params,
             'tcc_mode': self.tcc_mode.value,
             'socs_num_terms': self.socs_num_terms,
+            'technology_node': self.technology_node.value,
+            'flare': self.flare,
+            'shadowing_model': self.shadowing_model.value,
+            'reflective_mask_attenuation': self.reflective_mask_attenuation,
             'zernike_coefficients': zernike_out if zernike_out else {}
         }
 
@@ -571,6 +702,10 @@ class OpticalSystem:
         dose_values: Any = None,
         na_values: Any = None,
         sigma_values: Any = None,
+        flare_values: Any = None,
+        shadowing_model_values: Any = None,
+        reflective_mask_attenuation_values: Any = None,
+        technology_node_values: Any = None,
         center_weight_boost: Optional[float] = None,
         default_weight: float = 1.0
     ) -> Tuple[List['OpticalSystem'], List[float], List[ProcessCondition]]:
@@ -589,6 +724,10 @@ class OpticalSystem:
             dose_values: 曝光剂量扫描值（归一化），格式同上，None 则固定为 1.0
             na_values: 数值孔径扫描值，格式同上，None 则使用当前 NA
             sigma_values: 部分相干因子扫描值，格式同上，None 则使用当前 sigma
+            flare_values: Flare 系数扫描值，格式同上，None 则使用当前 flare
+            shadowing_model_values: 阴影效应模型扫描值，None 则使用当前模型
+            reflective_mask_attenuation_values: 反射式掩模衰减因子扫描值，格式同上
+            technology_node_values: 技术节点扫描值，None 则使用当前节点
             center_weight_boost: 中心条件额外权重倍率，None 则不区分
             default_weight: 所有条件的默认基础权重
 
@@ -610,6 +749,21 @@ class OpticalSystem:
         sigma_vals = ProcessWindow._normalize_scan_values(
             sigma_values if sigma_values is not None else self.sigma
         )
+        flare_vals = ProcessWindow._normalize_scan_values(
+            flare_values if flare_values is not None else self.flare
+        )
+        shadowing_vals = ProcessWindow._normalize_enum_values(
+            shadowing_model_values if shadowing_model_values is not None else self.shadowing_model,
+            ShadowingEffectModel
+        )
+        attenuation_vals = ProcessWindow._normalize_scan_values(
+            reflective_mask_attenuation_values if reflective_mask_attenuation_values is not None
+            else self.reflective_mask_attenuation
+        )
+        tech_node_vals = ProcessWindow._normalize_enum_values(
+            technology_node_values if technology_node_values is not None else self.technology_node,
+            TechnologyNode
+        )
 
         pw = ProcessWindow(
             defocus_values=df_vals,
@@ -617,6 +771,10 @@ class OpticalSystem:
             na_values=na_vals,
             sigma_values=sigma_vals,
             wavelength_values=self.wavelength,
+            flare_values=flare_vals,
+            shadowing_model_values=shadowing_vals,
+            reflective_mask_attenuation_values=attenuation_vals,
+            technology_node_values=tech_node_vals,
             default_weight=default_weight
         )
         conditions = pw.generate_conditions(center_weight_boost=center_weight_boost)

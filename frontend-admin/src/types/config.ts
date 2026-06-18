@@ -17,6 +17,10 @@ export interface OpticalSystem {
   tcc_mode: 'full_tcc' | 'socs' | 'kernel_2d'
   socs_num_terms: number
   use_socs: boolean
+  technology_node: 'duv_arf' | 'euv'
+  flare: number
+  shadowing_model: 'none' | 'approximate' | 'rigorous'
+  reflective_mask_attenuation: number
   zernike_coefficients: Record<string, number>
 }
 

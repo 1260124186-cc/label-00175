@@ -24,6 +24,18 @@ class OpticalSystem(BaseModel):
     tcc_mode: str = Field("socs", description="TCC模式: full_tcc, socs, kernel_2d")
     socs_num_terms: int = Field(5, gt=0, description="SOCS分解项数")
     use_socs: bool = Field(True, description="[已弃用]是否使用SOCS")
+    technology_node: str = Field(
+        "duv_arf",
+        description="技术节点: duv_arf (ArF深紫外), euv (极紫外)"
+    )
+    flare: float = Field(0.0, ge=0, le=1, description="Flare系数(0~1)，EUV系统杂散光比例")
+    shadowing_model: str = Field(
+        "none",
+        description="阴影效应模型: none, approximate, rigorous"
+    )
+    reflective_mask_attenuation: float = Field(
+        0.0, ge=0, le=1, description="反射式掩模衰减因子(0~1)，EUV特有"
+    )
     zernike_coefficients: Dict[str, float] = Field(
         default_factory=dict,
         description="Zernike像差系数(单位:波长λ)"
@@ -43,6 +55,22 @@ class OpticalSystem(BaseModel):
         valid = ["full_tcc", "socs", "kernel_2d"]
         if v not in valid:
             raise ValueError(f"TCC模式必须为以下之一: {valid}")
+        return v
+
+    @field_validator("technology_node")
+    @classmethod
+    def validate_technology_node(cls, v):
+        valid = ["duv_arf", "euv"]
+        if v not in valid:
+            raise ValueError(f"技术节点必须为以下之一: {valid}")
+        return v
+
+    @field_validator("shadowing_model")
+    @classmethod
+    def validate_shadowing_model(cls, v):
+        valid = ["none", "approximate", "rigorous"]
+        if v not in valid:
+            raise ValueError(f"阴影效应模型必须为以下之一: {valid}")
         return v
 
 
