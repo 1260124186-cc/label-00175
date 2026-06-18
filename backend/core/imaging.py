@@ -1575,8 +1575,89 @@ class PartialCoherentImaging:
             return None
         return create_window(self.image_size, self.window_type, self.tukey_alpha)
 
+    def _apply_reflective_mask_attenuation(self, mask: np.ndarray) -> np.ndarray:
+        """
+        应用反射式掩模衰减效应（EUV 特有）。
+
+        DUV 为透射式掩模，掩模值 0/1 直接对应不透明/透明。
+        EUV 为反射式掩模，吸收层并非完全吸收，存在反射衰减。
+        将 [0, 1] 线性映射到 [attenuation, 1]。
+
+        Args:
+            mask: 原始掩模 [0, 1]
+
+        Returns:
+            应用衰减后的有效掩模
+        """
+        atten = self.optics.reflective_mask_attenuation
+        if atten <= 0.0:
+            return mask
+        return atten + (1.0 - atten) * mask
+
+    def _apply_shadowing_effect(self, mask: np.ndarray) -> np.ndarray:
+        """
+        应用阴影效应近似模型（EUV 反射式掩模特有）。
+
+        EUV 采用掠入射照明，掩模吸收层侧壁对衍射光产生几何遮挡。
+        近似模型：
+        - NONE: 不处理
+        - APPROXIMATE: 沿入射方向（y轴）做不对称一维卷积，
+          模拟边缘有效宽度的非对称偏移
+        - RIGOROUS: 进一步加强的近似模型（更宽的非对称核）
+
+        Args:
+            mask: 输入掩模
+
+        Returns:
+            应用阴影效应后的掩模
+        """
+        model = self.optics.shadowing_model
+        if model == ShadowingEffectModel.NONE:
+            return mask
+
+        pixel_size_nm = self.optics.pixel_size
+        shadow_width_nm = 2.0 if model == ShadowingEffectModel.APPROXIMATE else 4.0
+        k = max(1, int(round(shadow_width_nm / pixel_size_nm)))
+
+        if k <= 1:
+            return mask
+
+        kernel = np.zeros((2 * k + 1,), dtype=np.float64)
+        kernel[k:] = 1.0
+        kernel = kernel / kernel.sum()
+
+        padded = np.pad(mask, ((0, 0), (k, k)), mode='edge')
+        shadowed = np.zeros_like(mask)
+        ny, nx = mask.shape
+        for y in range(ny):
+            for x in range(nx):
+                shadowed[y, x] = np.sum(padded[y, x:x + 2 * k + 1] * kernel)
+
+        return shadowed
+
+    def _apply_flare(self, intensity: np.ndarray) -> np.ndarray:
+        """
+        应用 Flare（杂散光）效应。
+
+        Flare 来自光学系统散射，表现为均匀背景叠加：
+            I_final = (1 - flare) * I_ideal + flare * mean(I_ideal)
+
+        Args:
+            intensity: 理想空间像光强
+
+        Returns:
+            叠加 flare 后的光强
+        """
+        flare = self.optics.flare
+        if flare <= 0.0:
+            return intensity
+        bg = float(np.mean(intensity))
+        return (1.0 - flare) * intensity + flare * bg
+
     def _preprocess_mask(self, mask: np.ndarray) -> np.ndarray:
         processed = mask.astype(np.float64)
+        processed = self._apply_reflective_mask_attenuation(processed)
+        processed = self._apply_shadowing_effect(processed)
         if self._window_2d is not None:
             processed = processed * self._window_2d
         if self.pad_width is not None:
@@ -1730,10 +1811,68 @@ class PartialCoherentImaging:
                 py, px = self.pad_width
             intensity = intensity[py:py + self.image_size[0], px:px + self.image_size[1]]
 
-        if intensity.max() > 0:
-            intensity = intensity / intensity.max()
+        intensity_np = _tonumpy(intensity.astype(backend.float64))
+        intensity_np = self._apply_flare(intensity_np)
 
-        return _tonumpy(intensity.astype(backend.float64))
+        if intensity_np.max() > 0:
+            intensity_np = intensity_np / intensity_np.max()
+
+        return intensity_np
+
+    def _apply_shadowing_gradient(self, grad: np.ndarray) -> np.ndarray:
+        """
+        阴影效应近似的梯度反向传播。
+
+        阴影效应正向是沿 x 方向的非对称一维卷积，
+        梯度反向传播使用转置（反向）卷积核。
+        """
+        model = self.optics.shadowing_model
+        if model == ShadowingEffectModel.NONE:
+            return grad
+
+        pixel_size_nm = self.optics.pixel_size
+        shadow_width_nm = 2.0 if model == ShadowingEffectModel.APPROXIMATE else 4.0
+        k = max(1, int(round(shadow_width_nm / pixel_size_nm)))
+
+        if k <= 1:
+            return grad
+
+        kernel = np.zeros((2 * k + 1,), dtype=np.float64)
+        kernel[k:] = 1.0
+        kernel = kernel / kernel.sum()
+        kernel_rev = kernel[::-1]
+
+        padded = np.pad(grad, ((0, 0), (k, k)), mode='edge')
+        backprop = np.zeros_like(grad)
+        ny, nx = grad.shape
+        for y in range(ny):
+            for x in range(nx):
+                backprop[y, x] = np.sum(padded[y, x:x + 2 * k + 1] * kernel_rev)
+
+        return backprop
+
+    def _apply_attenuation_gradient(self, grad: np.ndarray) -> np.ndarray:
+        """
+        反射式掩模衰减的梯度传播。
+        正向: m_eff = atten + (1 - atten) * m
+        反向: dL/dm = dL/dm_eff * (1 - atten)
+        """
+        atten = self.optics.reflective_mask_attenuation
+        if atten <= 0.0:
+            return grad
+        return grad * (1.0 - atten)
+
+    def _apply_flare_gradient(self, grad: np.ndarray) -> np.ndarray:
+        """
+        Flare 的梯度传播。
+        正向: I_out = (1-flare) * I_in + flare * mean(I_in)
+        反向: dL/dI_in = (1-flare) * dL/dI_out + flare * mean(dL/dI_out)
+        """
+        flare = self.optics.flare
+        if flare <= 0.0:
+            return grad
+        mean_g = float(np.mean(grad))
+        return (1.0 - flare) * grad + flare * mean_g
 
     def compute_image_gradient(self, mask: np.ndarray) -> np.ndarray:
         """
@@ -1815,7 +1954,13 @@ class PartialCoherentImaging:
             window = _asarray(self._window_2d)
             gradient = gradient * window
 
-        return _tonumpy(gradient.astype(backend.float64))
+        grad_np = _tonumpy(gradient.astype(backend.float64))
+
+        grad_np = self._apply_flare_gradient(grad_np)
+        grad_np = self._apply_shadowing_gradient(grad_np)
+        grad_np = self._apply_attenuation_gradient(grad_np)
+
+        return grad_np
 
     def get_source_image(self) -> np.ndarray:
         """获取光源分布图像（fftshift后便于可视化）"""

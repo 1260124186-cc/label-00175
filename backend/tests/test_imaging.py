@@ -31,7 +31,9 @@ from core.imaging import (
     AberrationType,
     load_aberration_scenarios,
     create_aberration_sweep,
-    ProcessCondition
+    ProcessCondition,
+    TechnologyNode,
+    ShadowingEffectModel
 )
 from core.fft import WindowType
 
@@ -1743,3 +1745,186 @@ class TestProcessConditionTCCMode:
         opt = cond.to_optical_system(base_optics=base)
         assert opt.tcc_mode == TCCMode.KERNEL_2D
         assert opt.socs_num_terms == 8
+
+
+class TestEUVImagingEffects:
+    """EUV 特有参数（flare/阴影效应/反射式掩模衰减）接入成像主链路验证"""
+
+    @staticmethod
+    def _make_line_mask(size: int = 64, pitch_nm: float = 100.0,
+                        cdnm: float = 50.0, pixel_nm: float = 1.0) -> np.ndarray:
+        """生成简单的一维密集线掩模图案"""
+        mask = np.zeros((size, size), dtype=np.float64)
+        pitch_px = max(1, int(round(pitch_nm / pixel_nm)))
+        cd_px = max(1, int(round(cdnm / pixel_nm)))
+        for x in range(0, size, pitch_px):
+            x0 = max(0, x + (pitch_px - cd_px) // 2)
+            x1 = min(size, x0 + cd_px)
+            mask[:, x0:x1] = 1.0
+        return mask
+
+    def test_duv_vs_euv_different_aerial_image(self):
+        """DUV ArF 和 EUV 节点生成的空间像应存在显著差异"""
+        mask = self._make_line_mask(size=64, pitch_nm=200.0, cdnm=100.0, pixel_nm=2.0)
+
+        duv_opt = OpticalSystem(
+            technology_node=TechnologyNode.DUV_ARF,
+            wavelength=193.0, na=1.35, sigma=0.75, pixel_size=2.0
+        )
+        euv_opt = OpticalSystem(
+            technology_node=TechnologyNode.EUV,
+            wavelength=13.5, na=0.33, sigma=0.5, pixel_size=2.0,
+            flare=0.0, shadowing_model=ShadowingEffectModel.NONE,
+            reflective_mask_attenuation=0.0
+        )
+
+        duv_img = PartialCoherentImaging(duv_opt, mask.shape).compute_aerial_image(mask)
+        euv_img = PartialCoherentImaging(euv_opt, mask.shape).compute_aerial_image(mask)
+
+        assert duv_img.shape == euv_img.shape
+        diff = float(np.mean(np.abs(duv_img - euv_img)))
+        assert diff > 1e-3, f"DUV/EUV 空间像差异过小: {diff}"
+
+    def test_flare_changes_aerial_image(self):
+        """开启 flare 后空间像对比度应下降"""
+        mask = self._make_line_mask(size=64, pitch_nm=200.0, cdnm=100.0, pixel_nm=2.0)
+        optics_no_flare = OpticalSystem(
+            technology_node=TechnologyNode.EUV, wavelength=13.5, na=0.33,
+            pixel_size=2.0, flare=0.0, shadowing_model=ShadowingEffectModel.NONE,
+            reflective_mask_attenuation=0.0
+        )
+        optics_flare = OpticalSystem(
+            technology_node=TechnologyNode.EUV, wavelength=13.5, na=0.33,
+            pixel_size=2.0, flare=0.1, shadowing_model=ShadowingEffectModel.NONE,
+            reflective_mask_attenuation=0.0
+        )
+
+        img_no_flare = PartialCoherentImaging(optics_no_flare, mask.shape).compute_aerial_image(mask)
+        img_flare = PartialCoherentImaging(optics_flare, mask.shape).compute_aerial_image(mask)
+
+        assert not np.allclose(img_no_flare, img_flare, atol=1e-6)
+        contrast_no = float(img_no_flare.max() - img_no_flare.min())
+        contrast_yes = float(img_flare.max() - img_flare.min())
+        assert contrast_yes < contrast_no, f"Flare 应降低对比度: before={contrast_no}, after={contrast_yes}"
+
+    def test_reflective_attenuation_changes_aerial_image(self):
+        """反射式掩模衰减应改变空间像"""
+        mask = self._make_line_mask(size=64, pitch_nm=100.0, cdnm=50.0, pixel_nm=1.0)
+        optics_no_atten = OpticalSystem(
+            technology_node=TechnologyNode.EUV, wavelength=13.5, na=0.33,
+            pixel_size=1.0, reflective_mask_attenuation=0.0,
+            shadowing_model=ShadowingEffectModel.NONE, flare=0.0
+        )
+        optics_atten = OpticalSystem(
+            technology_node=TechnologyNode.EUV, wavelength=13.5, na=0.33,
+            pixel_size=1.0, reflective_mask_attenuation=0.6,
+            shadowing_model=ShadowingEffectModel.NONE, flare=0.0
+        )
+
+        img_no = PartialCoherentImaging(optics_no_atten, mask.shape).compute_aerial_image(mask)
+        img_yes = PartialCoherentImaging(optics_atten, mask.shape).compute_aerial_image(mask)
+
+        assert not np.allclose(img_no, img_yes, atol=1e-6)
+
+    def test_shadowing_effect_changes_aerial_image(self):
+        """开启阴影效应后空间像应改变"""
+        mask = self._make_line_mask(size=64, pitch_nm=100.0, cdnm=50.0, pixel_nm=1.0)
+        optics_none = OpticalSystem(
+            technology_node=TechnologyNode.EUV, wavelength=13.5, na=0.33,
+            pixel_size=1.0, shadowing_model=ShadowingEffectModel.NONE,
+            reflective_mask_attenuation=0.0, flare=0.0
+        )
+        optics_approx = OpticalSystem(
+            technology_node=TechnologyNode.EUV, wavelength=13.5, na=0.33,
+            pixel_size=1.0, shadowing_model=ShadowingEffectModel.APPROXIMATE,
+            reflective_mask_attenuation=0.0, flare=0.0
+        )
+
+        img_none = PartialCoherentImaging(optics_none, mask.shape).compute_aerial_image(mask)
+        img_approx = PartialCoherentImaging(optics_approx, mask.shape).compute_aerial_image(mask)
+
+        assert not np.allclose(img_none, img_approx, atol=1e-6)
+
+    def test_simulate_wafer_image_inherits_euv_params(self):
+        """顶层 simulate_wafer_image 应自动继承 EUV 参数"""
+        mask = self._make_line_mask(size=48, pitch_nm=150.0, cdnm=75.0, pixel_nm=2.0)
+        duv_opt = OpticalSystem(technology_node=TechnologyNode.DUV_ARF, pixel_size=2.0)
+        euv_opt = OpticalSystem(
+            technology_node=TechnologyNode.EUV, pixel_size=2.0,
+            flare=0.05, reflective_mask_attenuation=0.6,
+            shadowing_model=ShadowingEffectModel.APPROXIMATE
+        )
+
+        wafer_duv = simulate_wafer_image(mask, optical_system=duv_opt, apply_resist=False)
+        wafer_euv = simulate_wafer_image(mask, optical_system=euv_opt, apply_resist=False)
+
+        assert wafer_duv.shape == wafer_euv.shape
+        assert not np.allclose(wafer_duv, wafer_euv, atol=1e-5)
+
+    def test_gradient_with_euv_effects_finite(self):
+        """开启 EUV 效应后梯度应为有限值且形状正确"""
+        mask = self._make_line_mask(size=32, pitch_nm=100.0, cdnm=50.0, pixel_nm=2.0)
+        optics = OpticalSystem(
+            technology_node=TechnologyNode.EUV, wavelength=13.5, na=0.33,
+            pixel_size=2.0, flare=0.05, reflective_mask_attenuation=0.6,
+            shadowing_model=ShadowingEffectModel.APPROXIMATE
+        )
+        imaging = PartialCoherentImaging(optics, mask.shape)
+        grad = imaging.compute_image_gradient(mask)
+
+        assert grad.shape == mask.shape
+        assert np.all(np.isfinite(grad))
+        assert np.any(grad != 0), "EUV 效应开启下梯度不应全零"
+
+    def test_gradient_flare_scales_correctly(self):
+        """Flare 效应应使梯度整体按比例缩小（近似关系）"""
+        mask = self._make_line_mask(size=32, pitch_nm=100.0, cdnm=50.0, pixel_nm=2.0)
+        optics_noflare = OpticalSystem(
+            technology_node=TechnologyNode.EUV, wavelength=13.5, na=0.33,
+            pixel_size=2.0, flare=0.0, shadowing_model=ShadowingEffectModel.NONE,
+            reflective_mask_attenuation=0.0
+        )
+        optics_flare = OpticalSystem(
+            technology_node=TechnologyNode.EUV, wavelength=13.5, na=0.33,
+            pixel_size=2.0, flare=0.5, shadowing_model=ShadowingEffectModel.NONE,
+            reflective_mask_attenuation=0.0
+        )
+        grad_noflare = PartialCoherentImaging(optics_noflare, mask.shape).compute_image_gradient(mask)
+        grad_flare = PartialCoherentImaging(optics_flare, mask.shape).compute_image_gradient(mask)
+
+        norm_noflare = float(np.linalg.norm(grad_noflare))
+        norm_flare = float(np.linalg.norm(grad_flare))
+        assert norm_flare < norm_noflare, "大 flare 下梯度范数应更小"
+
+    def test_all_three_euv_effects_combined(self):
+        """三个 EUV 效应同时开启时与全部关闭应存在显著差异"""
+        mask = self._make_line_mask(size=48, pitch_nm=100.0, cdnm=50.0, pixel_nm=1.0)
+        optics_off = OpticalSystem(
+            technology_node=TechnologyNode.EUV, wavelength=13.5, na=0.33,
+            pixel_size=1.0, flare=0.0, shadowing_model=ShadowingEffectModel.NONE,
+            reflective_mask_attenuation=0.0
+        )
+        optics_all = OpticalSystem(
+            technology_node=TechnologyNode.EUV, wavelength=13.5, na=0.33,
+            pixel_size=1.0, flare=0.05, shadowing_model=ShadowingEffectModel.APPROXIMATE,
+            reflective_mask_attenuation=0.6
+        )
+        img_off = PartialCoherentImaging(optics_off, mask.shape).compute_aerial_image(mask)
+        img_all = PartialCoherentImaging(optics_all, mask.shape).compute_aerial_image(mask)
+
+        diff = float(np.mean(np.abs(img_off - img_all)))
+        assert diff > 1e-3, f"三个 EUV 效应同时开启后差异不足: {diff}"
+
+    def test_duv_defaults_ignore_euv_params(self):
+        """DUV 默认模式下，EUV 参数保持为零/none，不影响成像结果"""
+        mask = self._make_line_mask(size=48, pitch_nm=200.0, cdnm=100.0, pixel_nm=2.0)
+        optics_default = OpticalSystem(technology_node=TechnologyNode.DUV_ARF, pixel_size=2.0)
+        imaging = PartialCoherentImaging(optics_default, mask.shape)
+
+        assert optics_default.flare == 0.0
+        assert optics_default.shadowing_model == ShadowingEffectModel.NONE
+        assert optics_default.reflective_mask_attenuation == 0.0
+
+        aerial = imaging.compute_aerial_image(mask)
+        assert aerial.shape == mask.shape
+        assert np.all(np.isfinite(aerial))
