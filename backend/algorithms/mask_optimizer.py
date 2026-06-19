@@ -10,6 +10,7 @@ import numpy as np
 from typing import Optional, Callable, Dict, Any, List, Union, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
+from collections import Counter
 import logging
 import time
 
@@ -18,7 +19,7 @@ from core.imaging import (
     ProcessCondition, ProcessWindow, MultiProcessSimulationResult,
     simulate_multi_process, create_focus_dose_window, create_full_process_window,
     downsample_mask, upsample_mask, build_pyramid_scales,
-    split_tiles, merge_tiles_with_blend
+    split_tiles, merge_tiles_with_blend, TCCMode
 )
 from core.rigorous_sim import (
     SimulationBackend,
@@ -357,6 +358,81 @@ class RegularizationConfig:
         }
 
 
+class FidelityLevel(str, Enum):
+    """保真度层级枚举
+
+    定义多保真度优化的三个层级：
+    - LOW: 使用 SurrogateImaging 神经网络代理模型，最快，精度最低
+    - MEDIUM: 使用 SOCS 近似，中等速度和精度
+    - HIGH: 使用完整 Hopkins + 光刻胶模型，最慢，精度最高
+    """
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+@dataclass
+class MultiFidelityConfig:
+    """多保真度优化配置
+
+    控制多保真度调度的行为，包括自动切换阈值、校准周期等。
+
+    Attributes:
+        enabled: 是否启用多保真度优化
+        start_level: 初始保真度层级
+        auto_switch: 是否根据代理误差自动切换保真度
+        calibration_interval: 中期 SOCS 校准周期（迭代次数）
+        high_fidelity_start_iter: 开始使用高保真模型的迭代次数
+        error_window_size: 代理误差滑动窗口大小
+        mse_threshold_medium: 从 LOW 切换到 MEDIUM 的 MSE 阈值
+        mse_threshold_high: 从 MEDIUM 切换到 HIGH 的 MSE 阈值
+        ssim_threshold_medium: 从 LOW 切换到 MEDIUM 的 SSIM 阈值
+        ssim_threshold_high: 从 MEDIUM 切换到 HIGH 的 SSIM 阈值
+        consecutive_failures: 连续多少次误差超过阈值才切换
+        socs_num_terms_calibration: 校准时使用的 SOCS 项数
+        force_high_fidelity_final: 最后 N 次迭代强制使用高保真
+        verbose: 是否输出保真度切换日志
+    """
+    enabled: bool = False
+    start_level: FidelityLevel = FidelityLevel.LOW
+    auto_switch: bool = True
+    calibration_interval: int = 20
+    high_fidelity_start_iter: Optional[int] = None
+    error_window_size: int = 10
+    mse_threshold_medium: float = 0.005
+    mse_threshold_high: float = 0.001
+    ssim_threshold_medium: float = 0.95
+    ssim_threshold_high: float = 0.98
+    consecutive_failures: int = 3
+    socs_num_terms_calibration: int = 10
+    force_high_fidelity_final: int = 20
+    verbose: bool = True
+
+    @classmethod
+    def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'MultiFidelityConfig':
+        if d is None:
+            return cls()
+        cfg = cls()
+        field_names = {f.name for f in cls.__dataclass_fields__.values()}
+        for key, value in d.items():
+            if key in field_names:
+                if key == 'start_level' and isinstance(value, str):
+                    setattr(cfg, key, FidelityLevel(value))
+                else:
+                    setattr(cfg, key, value)
+        return cfg
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = {}
+        for f in self.__dataclass_fields__.values():
+            val = getattr(self, f.name)
+            if isinstance(val, FidelityLevel):
+                result[f.name] = val.value
+            else:
+                result[f.name] = val
+        return result
+
+
 @dataclass
 class OptimizationConfig:
     """
@@ -602,6 +678,9 @@ class OptimizationConfig:
     use_real_model_for_final_evaluation: bool = True  # 优化结束后用真实模型验证
     surrogate_device: str = 'auto'  # 代理模型推理设备: 'auto' | 'cpu' | 'cuda' | 'mps'
 
+    # 多保真度优化配置
+    multi_fidelity: MultiFidelityConfig = field(default_factory=MultiFidelityConfig)
+
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'OptimizationConfig':
         if d is None:
@@ -625,6 +704,8 @@ class OptimizationConfig:
                     cfg.rcwa_config = RCWAConfig(**value) if isinstance(value, dict) else value
                 elif key == 'fdtd_config' and value is not None:
                     cfg.fdtd_config = FDTDConfig(**value) if isinstance(value, dict) else value
+                elif key == 'multi_fidelity' and value is not None:
+                    cfg.multi_fidelity = MultiFidelityConfig.from_dict(value)
                 else:
                     setattr(cfg, key, value)
         return cfg
@@ -649,6 +730,8 @@ class OptimizationConfig:
                     else:
                         d[k] = v
                 result[f.name] = d
+            elif f.name == 'multi_fidelity':
+                result[f.name] = val.to_dict()
             else:
                 result[f.name] = val
         return result
@@ -764,6 +847,245 @@ class MaskOptimizationResult:
     per_condition_losses: Optional[List[float]] = None
     process_conditions: Optional[List[ProcessCondition]] = None
     mask_history: Optional[List[np.ndarray]] = None
+    fidelity_level_history: Optional[List[str]] = None
+    surrogate_error_history: Optional[List[Dict[str, float]]] = None
+
+
+@dataclass
+class SurrogateErrorRecord:
+    """代理误差记录"""
+    epoch: int
+    mse: float
+    ssim: float
+    psnr: float
+    mae: float
+    fidelity_level: FidelityLevel
+
+
+class FidelityScheduler:
+    """
+    多保真度调度器
+
+    负责根据代理模型误差自动决定何时切换保真度层级。
+
+    策略：
+    - 前期（LOW）：使用 SurrogateImaging 快速探索
+    - 中期（MEDIUM）：周期性用 SOCS 近似校准
+    - 后期（HIGH）：用完整 Hopkins + 光刻胶模型精修
+    """
+
+    def __init__(self, config: MultiFidelityConfig, total_iterations: int):
+        """
+        初始化保真度调度器
+
+        Args:
+            config: 多保真度配置
+            total_iterations: 总迭代次数
+        """
+        self.config = config
+        self.total_iterations = total_iterations
+        self.current_level: FidelityLevel = config.start_level
+        self.error_history: List[SurrogateErrorRecord] = []
+        self.error_window: List[SurrogateErrorRecord] = []
+        self.consecutive_failures = 0
+        self.last_calibration_epoch = -1
+        self.level_switches: List[Tuple[int, FidelityLevel, FidelityLevel]] = []
+        self._current_iter = 0
+
+    def should_calibrate(self, epoch: int) -> bool:
+        """
+        判断当前迭代是否应该进行 SOCS 校准
+
+        Args:
+            epoch: 当前迭代次数
+
+        Returns:
+            是否需要校准
+        """
+        if self.current_level != FidelityLevel.LOW:
+            return False
+        if self.config.calibration_interval <= 0:
+            return False
+        if epoch - self.last_calibration_epoch >= self.config.calibration_interval:
+            return True
+        return False
+
+    def record_error(self, epoch: int, mse: float, ssim: float,
+                     psnr: float, mae: float) -> None:
+        """
+        记录代理模型误差
+
+        Args:
+            epoch: 当前迭代次数
+            mse: 均方误差
+            ssim: 结构相似性
+            psnr: 峰值信噪比
+            mae: 平均绝对误差
+        """
+        record = SurrogateErrorRecord(
+            epoch=epoch,
+            mse=mse,
+            ssim=ssim,
+            psnr=psnr,
+            mae=mae,
+            fidelity_level=self.current_level
+        )
+        self.error_history.append(record)
+        self.error_window.append(record)
+
+        if len(self.error_window) > self.config.error_window_size:
+            self.error_window.pop(0)
+
+    def _average_error(self) -> Tuple[float, float]:
+        """
+        计算滑动窗口内的平均误差
+
+        Returns:
+            (avg_mse, avg_ssim)
+        """
+        if not self.error_window:
+            return float('inf'), 0.0
+        mses = [r.mse for r in self.error_window]
+        ssims = [r.ssim for r in self.error_window]
+        return float(np.mean(mses)), float(np.mean(ssims))
+
+    def _check_switch_criteria(self, avg_mse: float, avg_ssim: float,
+                                   target_mse: float, target_ssim: float) -> bool:
+        """
+        检查是否满足切换条件
+
+        Args:
+            avg_mse: 平均 MSE
+            avg_ssim: 平均 SSIM
+            target_mse: 目标 MSE 阈值
+            target_ssim: 目标 SSIM 阈值
+
+        Returns:
+            是否满足切换条件
+        """
+        if len(self.error_window) < self.config.error_window_size:
+            return False
+
+        mse_ok = avg_mse <= target_mse
+        ssim_ok = avg_ssim >= target_ssim
+
+        if mse_ok and ssim_ok:
+            self.consecutive_failures = 0
+            return True
+        else:
+            self.consecutive_failures += 1
+            return self.consecutive_failures >= self.config.consecutive_failures
+
+    def check_and_switch(self, epoch: int) -> Optional[FidelityLevel]:
+        """
+        检查是否需要切换保真度层级
+
+        自动切换逻辑：
+        - LOW -> MEDIUM: 当代理误差足够小
+        - MEDIUM -> HIGH: 当代理误差进一步减小
+        - 最后 N 次迭代强制切换到 HIGH
+
+        Args:
+            epoch: 当前迭代次数
+
+        Returns:
+            新的保真度层级，如果不需要切换则返回 None
+        """
+        if not self.config.auto_switch:
+            return None
+
+        remaining = self.total_iterations - epoch
+        if remaining <= self.config.force_high_fidelity_final:
+            if self.current_level != FidelityLevel.HIGH:
+                return FidelityLevel.HIGH
+
+        if self.config.high_fidelity_start_iter is not None:
+            if epoch >= self.config.high_fidelity_start_iter:
+                if self.current_level != FidelityLevel.HIGH:
+                    return FidelityLevel.HIGH
+
+        avg_mse, avg_ssim = self._average_error()
+
+        if self.current_level == FidelityLevel.LOW:
+            if self._check_switch_criteria(
+                avg_mse, avg_ssim,
+                self.config.mse_threshold_medium,
+                self.config.ssim_threshold_medium
+            ):
+                return FidelityLevel.MEDIUM
+
+        elif self.current_level == FidelityLevel.MEDIUM:
+            if self._check_switch_criteria(
+                avg_mse, avg_ssim,
+                self.config.mse_threshold_high,
+                self.config.ssim_threshold_high
+            ):
+                return FidelityLevel.HIGH
+
+        return None
+
+    def switch_to(self, new_level: FidelityLevel, epoch: int) -> None:
+        """
+        切换到新的保真度层级
+
+        Args:
+            new_level: 新的保真度层级
+            epoch: 当前迭代次数
+        """
+        if new_level == self.current_level:
+            return
+
+        old_level = self.current_level
+        self.current_level = new_level
+        self.level_switches.append((epoch, old_level, new_level))
+        self.consecutive_failures = 0
+        self.error_window.clear()
+
+        if self.config.verbose:
+            level_names = {
+                FidelityLevel.LOW: "SurrogateImaging (低保真)",
+                FidelityLevel.MEDIUM: "SOCS (中保真)",
+                FidelityLevel.HIGH: "Hopkins+光刻胶 (高保真)"
+            }
+            logger.info(
+                f"[多保真度] 第 {epoch} 次迭代切换保真度: "
+                f"{level_names[old_level]} -> {level_names[new_level]}"
+            )
+
+    def update_iter(self, epoch: int) -> Optional[FidelityLevel]:
+        """
+        更新迭代状态，检查是否需要切换保真度
+
+        Args:
+            epoch: 当前迭代次数
+
+        Returns:
+            新的保真度层级（如果切换了），否则返回当前层级
+        """
+        self._current_iter = epoch
+        new_level = self.check_and_switch(epoch)
+        if new_level is not None:
+            self.switch_to(new_level, epoch)
+        return self.current_level
+
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        获取调度器统计信息
+
+        Returns:
+            统计信息字典
+        """
+        return {
+            'current_level': self.current_level.value,
+            'total_switches': len(self.level_switches),
+            'level_switches': [
+                {'epoch': e, 'from': old.value, 'to': new.value}
+                for e, old, new in self.level_switches
+            ],
+            'total_errors': len(self.error_history),
+            'recent_avg_mse': self._average_error()[0],
+            'recent_avg_ssim': self._average_error()[1],
+        }
 
 
 class MaskOptimizer:
@@ -821,6 +1143,15 @@ class MaskOptimizer:
         self._cd_target_value_nm: Optional[float] = None  # 预提取的目标CD
         self._last_cd_error_value: float = 0.0  # 最近一次的CD误差值（用于梯度回退）
         self._last_litho_epe_value: float = 0.0  # 最近一次的Litho EPE值
+
+        # 多保真度优化状态
+        self._fidelity_scheduler: Optional[FidelityScheduler] = None
+        self._imaging_model_socs: Optional[PartialCoherentImaging] = None
+        self._imaging_model_full: Optional[PartialCoherentImaging] = None
+        self._multi_imaging_models_socs: Optional[List[PartialCoherentImaging]] = None
+        self._multi_imaging_models_full: Optional[List[PartialCoherentImaging]] = None
+        self._fidelity_level_history: List[str] = []
+        self._surrogate_error_history: List[Dict[str, float]] = []
 
     def _get_effective_bandlimit_config(self) -> Optional[BandlimitConstraintConfig]:
         """
@@ -1378,6 +1709,244 @@ class MaskOptimizer:
                 f"训练={self.config.simulation_backend}, "
                 f"评估={'矢量' if self.config.use_vector_backend_for_evaluation else '标量Hopkins'}"
             )
+
+    def _setup_multi_fidelity_models(self, image_size: tuple):
+        """
+        设置多保真度成像模型
+
+        创建三个保真度层级的成像模型：
+        - LOW: SurrogateImaging（已在 _setup_surrogate_model 中初始化）
+        - MEDIUM: SOCS 近似模型
+        - HIGH: 完整 Hopkins 模型
+        """
+        mf_cfg = self.config.multi_fidelity
+        if not mf_cfg.enabled:
+            return
+
+        optics_socs = self.optical_system
+        optics_socs.tcc_mode = TCCMode.SOCS
+        optics_socs.socs_num_terms = mf_cfg.socs_num_terms_calibration
+        self._imaging_model_socs = PartialCoherentImaging(optics_socs, image_size)
+
+        optics_full = self.optical_system
+        optics_full.tcc_mode = TCCMode.FULL_TCC
+        self._imaging_model_full = PartialCoherentImaging(optics_full, image_size)
+
+        if self._multi_conditions is not None:
+            self._multi_imaging_models_socs = []
+            self._multi_imaging_models_full = []
+            for cond in self._multi_conditions:
+                cond_optics = cond.to_optical_system(base_optics=self.optical_system)
+                cond_optics.tcc_mode = TCCMode.SOCS
+                cond_optics.socs_num_terms = mf_cfg.socs_num_terms_calibration
+                self._multi_imaging_models_socs.append(
+                    PartialCoherentImaging(cond_optics, image_size)
+                )
+
+                cond_optics_full = cond.to_optical_system(base_optics=self.optical_system)
+                cond_optics_full.tcc_mode = TCCMode.FULL_TCC
+                self._multi_imaging_models_full.append(
+                    PartialCoherentImaging(cond_optics_full, image_size)
+                )
+
+        if self.config.verbose:
+            logger.info(
+                f"多保真度成像模型初始化完成: "
+                f"SOCS项数={mf_cfg.socs_num_terms_calibration}, "
+                f"校准周期={mf_cfg.calibration_interval}迭代"
+            )
+
+    def _setup_fidelity_scheduler(self):
+        """初始化多保真度调度器"""
+        mf_cfg = self.config.multi_fidelity
+        if not mf_cfg.enabled:
+            return
+
+        self._fidelity_scheduler = FidelityScheduler(
+            config=mf_cfg,
+            total_iterations=self.config.max_iter
+        )
+        if not hasattr(self, '_fidelity_level_history') or self._fidelity_level_history is None:
+            self._fidelity_level_history = []
+        if not hasattr(self, '_surrogate_error_history') or self._surrogate_error_history is None:
+            self._surrogate_error_history = []
+
+        if self.config.verbose:
+            level_names = {
+                FidelityLevel.LOW: "SurrogateImaging (低保真)",
+                FidelityLevel.MEDIUM: "SOCS (中保真)",
+                FidelityLevel.HIGH: "Hopkins+光刻胶 (高保真)"
+            }
+            logger.info(
+                f"多保真度调度器已初始化: "
+                f"起始层级={level_names[mf_cfg.start_level]}, "
+                f"自动切换={'启用' if mf_cfg.auto_switch else '禁用'}"
+            )
+
+    def _get_current_imaging_model(self, fidelity_level: Optional[FidelityLevel] = None,
+                                   multi_idx: Optional[int] = None) -> PartialCoherentImaging:
+        """
+        根据保真度层级获取对应的成像模型
+
+        Args:
+            fidelity_level: 保真度层级，None 则使用当前调度器的层级
+            multi_idx: 多工艺条件索引
+
+        Returns:
+            对应的成像模型
+        """
+        if fidelity_level is None:
+            if self._fidelity_scheduler is not None:
+                fidelity_level = self._fidelity_scheduler.current_level
+            else:
+                fidelity_level = FidelityLevel.HIGH
+
+        if multi_idx is not None:
+            if fidelity_level == FidelityLevel.MEDIUM and self._multi_imaging_models_socs is not None:
+                return self._multi_imaging_models_socs[multi_idx]
+            elif fidelity_level == FidelityLevel.HIGH and self._multi_imaging_models_full is not None:
+                return self._multi_imaging_models_full[multi_idx]
+            elif self._multi_imaging_models is not None:
+                return self._multi_imaging_models[multi_idx]
+
+        if fidelity_level == FidelityLevel.MEDIUM and self._imaging_model_socs is not None:
+            return self._imaging_model_socs
+        elif fidelity_level == FidelityLevel.HIGH and self._imaging_model_full is not None:
+            return self._imaging_model_full
+        else:
+            return self._imaging_model
+
+    def _should_use_surrogate_for_fidelity(self, fidelity_level: Optional[FidelityLevel] = None) -> bool:
+        """
+        判断当前保真度层级是否应该使用代理模型
+
+        Args:
+            fidelity_level: 保真度层级
+
+        Returns:
+            是否使用代理模型
+        """
+        if fidelity_level is None:
+            if self._fidelity_scheduler is not None:
+                fidelity_level = self._fidelity_scheduler.current_level
+            else:
+                return self.config.use_surrogate
+
+        if fidelity_level == FidelityLevel.LOW:
+            return self.config.use_surrogate and self._surrogate_imaging is not None
+        return False
+
+    def _compute_surrogate_error(self, mask: np.ndarray) -> Dict[str, float]:
+        """
+        计算代理模型与真实模型的误差
+
+        使用当前保真度层级对应的真实模型（SOCS 或 FULL_TCC）
+        与代理模型的预测结果进行对比。
+
+        Args:
+            mask: 掩模图案
+
+        Returns:
+            误差字典，包含 mse, mae, ssim, psnr
+        """
+        if self._surrogate_imaging is None:
+            return {'mse': 0.0, 'mae': 0.0, 'ssim': 1.0, 'psnr': 100.0}
+
+        try:
+            surrogate_aerial = self._surrogate_imaging.compute_aerial_image(mask)
+
+            fidelity_level = self._fidelity_scheduler.current_level if self._fidelity_scheduler else FidelityLevel.HIGH
+            true_model = self._get_current_imaging_model(fidelity_level)
+            true_aerial = true_model.compute_aerial_image(mask)
+
+            mse_val = float(np.mean((surrogate_aerial - true_aerial) ** 2))
+            mae_val = float(np.mean(np.abs(surrogate_aerial - true_aerial)))
+            from core.metrics import ssim_numpy, psnr_numpy
+            try:
+                ssim_val = ssim_numpy(surrogate_aerial, true_aerial)
+            except Exception:
+                ssim_val = float('nan')
+            psnr_val = psnr_numpy(surrogate_aerial, true_aerial)
+
+            return {
+                'mse': mse_val,
+                'mae': mae_val,
+                'ssim': ssim_val,
+                'psnr': psnr_val
+            }
+        except Exception as e:
+            logger.warning(f"计算代理模型误差失败: {e}")
+            return {'mse': 0.0, 'mae': 0.0, 'ssim': 1.0, 'psnr': 100.0}
+
+    def _perform_socs_calibration(self, mask: np.ndarray, epoch: int) -> None:
+        """
+        执行 SOCS 校准
+
+        在低保真阶段周期性使用 SOCS 模型进行校准，
+        计算代理误差并更新调度器。
+
+        Args:
+            mask: 当前掩模图案
+            epoch: 当前迭代次数
+        """
+        if self._fidelity_scheduler is None:
+            return
+
+        if not self._fidelity_scheduler.should_calibrate(epoch):
+            return
+
+        if self.config.verbose:
+            logger.info(f"[多保真度] 第 {epoch} 次迭代执行 SOCS 校准")
+
+        error = self._compute_surrogate_error(mask)
+        self._fidelity_scheduler.record_error(
+            epoch=epoch,
+            mse=error['mse'],
+            ssim=error['ssim'],
+            psnr=error['psnr'],
+            mae=error['mae']
+        )
+        self._surrogate_error_history.append(error)
+        self._fidelity_scheduler.last_calibration_epoch = epoch
+
+        if self.config.verbose:
+            logger.info(
+                f"[多保真度] 代理误差: "
+                f"MSE={error['mse']:.6f}, "
+                f"SSIM={error['ssim']:.4f}, "
+                f"PSNR={error['psnr']:.2f}dB"
+            )
+
+    def _update_fidelity_level(self, mask: np.ndarray, epoch: int) -> FidelityLevel:
+        """
+        更新保真度层级
+
+        计算代理误差并检查是否需要切换保真度层级。
+
+        Args:
+            mask: 当前掩模图案
+            epoch: 当前迭代次数
+
+        Returns:
+            当前保真度层级
+        """
+        if self._fidelity_scheduler is None:
+            return FidelityLevel.HIGH
+
+        error = self._compute_surrogate_error(mask)
+        self._fidelity_scheduler.record_error(
+            epoch=epoch,
+            mse=error['mse'],
+            ssim=error['ssim'],
+            psnr=error['psnr'],
+            mae=error['mae']
+        )
+        self._surrogate_error_history.append(error)
+
+        current_level = self._fidelity_scheduler.update_iter(epoch)
+        self._fidelity_level_history.append(current_level.value)
+
+        return current_level
 
     def _setup_monte_carlo(self, image_size: tuple):
         """
@@ -1941,6 +2510,18 @@ class MaskOptimizer:
             nit = epoch
 
             self._callbacks.on_epoch_begin(epoch)
+
+            if self._fidelity_scheduler is not None:
+                current_level = self._update_fidelity_level(x, epoch)
+                if cfg.verbose and epoch % 10 == 0:
+                    avg_mse, avg_ssim = self._fidelity_scheduler._average_error()
+                    logger.info(
+                        f"Epoch {epoch}: 保真度层级={current_level.value}, "
+                        f"平均代理MSE={avg_mse:.6e}, 平均SSIM={avg_ssim:.6f}"
+                    )
+                if (self._fidelity_scheduler.config.calibration_interval > 0 and
+                        epoch % self._fidelity_scheduler.config.calibration_interval == 0):
+                    self._perform_socs_calibration(x)
 
             lr = state.learning_rate
 
@@ -2507,11 +3088,18 @@ class MaskOptimizer:
                                             imaging_model: PartialCoherentImaging,
                                             dose: float = 1.0,
                                             for_evaluation: bool = False,
-                                            multi_idx: Optional[int] = None) -> Tuple[float, np.ndarray, CompositeLossComponents]:
+                                            multi_idx: Optional[int] = None,
+                                            use_surrogate: Optional[bool] = None,
+                                            fidelity_level: Optional[FidelityLevel] = None) -> Tuple[float, np.ndarray, CompositeLossComponents]:
         """
         计算单工艺条件下的复合损失、成像结果及各分量（不含 PVB 和正则化）
 
         支持统一仿真后端：代理模型 → RCWA/FDTD → Hopkins
+
+        当启用多保真度时，根据 fidelity_level 选择成像模型：
+        - LOW: 优先使用 SurrogateImaging
+        - MEDIUM: 使用 SOCS 近似模型
+        - HIGH: 使用完整 Hopkins 模型
 
         Args:
             mask: 掩模
@@ -2519,12 +3107,19 @@ class MaskOptimizer:
             dose: 曝光剂量
             for_evaluation: 是否为评估阶段（可切换到矢量后端）
             multi_idx: 多工艺条件索引（用于选择对应代理模型）
+            use_surrogate: 是否强制使用代理模型（None 则自动判断）
+            fidelity_level: 保真度层级（None 则使用当前调度器层级）
 
         Returns:
             (loss_value, processed_image, components)
         """
+        if use_surrogate is None:
+            use_surrogate = self._should_use_surrogate_for_fidelity(fidelity_level)
+
+        actual_imaging_model = self._get_current_imaging_model(fidelity_level, multi_idx)
+
         aerial = None
-        if not for_evaluation:
+        if not for_evaluation and use_surrogate:
             if multi_idx is not None:
                 aerial = self._multi_surrogate_compute_aerial(multi_idx, mask, for_evaluation=for_evaluation)
             else:
@@ -2533,15 +3128,15 @@ class MaskOptimizer:
         if aerial is None:
             backend = self._effective_backend(for_evaluation=for_evaluation)
             if backend == SimulationBackend.HOPKINS.value:
-                aerial = imaging_model.compute_aerial_image(mask)
+                aerial = actual_imaging_model.compute_aerial_image(mask)
             else:
                 sim_res = unified_simulate(
                     mask=mask,
                     backend=backend,
-                    optical_system=imaging_model.optics,
+                    optical_system=actual_imaging_model.optics,
                     threshold=self.config.threshold,
                     apply_resist=False,
-                    pixel_size_nm=imaging_model.optics.pixel_size,
+                    pixel_size_nm=actual_imaging_model.optics.pixel_size,
                     rcwa_config=self.config.rcwa_config,
                     fdtd_config=self.config.fdtd_config,
                 )
@@ -2558,12 +3153,16 @@ class MaskOptimizer:
                                        imaging_model: PartialCoherentImaging,
                                        dose: float = 1.0,
                                        for_evaluation: bool = False,
-                                       multi_idx: Optional[int] = None) -> float:
+                                       multi_idx: Optional[int] = None,
+                                       use_surrogate: Optional[bool] = None,
+                                       fidelity_level: Optional[FidelityLevel] = None) -> float:
         """
         计算单组工艺条件下的损失
 
         当 config.use_composite_loss=True 时，使用复合损失（MSE/SSIM 加权）；
         否则回退到旧的单一 metric 逻辑。
+
+        当启用多保真度时，根据 fidelity_level 选择成像模型。
 
         Args:
             mask: 掩模图案
@@ -2571,18 +3170,27 @@ class MaskOptimizer:
             dose: 曝光相对剂量
             for_evaluation: 是否为评估阶段（可切换到矢量后端）
             multi_idx: 多工艺条件索引（用于选择对应代理模型）
+            use_surrogate: 是否强制使用代理模型（None 则自动判断）
+            fidelity_level: 保真度层级（None 则使用当前调度器层级）
 
         Returns:
             损失值
         """
         if self.config.use_composite_loss:
             loss, _, _ = self._compute_composite_single_condition(
-                mask, imaging_model, dose, for_evaluation=for_evaluation, multi_idx=multi_idx
+                mask, imaging_model, dose, for_evaluation=for_evaluation,
+                multi_idx=multi_idx, use_surrogate=use_surrogate,
+                fidelity_level=fidelity_level
             )
             return loss
 
+        if use_surrogate is None:
+            use_surrogate = self._should_use_surrogate_for_fidelity(fidelity_level)
+
+        actual_imaging_model = self._get_current_imaging_model(fidelity_level, multi_idx)
+
         aerial = None
-        if not for_evaluation:
+        if not for_evaluation and use_surrogate:
             if multi_idx is not None:
                 aerial = self._multi_surrogate_compute_aerial(multi_idx, mask, for_evaluation=for_evaluation)
             else:
@@ -2591,15 +3199,15 @@ class MaskOptimizer:
         if aerial is None:
             backend = self._effective_backend(for_evaluation=for_evaluation)
             if backend == SimulationBackend.HOPKINS.value:
-                aerial = imaging_model.compute_aerial_image(mask)
+                aerial = actual_imaging_model.compute_aerial_image(mask)
             else:
                 sim_res = unified_simulate(
                     mask=mask,
                     backend=backend,
-                    optical_system=imaging_model.optics,
+                    optical_system=actual_imaging_model.optics,
                     threshold=self.config.threshold,
                     apply_resist=False,
-                    pixel_size_nm=imaging_model.optics.pixel_size,
+                    pixel_size_nm=actual_imaging_model.optics.pixel_size,
                     rcwa_config=self.config.rcwa_config,
                     fdtd_config=self.config.fdtd_config,
                 )
@@ -2624,7 +3232,8 @@ class MaskOptimizer:
         else:
             raise ValueError(f"未知的评估指标: {metric}")
 
-    def _compute_multi_process_loss(self, mask: np.ndarray) -> float:
+    def _compute_multi_process_loss(self, mask: np.ndarray,
+                                     fidelity_level: Optional[FidelityLevel] = None) -> float:
         """
         计算多工艺条件加权损失
 
@@ -2637,13 +3246,17 @@ class MaskOptimizer:
 
         否则使用旧的单一 metric 逻辑。
 
+        当启用多保真度时，根据 fidelity_level 选择成像模型。
+
         Args:
             mask: 掩模图案
+            fidelity_level: 保真度层级（None 则使用当前调度器层级）
 
         Returns:
             加权总损失
         """
         cfg = self.config
+        use_surrogate = self._should_use_surrogate_for_fidelity(fidelity_level)
 
         if cfg.use_composite_loss:
             lw = cfg.loss_weights
@@ -2657,7 +3270,9 @@ class MaskOptimizer:
                 self._multi_weights
             )):
                 loss_i, img_i, _ = self._compute_composite_single_condition(
-                    mask, model, cond.dose, multi_idx=idx
+                    mask, model, cond.dose, multi_idx=idx,
+                    use_surrogate=use_surrogate,
+                    fidelity_level=fidelity_level
                 )
                 per_images.append(img_i)
                 per_losses.append(loss_i)
@@ -2698,7 +3313,9 @@ class MaskOptimizer:
             self._multi_weights
         )):
             loss_i = self._compute_single_condition_loss(
-                mask, model, cond.dose, multi_idx=idx
+                mask, model, cond.dose, multi_idx=idx,
+                use_surrogate=use_surrogate,
+                fidelity_level=fidelity_level
             )
             per_losses.append(loss_i)
 
@@ -2715,7 +3332,8 @@ class MaskOptimizer:
 
         return total_loss
 
-    def _compute_multi_process_gradient(self, mask: np.ndarray) -> np.ndarray:
+    def _compute_multi_process_gradient(self, mask: np.ndarray,
+                                          fidelity_level: Optional[FidelityLevel] = None) -> np.ndarray:
         """
         计算多工艺条件加权损失的梯度
 
@@ -2729,14 +3347,18 @@ class MaskOptimizer:
         对于包含 PVB 或使用矢量仿真后端 (RCWA/FDTD) 的情况，退化为数值梯度。
         支持代理模型（Surrogate Model）快速计算 aerial 和 gradient。
 
+        当启用多保真度时，根据 fidelity_level 选择成像模型。
+
         Args:
             mask: 掩模图案
+            fidelity_level: 保真度层级（None 则使用当前调度器层级）
 
         Returns:
             梯度数组
         """
         cfg = self.config
         train_backend = self._effective_backend(for_evaluation=False)
+        use_surrogate = self._should_use_surrogate_for_fidelity(fidelity_level)
 
         if train_backend != SimulationBackend.HOPKINS.value:
             return self._numerical_gradient(mask)
@@ -2755,9 +3377,13 @@ class MaskOptimizer:
                 self._multi_conditions,
                 self._multi_weights
             )):
-                aerial = self._multi_surrogate_compute_aerial(idx, mask)
+                actual_model = self._get_current_imaging_model(fidelity_level, idx)
+
+                aerial = None
+                if use_surrogate:
+                    aerial = self._multi_surrogate_compute_aerial(idx, mask)
                 if aerial is None:
-                    aerial = model.compute_aerial_image(mask)
+                    aerial = actual_model.compute_aerial_image(mask)
                 image = self._prepare_image(aerial, cond.dose)
                 per_images.append(image)
 
@@ -2787,9 +3413,11 @@ class MaskOptimizer:
                         epe_approx_grad = self._compute_litho_epe_gradient_approx(aerial)
                         error_grad += lw.litho_epe * epe_approx_grad
 
-                imaging_grad = self._multi_surrogate_compute_gradient(idx, mask)
+                imaging_grad = None
+                if use_surrogate:
+                    imaging_grad = self._multi_surrogate_compute_gradient(idx, mask)
                 if imaging_grad is None:
-                    imaging_grad = model.compute_image_gradient(mask)
+                    imaging_grad = actual_model.compute_image_gradient(mask)
 
                 if cond.dose != 1.0:
                     error_grad = error_grad * cond.dose
@@ -2802,7 +3430,8 @@ class MaskOptimizer:
                 gradient += w * (error_grad * imaging_grad)
 
                 loss_i, _, _ = self._compute_composite_single_condition(
-                    mask, model, cond.dose, multi_idx=idx
+                    mask, actual_model, cond.dose, multi_idx=idx,
+                    use_surrogate=use_surrogate, fidelity_level=fidelity_level
                 )
                 per_losses.append(loss_i)
 
@@ -2827,9 +3456,12 @@ class MaskOptimizer:
                     factor = 2.0 * cfg.robustness_loss_weight * (per_losses[idx] - mean_loss) / (n * n)
                     if abs(factor) < 1e-12:
                         continue
-                    aerial = self._multi_surrogate_compute_aerial(idx, mask)
+                    actual_model = self._get_current_imaging_model(fidelity_level, idx)
+                    aerial = None
+                    if use_surrogate:
+                        aerial = self._multi_surrogate_compute_aerial(idx, mask)
                     if aerial is None:
-                        aerial = model.compute_aerial_image(mask)
+                        aerial = actual_model.compute_aerial_image(mask)
                     image = self._prepare_image(aerial, cond.dose)
                     error_grad = np.zeros_like(image)
                     if lw.mse > 0:
@@ -2851,9 +3483,11 @@ class MaskOptimizer:
                         if lw.litho_epe > 0:
                             epe_approx_grad = self._compute_litho_epe_gradient_approx(aerial)
                             error_grad += lw.litho_epe * epe_approx_grad
-                    imaging_grad = self._multi_surrogate_compute_gradient(idx, mask)
+                    imaging_grad = None
+                    if use_surrogate:
+                        imaging_grad = self._multi_surrogate_compute_gradient(idx, mask)
                     if imaging_grad is None:
-                        imaging_grad = model.compute_image_gradient(mask)
+                        imaging_grad = actual_model.compute_image_gradient(mask)
                     if cond.dose != 1.0:
                         error_grad = error_grad * cond.dose
                     gradient += factor * (error_grad * imaging_grad)
@@ -2869,9 +3503,12 @@ class MaskOptimizer:
             self._multi_conditions,
             self._multi_weights
         )):
-            aerial = self._multi_surrogate_compute_aerial(idx, mask)
+            actual_model = self._get_current_imaging_model(fidelity_level, idx)
+            aerial = None
+            if use_surrogate:
+                aerial = self._multi_surrogate_compute_aerial(idx, mask)
             if aerial is None:
-                aerial = model.compute_aerial_image(mask)
+                aerial = actual_model.compute_aerial_image(mask)
 
             if cond.dose != 1.0:
                 aerial_dosed = np.clip(aerial * cond.dose, 0.0, 1.0)
@@ -2892,9 +3529,11 @@ class MaskOptimizer:
             else:
                 return self._numerical_gradient(mask)
 
-            imaging_grad = self._multi_surrogate_compute_gradient(idx, mask)
+            imaging_grad = None
+            if use_surrogate:
+                imaging_grad = self._multi_surrogate_compute_gradient(idx, mask)
             if imaging_grad is None:
-                imaging_grad = model.compute_image_gradient(mask)
+                imaging_grad = actual_model.compute_image_gradient(mask)
 
             if cond.dose != 1.0:
                 error_grad = error_grad * cond.dose
@@ -2906,7 +3545,8 @@ class MaskOptimizer:
             gradient += w * (error_grad * imaging_grad)
 
             loss_i = self._compute_single_condition_loss(
-                mask, model, cond.dose, multi_idx=idx
+                mask, actual_model, cond.dose, multi_idx=idx,
+                use_surrogate=use_surrogate, fidelity_level=fidelity_level
             )
             per_losses.append(loss_i)
 
@@ -2922,9 +3562,12 @@ class MaskOptimizer:
                 factor = 2.0 * self.config.robustness_loss_weight * (per_losses[idx] - mean_loss) / (n * n)
                 if abs(factor) < 1e-12:
                     continue
-                aerial = self._multi_surrogate_compute_aerial(idx, mask)
+                actual_model = self._get_current_imaging_model(fidelity_level, idx)
+                aerial = None
+                if use_surrogate:
+                    aerial = self._multi_surrogate_compute_aerial(idx, mask)
                 if aerial is None:
-                    aerial = model.compute_aerial_image(mask)
+                    aerial = actual_model.compute_aerial_image(mask)
                 if cond.dose != 1.0:
                     aerial_dosed = np.clip(aerial * cond.dose, 0.0, 1.0)
                 else:
@@ -2935,9 +3578,11 @@ class MaskOptimizer:
                     error_grad = np.sign(aerial_dosed - self._target_image) / mask.size
                 elif metric == 'ssim':
                     error_grad = ssim_loss_gradient(aerial_dosed, self._target_image)
-                imaging_grad = self._multi_surrogate_compute_gradient(idx, mask)
+                imaging_grad = None
+                if use_surrogate:
+                    imaging_grad = self._multi_surrogate_compute_gradient(idx, mask)
                 if imaging_grad is None:
-                    imaging_grad = model.compute_image_gradient(mask)
+                    imaging_grad = actual_model.compute_image_gradient(mask)
                 if cond.dose != 1.0:
                     error_grad = error_grad * cond.dose
                 gradient += factor * (error_grad * imaging_grad)
@@ -2998,19 +3643,32 @@ class MaskOptimizer:
         L = w_mse*MSE + w_ssim*(1-SSIM) + w_mask_complexity*TV(mask) + R(mask)
           + w_worst_case * worst_case_loss（蒙特卡洛最坏情况）
 
+        当启用多保真度优化时，根据当前保真度层级选择成像模型：
+        - LOW: 优先使用 SurrogateImaging
+        - MEDIUM: 使用 SOCS 近似模型
+        - HIGH: 使用完整 Hopkins 模型
+
         Args:
             mask: 掩模图案
 
         Returns:
             损失值
         """
+        mf_enabled = self.config.multi_fidelity.enabled and self._fidelity_scheduler is not None
+        current_fidelity = self._fidelity_scheduler.current_level if mf_enabled else None
+
         if self.config.use_multi_process and self._multi_imaging_models is not None:
-            base_loss = self._compute_multi_process_loss(mask)
+            base_loss = self._compute_multi_process_loss(mask, fidelity_level=current_fidelity)
         else:
+            imaging_model = self._get_current_imaging_model(current_fidelity)
+            use_surrogate = self._should_use_surrogate_for_fidelity(current_fidelity)
+
             if self.config.use_composite_loss:
                 lw = self.config.loss_weights
                 base_loss, _, _ = self._compute_composite_single_condition(
-                    mask, self._imaging_model, dose=1.0
+                    mask, imaging_model, dose=1.0,
+                    use_surrogate=use_surrogate,
+                    fidelity_level=current_fidelity
                 )
                 if lw.mask_complexity > 0:
                     mc_scale = self._get_regularization_scale_factor('mask_complexity')
@@ -3025,9 +3683,11 @@ class MaskOptimizer:
 
                 base_loss += self._compute_regularization_loss(mask)
             else:
-                wafer_image = self._surrogate_compute_aerial(mask)
+                wafer_image = None
+                if use_surrogate:
+                    wafer_image = self._surrogate_compute_aerial(mask)
                 if wafer_image is None:
-                    wafer_image = self._imaging_model.compute_aerial_image(mask)
+                    wafer_image = imaging_model.compute_aerial_image(mask)
 
                 if self.config.use_wafer_image_loss:
                     wafer_image = _apply_threshold_for_loss(wafer_image, self.config.threshold)
@@ -3160,28 +3820,42 @@ class MaskOptimizer:
 
         当启用蒙特卡洛最坏情况优化时，额外加上最坏情况损失的梯度。
 
+        当启用多保真度优化时，根据当前保真度层级选择成像模型：
+        - LOW: 优先使用 SurrogateImaging 计算梯度
+        - MEDIUM: 使用 SOCS 近似模型计算梯度
+        - HIGH: 使用完整 Hopkins 模型计算梯度
+
         Args:
             mask: 掩模图案
 
         Returns:
             梯度数组
         """
+        mf_enabled = self.config.multi_fidelity.enabled and self._fidelity_scheduler is not None
+        current_fidelity = self._fidelity_scheduler.current_level if mf_enabled else None
+        use_surrogate = self._should_use_surrogate_for_fidelity(current_fidelity)
+        imaging_model = self._get_current_imaging_model(current_fidelity)
+
         if self.config.use_multi_process and self._multi_imaging_models is not None:
-            gradient = self._compute_multi_process_gradient(mask).copy()
+            gradient = self._compute_multi_process_gradient(mask, fidelity_level=current_fidelity).copy()
         else:
             cfg = self.config
 
             if cfg.use_composite_loss:
                 lw = cfg.loss_weights
 
-                aerial = self._surrogate_compute_aerial(mask)
+                aerial = None
+                if use_surrogate:
+                    aerial = self._surrogate_compute_aerial(mask)
                 if aerial is None:
-                    aerial = self._imaging_model.compute_aerial_image(mask)
+                    aerial = imaging_model.compute_aerial_image(mask)
                 image = self._prepare_image(aerial, dose=1.0)
 
-                imaging_grad = self._surrogate_compute_gradient(mask)
+                imaging_grad = None
+                if use_surrogate:
+                    imaging_grad = self._surrogate_compute_gradient(mask)
                 if imaging_grad is None:
-                    imaging_grad = self._imaging_model.compute_image_gradient(mask)
+                    imaging_grad = imaging_model.compute_image_gradient(mask)
 
                 error_grad = np.zeros_like(image)
 
@@ -3224,9 +3898,11 @@ class MaskOptimizer:
 
                 gradient += self._compute_regularization_gradient(mask)
             else:
-                wafer_image = self._surrogate_compute_aerial(mask)
+                wafer_image = None
+                if use_surrogate:
+                    wafer_image = self._surrogate_compute_aerial(mask)
                 if wafer_image is None:
-                    wafer_image = self._imaging_model.compute_aerial_image(mask)
+                    wafer_image = imaging_model.compute_aerial_image(mask)
 
                 if self.config.use_wafer_image_loss:
                     wafer_image_for_grad = _apply_threshold_for_loss(wafer_image, self.config.threshold)
@@ -3242,9 +3918,11 @@ class MaskOptimizer:
                 else:
                     return self._numerical_gradient(mask)
 
-                imaging_grad = self._surrogate_compute_gradient(mask)
+                imaging_grad = None
+                if use_surrogate:
+                    imaging_grad = self._surrogate_compute_gradient(mask)
                 if imaging_grad is None:
-                    imaging_grad = self._imaging_model.compute_image_gradient(mask)
+                    imaging_grad = imaging_model.compute_image_gradient(mask)
 
                 if self.config.use_wafer_image_loss:
                     threshold_grad = (wafer_image >= self.config.threshold).astype(np.float64)
@@ -3281,6 +3959,9 @@ class MaskOptimizer:
         """
         为非 step-training 优化器包装目标函数，用于驱动 callback 系统。
 
+        当启用多保真度优化时，在每个逻辑 epoch 调用 fidelity 调度器，
+        根据代理误差自动切换保真度层级。
+
         Args:
             original_obj: 原始目标函数 f(mask_2d) -> float
             original_mask_shape: 原始掩模 2D 形状
@@ -3292,6 +3973,7 @@ class MaskOptimizer:
         cfg = self.config
         callbacks = self._callbacks
         state = self._trainer_state
+        mf_enabled = cfg.multi_fidelity.enabled and self._fidelity_scheduler is not None
 
         interval = max(1, int(base_epoch_interval))
         counter = {'eval_count': 0, 'logical_epoch': 0}
@@ -3321,6 +4003,19 @@ class MaskOptimizer:
                 counter['logical_epoch'] = new_logical
                 epoch = counter['logical_epoch']
                 state.epoch = epoch
+
+                if mf_enabled:
+                    current_level = self._update_fidelity_level(mask_2d, epoch)
+                    if cfg.verbose and epoch % 10 == 0:
+                        avg_mse, avg_ssim = self._fidelity_scheduler._average_error()
+                        logger.info(
+                            f"Epoch {epoch}: 保真度层级={current_level.value}, "
+                            f"平均代理MSE={avg_mse:.6e}, 平均SSIM={avg_ssim:.6f}"
+                        )
+                    if (self._fidelity_scheduler.config.socs_calibration_interval > 0 and
+                            epoch % self._fidelity_scheduler.config.socs_calibration_interval == 0):
+                        self._perform_socs_calibration(mask_2d)
+
                 logs = {'loss': loss, 'learning_rate': state.learning_rate}
                 try:
                     callbacks.on_epoch_begin(epoch)
@@ -3455,6 +4150,24 @@ class MaskOptimizer:
             self._last_mc_worst_idx = None
 
         self._setup_surrogate_model(initial_mask.shape)
+
+        self._fidelity_level_history = []
+        self._surrogate_error_history = []
+        if self.config.multi_fidelity.enabled:
+            self._setup_multi_fidelity_models(initial_mask.shape)
+            self._setup_fidelity_scheduler()
+            if self.config.verbose:
+                logger.info(
+                    f"多保真度优化已启用，初始层级: {self._fidelity_scheduler.current_level.value}"
+                )
+        else:
+            self._fidelity_scheduler = None
+            self._low_fidelity_model = None
+            self._medium_fidelity_model = None
+            self._high_fidelity_model = None
+            self._multi_low_fidelity_models = None
+            self._multi_medium_fidelity_models = None
+            self._multi_high_fidelity_models = None
 
         if self.config.use_multi_process:
             logger.info(f"开始多工艺条件联合掩模优化，{len(self._multi_conditions)} 个工艺条件，"
@@ -3599,6 +4312,19 @@ class MaskOptimizer:
               and self._trainer_state.mask_history):
             mask_history = self._trainer_state.mask_history
 
+        fidelity_history = self._fidelity_level_history if self._fidelity_level_history else None
+        error_history = self._surrogate_error_history if self._surrogate_error_history else None
+
+        if self.config.multi_fidelity.enabled and self.config.verbose:
+            if fidelity_history:
+                level_counts = Counter(fidelity_history)
+                logger.info(
+                    f"保真度层级统计: "
+                    f"LOW={level_counts.get('low', 0)}, "
+                    f"MEDIUM={level_counts.get('medium', 0)}, "
+                    f"HIGH={level_counts.get('high', 0)}"
+                )
+
         logger.info(f"优化完成，最终MSE: {final_metrics.mse:.6e}，"
                    f"耗时: {total_time:.2f}秒")
 
@@ -3618,7 +4344,9 @@ class MaskOptimizer:
             multi_process_result=multi_process_result,
             per_condition_losses=per_condition_losses,
             process_conditions=process_conditions,
-            mask_history=mask_history
+            mask_history=mask_history,
+            fidelity_level_history=fidelity_history,
+            surrogate_error_history=error_history
         )
 
     def _optimize_pyramid(self,
