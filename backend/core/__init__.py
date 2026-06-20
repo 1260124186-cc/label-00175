@@ -125,6 +125,22 @@ try:
         get_device,
         is_gpu_available,
     )
+    from core.mask3d import (
+        MaskType,
+        SidewallProfile,
+        RoughnessModel,
+        SidewallParams,
+        RoughnessParams,
+        AbsorberLayer,
+        Mask3DConfig,
+        MaskTopography,
+        SimplifiedBEMScattering,
+        RCWAHopkinsCoupler,
+        Mask3DCorrectionResult,
+        Mask3DImagingCorrector,
+        create_default_mask3d_config,
+        apply_mask3d_correction,
+    )
 except ImportError:
     from .imaging import (
         OpticalSystem,
@@ -246,6 +262,22 @@ except ImportError:
         set_backend,
         get_device,
         is_gpu_available,
+    )
+    from .mask3d import (
+        MaskType,
+        SidewallProfile,
+        RoughnessModel,
+        SidewallParams,
+        RoughnessParams,
+        AbsorberLayer,
+        Mask3DConfig,
+        MaskTopography,
+        SimplifiedBEMScattering,
+        RCWAHopkinsCoupler,
+        Mask3DCorrectionResult,
+        Mask3DImagingCorrector,
+        create_default_mask3d_config,
+        apply_mask3d_correction,
     )
 
 __all__ = [
@@ -369,4 +401,18 @@ __all__ = [
     'create_euv_reflective_system',
     'compute_polarization_contribution',
     'compute_polarization_degree',
+    'MaskType',
+    'SidewallProfile',
+    'RoughnessModel',
+    'SidewallParams',
+    'RoughnessParams',
+    'AbsorberLayer',
+    'Mask3DConfig',
+    'MaskTopography',
+    'SimplifiedBEMScattering',
+    'RCWAHopkinsCoupler',
+    'Mask3DCorrectionResult',
+    'Mask3DImagingCorrector',
+    'create_default_mask3d_config',
+    'apply_mask3d_correction',
 ]
