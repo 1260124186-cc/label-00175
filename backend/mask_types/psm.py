@@ -669,3 +669,315 @@ def verify_gradient_numerical(
         'mean_rel_error': float(np.mean(rel_error)),
         'correct': bool(np.max(rel_error) < 1e-4),
     }
+
+
+class PSMImagingWrapper:
+    """
+    PSM 掩模 + 成像系统的端到端封装
+
+    将相位偏移掩模模型与部分相干成像系统结合起来，
+    提供从掩模变量到空间像的前向传播，以及
+    损失对掩模变量的反向梯度传播。
+
+    使用场景：
+    - 直接优化相位分布（Alt-PSM 或 Att-PSM）
+    - 对比不同掩模类型的成像效果
+    - 端到端梯度验证
+
+    梯度链：
+        L( I( t(m) ) )
+        dL/dm = dL/dI · dI/dt · dt/dm
+
+    其中：
+        dL/dI: 损失对光强的梯度（外部提供）
+        dI/dt: 光强对复透过率的梯度（由成像模型提供）
+        dt/dm: 复透过率对掩模变量的梯度（由 PSM 模型提供）
+    """
+
+    def __init__(
+        self,
+        imaging_model,
+        mask_model: PhaseShiftMask,
+    ):
+        """
+        初始化 PSM 成像封装
+
+        Args:
+            imaging_model: 部分相干成像模型 (PartialCoherentImaging)
+            mask_model: 掩模模型 (PhaseShiftMask)
+        """
+        self.imaging = imaging_model
+        self.mask_model = mask_model
+
+    def compute_aerial_image(self, mask: np.ndarray) -> np.ndarray:
+        """
+        计算空间像
+
+        Args:
+            mask: 掩模变量 [0, 1]
+
+        Returns:
+            空间像光强分布
+        """
+        t = self.mask_model.get_transmission(mask)
+        return self.imaging.compute_aerial_image_complex(t)
+
+    def compute_gradient(
+        self,
+        mask: np.ndarray,
+        intensity_grad: np.ndarray,
+    ) -> np.ndarray:
+        """
+        计算损失对掩模变量的梯度（端到端）
+
+        Args:
+            mask: 掩模变量 [0, 1]
+            intensity_grad: 损失对光强的梯度 dL/dI
+
+        Returns:
+            损失对掩模变量的梯度 dL/dm
+        """
+        t = self.mask_model.get_transmission(mask)
+        grad_t = self.imaging.compute_complex_gradient(t, intensity_grad)
+        grad_m = self.mask_model.gradient_wrt_mask(mask, grad_t)
+        return grad_m
+
+    def compute_image_and_gradient(
+        self,
+        mask: np.ndarray,
+        intensity_grad: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        同时计算空间像和梯度（更高效，复用中间结果）
+
+        Args:
+            mask: 掩模变量
+            intensity_grad: 损失对光强的梯度
+
+        Returns:
+            (空间像, 掩模梯度)
+        """
+        t = self.mask_model.get_transmission(mask)
+        aerial = self.imaging.compute_aerial_image_complex(t)
+        grad_t = self.imaging.compute_complex_gradient(t, intensity_grad)
+        grad_m = self.mask_model.gradient_wrt_mask(mask, grad_t)
+        return aerial, grad_m
+
+
+class PhaseOnlyImagingWrapper:
+    """
+    纯相位优化的成像封装
+
+    直接以相位作为优化变量，振幅固定为 1。
+    适用于纯相位掩模的优化问题。
+
+    优化变量：相位分布 φ(x, y)
+    复透过率：t(φ) = exp(iφ)
+    """
+
+    def __init__(
+        self,
+        imaging_model,
+    ):
+        """
+        初始化纯相位成像封装
+
+        Args:
+            imaging_model: 部分相干成像模型
+        """
+        self.imaging = imaging_model
+
+    def compute_aerial_image(self, phase: np.ndarray) -> np.ndarray:
+        """
+        计算空间像
+
+        Args:
+            phase: 相位分布 (弧度)
+
+        Returns:
+            空间像光强分布
+        """
+        t = np.exp(1j * phase.astype(np.float64))
+        return self.imaging.compute_aerial_image_complex(t)
+
+    def compute_gradient(
+        self,
+        phase: np.ndarray,
+        intensity_grad: np.ndarray,
+    ) -> np.ndarray:
+        """
+        计算损失对相位的梯度
+
+        dL/dφ = -Im( dL/dt * t )
+              = -Re(dL/dt)*sinφ + Im(dL/dt)*cosφ
+
+        Args:
+            phase: 相位分布
+            intensity_grad: 损失对光强的梯度
+
+        Returns:
+            损失对相位的梯度
+        """
+        t = np.exp(1j * phase.astype(np.float64))
+        grad_t = self.imaging.compute_complex_gradient(t, intensity_grad)
+
+        sin_phi = np.sin(phase)
+        cos_phi = np.cos(phase)
+
+        grad_real = np.real(grad_t)
+        grad_imag = np.imag(grad_t)
+
+        grad_phase = -grad_real * sin_phi + grad_imag * cos_phi
+
+        return grad_phase.astype(np.float64)
+
+
+class AmplitudePhaseImagingWrapper:
+    """
+    幅度-相位联合优化的成像封装
+
+    同时优化幅度和相位两个独立变量。
+    适用于一般复振幅掩模的优化问题。
+
+    优化变量：幅度 A(x, y) ∈ [0, 1]，相位 φ(x, y)
+    复透过率：t(A, φ) = A * exp(iφ)
+    """
+
+    def __init__(
+        self,
+        imaging_model,
+    ):
+        """
+        初始化幅度-相位成像封装
+
+        Args:
+            imaging_model: 部分相干成像模型
+        """
+        self.imaging = imaging_model
+
+    def compute_aerial_image(
+        self,
+        amplitude: np.ndarray,
+        phase: np.ndarray,
+    ) -> np.ndarray:
+        """
+        计算空间像
+
+        Args:
+            amplitude: 幅度分布 [0, 1]
+            phase: 相位分布 (弧度)
+
+        Returns:
+            空间像光强分布
+        """
+        t = amplitude.astype(np.float64) * np.exp(1j * phase.astype(np.float64))
+        return self.imaging.compute_aerial_image_complex(t)
+
+    def compute_gradients(
+        self,
+        amplitude: np.ndarray,
+        phase: np.ndarray,
+        intensity_grad: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        计算损失对幅度和相位的梯度
+
+        dL/dA = Re(dL/dt) * cosφ + Im(dL/dt) * sinφ
+        dL/dφ = A * (-Re(dL/dt)*sinφ + Im(dL/dt)*cosφ)
+
+        Args:
+            amplitude: 幅度分布
+            phase: 相位分布
+            intensity_grad: 损失对光强的梯度
+
+        Returns:
+            (幅度梯度, 相位梯度)
+        """
+        t = amplitude.astype(np.float64) * np.exp(1j * phase.astype(np.float64))
+        grad_t = self.imaging.compute_complex_gradient(t, intensity_grad)
+
+        cos_phi = np.cos(phase)
+        sin_phi = np.sin(phase)
+        amp = amplitude.astype(np.float64)
+
+        grad_real = np.real(grad_t)
+        grad_imag = np.imag(grad_t)
+
+        grad_amplitude = grad_real * cos_phi + grad_imag * sin_phi
+        grad_phase = amp * (-grad_real * sin_phi + grad_imag * cos_phi)
+
+        return grad_amplitude.astype(np.float64), grad_phase.astype(np.float64)
+
+
+def verify_end_to_end_gradient_numerical(
+    wrapper: PSMImagingWrapper,
+    mask: np.ndarray,
+    target_image: np.ndarray,
+    eps: float = 1e-5,
+    metric: str = 'mse',
+) -> Dict[str, Any]:
+    """
+    数值验证端到端梯度正确性
+
+    使用有限差分法验证整个成像链路的梯度计算。
+
+    Args:
+        wrapper: PSM 成像封装
+        mask: 掩模变量
+        target_image: 目标图像（用于计算损失）
+        eps: 有限差分步长
+        metric: 损失函数类型 ('mse' 或 'mae')
+
+    Returns:
+        包含解析梯度、数值梯度和相对误差的字典
+    """
+    ny, nx = mask.shape
+
+    aerial = wrapper.compute_aerial_image(mask)
+
+    if metric.lower() == 'mse':
+        error = aerial - target_image
+        intensity_grad = 2.0 * error / (ny * nx)
+        loss_analytical = np.mean(error ** 2)
+    elif metric.lower() == 'mae':
+        error = np.sign(aerial - target_image)
+        intensity_grad = error / (ny * nx)
+        loss_analytical = np.mean(np.abs(aerial - target_image))
+    else:
+        raise ValueError(f"不支持的度量: {metric}")
+
+    grad_analytical = wrapper.compute_gradient(mask, intensity_grad)
+
+    grad_numerical = np.zeros_like(mask, dtype=np.float64)
+
+    for i in range(ny):
+        for j in range(nx):
+            mask_plus = mask.copy()
+            mask_plus[i, j] += eps
+            aerial_plus = wrapper.compute_aerial_image(mask_plus)
+
+            mask_minus = mask.copy()
+            mask_minus[i, j] -= eps
+            aerial_minus = wrapper.compute_aerial_image(mask_minus)
+
+            if metric.lower() == 'mse':
+                loss_plus = np.mean((aerial_plus - target_image) ** 2)
+                loss_minus = np.mean((aerial_minus - target_image) ** 2)
+            else:
+                loss_plus = np.mean(np.abs(aerial_plus - target_image))
+                loss_minus = np.mean(np.abs(aerial_minus - target_image))
+
+            grad_numerical[i, j] = (loss_plus - loss_minus) / (2 * eps)
+
+    error = np.abs(grad_analytical - grad_numerical)
+    rel_error = error / (np.abs(grad_analytical) + 1e-10)
+
+    return {
+        'analytical': grad_analytical,
+        'numerical': grad_numerical,
+        'abs_error': error,
+        'rel_error': rel_error,
+        'max_rel_error': float(np.max(rel_error)),
+        'mean_rel_error': float(np.mean(rel_error)),
+        'correct': bool(np.max(rel_error) < 1e-3),
+    }

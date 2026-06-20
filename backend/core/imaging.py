@@ -2063,6 +2063,253 @@ class PartialCoherentImaging:
         mean_g = float(np.mean(grad))
         return (1.0 - flare) * grad + flare * mean_g
 
+    def _preprocess_complex_mask(self, mask: np.ndarray) -> np.ndarray:
+        """
+        预处理复数掩模（加窗、零填充）
+
+        注意：反射式掩模衰减和阴影效应是幅度效应，
+        对于复振幅掩模，应在外部将衰减和阴影效应
+        合并到复振幅中。这里只做加窗和零填充。
+
+        Args:
+            mask: 复数掩模
+
+        Returns:
+            预处理后的复数掩模
+        """
+        processed = mask.astype(np.complex128)
+        if self._window_2d is not None:
+            processed = processed * self._window_2d.astype(np.complex128)
+        if self.pad_width is not None:
+            processed, _ = apply_zero_padding(processed, self.pad_width)
+        return processed
+
+    def compute_aerial_image_complex(self, mask_complex: np.ndarray) -> np.ndarray:
+        """
+        使用复振幅掩模计算空间像（晶圆上的光强分布）
+
+        支持复数透过率掩模（如 PSM 相位掩模），掩模可以同时包含
+        幅度和相位信息。
+
+        数学原理：
+            I(x,y) = Σ_i λ_i · | IFFT{ M(f) · φ_i(f) } |^2
+            其中 M(f) = FFT{ t(x,y) } 是复掩模的频谱，
+                  φ_i(f) 是第 i 个 SOCS 本征函数。
+
+        Args:
+            mask_complex: 复数掩模图案（复振幅透过率）
+
+        Returns:
+            空间像光强分布（原始掩模尺寸）
+        """
+        backend = get_backend()
+        processed_mask = self._preprocess_complex_mask(mask_complex)
+
+        mask_c = _asarray(processed_mask).astype(backend.complex128)
+        ny_eff, nx_eff = processed_mask.shape
+        mode = self.optics.tcc_mode
+
+        if mode == TCCMode.SOCS and self.socs_eigenvalues is not None:
+            intensity = backend.zeros((ny_eff, nx_eff), dtype=backend.float64)
+            mask_spectrum = backend.fft2(mask_c)
+            eigenvalues = _asarray(self.socs_eigenvalues)
+            eigenfunctions = _asarray(self.socs_eigenfunctions)
+
+            for i in range(len(eigenvalues)):
+                lam = eigenvalues[i]
+                if lam < 1e-10:
+                    continue
+                phi = eigenfunctions[i]
+                filtered = mask_spectrum * phi
+                field_i = backend.ifft2(filtered)
+                intensity = intensity + lam * backend.abs(field_i)**2
+        elif mode == TCCMode.KERNEL_2D and self.tcc_kernel is not None:
+            mask_spectrum = backend.fft2(mask_c)
+            tcc_kernel = _asarray(self.tcc_kernel)
+            effective_pupil = backend.sqrt(backend.maximum(tcc_kernel, 0.0))
+            filtered = mask_spectrum * effective_pupil
+            field = backend.ifft2(filtered)
+            intensity = backend.abs(field)**2
+        else:
+            intensity = backend.zeros((ny_eff, nx_eff), dtype=backend.float64)
+            mask_spectrum = backend.fft2(mask_c)
+            cutoff = self.optics.cutoff_frequency
+
+            source = _asarray(self.source)
+            fx = _asarray(self.fx)
+            fy = _asarray(self.fy)
+            pupil = _asarray(self.pupil)
+
+            source_indices = backend.where_idx(source > 1e-10)
+            source_values = source[source_indices]
+
+            for idx in range(len(source_indices[0])):
+                sy, sx = int(source_indices[0][idx]), int(source_indices[1][idx])
+                src_val = source_values[idx]
+
+                fs_x = fx[sy, sx]
+                fs_y = fy[sy, sx]
+
+                if backend.sqrt(fs_x**2 + fs_y**2) > cutoff:
+                    continue
+
+                pupil_shifted = _shift_pupil(pupil, fs_x, fs_y, self.dfx, self.dfy)
+                filtered = mask_spectrum * pupil_shifted
+                field_i = backend.ifft2(filtered)
+                intensity = intensity + src_val * backend.abs(field_i)**2
+
+        if self.pad_width is not None:
+            if isinstance(self.pad_width, int):
+                py, px = self.pad_width, self.pad_width
+            else:
+                py, px = self.pad_width
+            intensity = intensity[py:py + self.image_size[0], px:px + self.image_size[1]]
+
+        intensity_np = _tonumpy(intensity.astype(backend.float64))
+        intensity_np = self._apply_flare(intensity_np)
+
+        if intensity_np.max() > 0:
+            intensity_np = intensity_np / intensity_np.max()
+
+        return intensity_np
+
+    def compute_complex_gradient(
+        self,
+        mask_complex: np.ndarray,
+        intensity_grad: np.ndarray,
+        return_spectral: bool = False,
+    ) -> np.ndarray:
+        """
+        计算损失对复振幅掩模的梯度
+
+        使用"分量梯度"约定：返回的梯度 g = ∂L/∂a + i ∂L/∂b，
+        其中 a = Re(t), b = Im(t) 分别是复透过率的实部和虚部。
+
+        数学推导：
+            光强 I = Σ_i λ_i · |E_i|^2
+            其中 E_i = IFFT{ M(f) · φ_i(f) }
+
+            像面电场梯度（分量约定）：
+                g_Ei = ∂L/∂Re(E_i) + i ∂L/∂Im(E_i) = 2 · dL/dI · E_i
+
+            频域梯度：
+                G_Mi(f) = φ_i*(f) · G_Ei(f)
+
+            空间域梯度（所有 SOCS 项求和）：
+                g_t = Σ_i λ_i · IFFT{ G_Mi }
+
+        Args:
+            mask_complex: 复数掩模
+            intensity_grad: 损失对光强的梯度 dL/dI
+            return_spectral: 是否返回频域梯度（调试用）
+
+        Returns:
+            损失对复掩模的梯度（分量约定）。
+            如果 return_spectral=True，返回 (空间域梯度, 频域梯度)
+        """
+        backend = get_backend()
+        processed_mask = self._preprocess_complex_mask(mask_complex)
+
+        mask_c = _asarray(processed_mask).astype(backend.complex128)
+        ny_eff, nx_eff = processed_mask.shape
+        mode = self.optics.tcc_mode
+        mask_spectrum = backend.fft2(mask_c)
+
+        dLdI = _asarray(intensity_grad).astype(backend.float64)
+        if dLdI.shape != self.image_size:
+            raise ValueError(
+                f"intensity_grad 形状 {dLdI.shape} 与 image_size {self.image_size} 不匹配"
+            )
+
+        if self.pad_width is not None:
+            if isinstance(self.pad_width, int):
+                py, px = self.pad_width, self.pad_width
+            else:
+                py, px = self.pad_width
+            dLdI_padded = backend.zeros((ny_eff, nx_eff), dtype=backend.float64)
+            dLdI_padded[py:py + self.image_size[0], px:px + self.image_size[1]] = dLdI
+            dLdI = dLdI_padded
+
+        if self.optics.flare > 0.0:
+            dLdI = _asarray(self._apply_flare_gradient(_tonumpy(dLdI)))
+
+        grad_spectrum = backend.zeros((ny_eff, nx_eff), dtype=backend.complex128)
+
+        if mode == TCCMode.SOCS and self.socs_eigenvalues is not None:
+            eigenvalues = _asarray(self.socs_eigenvalues)
+            eigenfunctions = _asarray(self.socs_eigenfunctions)
+
+            for i in range(len(eigenvalues)):
+                lam = eigenvalues[i]
+                if lam < 1e-10:
+                    continue
+                phi = eigenfunctions[i]
+                filtered = mask_spectrum * phi
+                field_i = backend.ifft2(filtered)
+
+                g_field = 2.0 * dLdI * field_i
+                g_field_spectrum = backend.fft2(g_field)
+                grad_spectrum = grad_spectrum + lam * backend.conj(phi) * g_field_spectrum
+        elif mode == TCCMode.KERNEL_2D and self.tcc_kernel is not None:
+            tcc_kernel = _asarray(self.tcc_kernel)
+            effective_pupil = backend.sqrt(backend.maximum(tcc_kernel, 0.0))
+            filtered = mask_spectrum * effective_pupil
+            field = backend.ifft2(filtered)
+
+            g_field = 2.0 * dLdI * field
+            g_field_spectrum = backend.fft2(g_field)
+            grad_spectrum = backend.conj(effective_pupil) * g_field_spectrum
+        else:
+            source = _asarray(self.source)
+            fx = _asarray(self.fx)
+            fy = _asarray(self.fy)
+            pupil = _asarray(self.pupil)
+            cutoff = self.optics.cutoff_frequency
+
+            source_indices = backend.where_idx(source > 1e-10)
+            source_values = source[source_indices]
+
+            for idx in range(len(source_indices[0])):
+                sy, sx = int(source_indices[0][idx]), int(source_indices[1][idx])
+                src_val = source_values[idx]
+
+                fs_x = fx[sy, sx]
+                fs_y = fy[sy, sx]
+
+                if backend.sqrt(fs_x**2 + fs_y**2) > cutoff:
+                    continue
+
+                pupil_shifted = _shift_pupil(pupil, fs_x, fs_y, self.dfx, self.dfy)
+                filtered = mask_spectrum * pupil_shifted
+                field_i = backend.ifft2(filtered)
+
+                g_field = 2.0 * dLdI * field_i
+                g_field_spectrum = backend.fft2(g_field)
+                grad_spectrum = grad_spectrum + src_val * backend.conj(pupil_shifted) * g_field_spectrum
+
+        grad_spatial = backend.ifft2(grad_spectrum)
+
+        if self.pad_width is not None:
+            if isinstance(self.pad_width, int):
+                py, px = self.pad_width, self.pad_width
+            else:
+                py, px = self.pad_width
+            grad_spatial = grad_spatial[py:py + self.image_size[0], px:px + self.image_size[1]]
+            grad_spectrum_out = grad_spectrum  # 频域梯度保持填充后尺寸
+        else:
+            grad_spectrum_out = grad_spectrum
+
+        if self._window_2d is not None:
+            window = _asarray(self._window_2d).astype(backend.complex128)
+            grad_spatial = grad_spatial * window
+
+        grad_spatial_np = _tonumpy(grad_spatial).astype(np.complex128)
+        grad_spectrum_np = _tonumpy(grad_spectrum_out).astype(np.complex128)
+
+        if return_spectral:
+            return grad_spatial_np, grad_spectrum_np
+        return grad_spatial_np
+
     def compute_image_gradient(self, mask: np.ndarray) -> np.ndarray:
         """
         计算空间像对掩模的梯度（用于优化）
