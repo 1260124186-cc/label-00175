@@ -171,6 +171,9 @@ class ILTConfig:
     verbose: bool = True
     imaging_model: Optional[Any] = None
 
+    manufacturing_weight: float = 0.0
+    manufacturing: Optional[Any] = None
+
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'ILTConfig':
         if d is None:
@@ -184,6 +187,12 @@ class ILTConfig:
                     cfg.transmission_level = TransmissionLevel(value) if isinstance(value, str) else value
                 elif key == 'complexity':
                     cfg.complexity = ILTComplexityConfig.from_dict(value)
+                elif key == 'manufacturing':
+                    try:
+                        from manufacturing import ManufacturingPenaltyConfig
+                        cfg.manufacturing = ManufacturingPenaltyConfig.from_dict(value) if isinstance(value, dict) else value
+                    except ImportError:
+                        cfg.manufacturing = value
                 else:
                     setattr(cfg, key, value)
         return cfg
@@ -195,7 +204,7 @@ class ILTConfig:
         return cls.from_dict(ilt_config)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             'max_iter': self.max_iter,
             'learning_rate': self.learning_rate,
             'optimizer_type': self.optimizer_type.value,
@@ -214,7 +223,14 @@ class ILTConfig:
             'multi_objective_conditions': self.multi_objective_conditions,
             'pixel_size': self.pixel_size,
             'verbose': self.verbose,
+            'manufacturing_weight': self.manufacturing_weight,
         }
+        if self.manufacturing is not None:
+            if hasattr(self.manufacturing, 'to_dict'):
+                d['manufacturing'] = self.manufacturing.to_dict()
+            else:
+                d['manufacturing'] = self.manufacturing
+        return d
 
     def to_yaml(self, config_path: Union[str, Path]) -> None:
         save_config({'ilt': self.to_dict()}, config_path)
@@ -1096,6 +1112,7 @@ class ILTWorkflow:
         self._gradient_projector: Optional[GradientProjector] = None
         self._complexity_penalty: Optional[MaskComplexityPenalty] = None
         self._multi_objective: Optional[MultiObjectiveILT] = None
+        self._manufacturing_penalty: Optional[Any] = None
 
     def optimize(self,
                  initial_mask: np.ndarray,
@@ -1123,6 +1140,26 @@ class ILTWorkflow:
         )
         self._gradient_projector = GradientProjector(cfg)
         self._complexity_penalty = MaskComplexityPenalty(cfg.complexity)
+
+        if cfg.manufacturing_weight > 0:
+            try:
+                from manufacturing import MaskManufacturingPenalty, ManufacturingPenaltyConfig
+                penalty_cfg = cfg.manufacturing
+                if penalty_cfg is None:
+                    penalty_cfg = ManufacturingPenaltyConfig()
+                elif isinstance(penalty_cfg, dict):
+                    penalty_cfg = ManufacturingPenaltyConfig.from_dict(penalty_cfg)
+                if penalty_cfg.cost_config is None:
+                    from manufacturing import ManufacturingCostConfig
+                    cost_cfg = ManufacturingCostConfig()
+                    cost_cfg.pixel_size_nm = cfg.pixel_size
+                    penalty_cfg.cost_config = cost_cfg
+                self._manufacturing_penalty = MaskManufacturingPenalty(penalty_cfg)
+                if cfg.verbose:
+                    logger.info(f"ILT 制造成本惩罚已启用: 权重={cfg.manufacturing_weight}")
+            except ImportError as e:
+                logger.warning(f"导入 manufacturing 模块失败，禁用制造成本惩罚: {e}")
+                self._manufacturing_penalty = None
 
         is_multi = (cfg.multi_objective_conditions is not None
                     and len(cfg.multi_objective_conditions) > 0)
@@ -1319,6 +1356,19 @@ class ILTWorkflow:
             components['tv_smooth'] = tv
             total += cfg.tv_smooth_weight * tv
 
+        if cfg.manufacturing_weight > 0 and self._manufacturing_penalty is not None:
+            result = self._manufacturing_penalty(mask)
+            if isinstance(result, tuple):
+                mfg_val, mfg_comps = result
+            else:
+                mfg_val = float(result)
+                mfg_comps = self._manufacturing_penalty.get_last_components()
+            components['manufacturing_cost'] = mfg_val
+            if isinstance(mfg_comps, dict):
+                for k, v in mfg_comps.items():
+                    components[f'mfg_{k}'] = float(v) if isinstance(v, (int, float, np.floating)) else v
+            total += cfg.manufacturing_weight * mfg_val
+
         components['total'] = total
         return total, components
 
@@ -1366,6 +1416,10 @@ class ILTWorkflow:
 
         if cfg.tv_smooth_weight > 0:
             grad += cfg.tv_smooth_weight * total_variation_isotropic_gradient(mask)
+
+        if cfg.manufacturing_weight > 0 and self._manufacturing_penalty is not None:
+            mfg_grad = self._manufacturing_penalty.gradient(mask)
+            grad += cfg.manufacturing_weight * mfg_grad
 
         return grad
 

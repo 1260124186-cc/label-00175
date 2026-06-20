@@ -2025,6 +2025,7 @@ class CompositeLossComponents:
     weighted_mae: float = 0.0
     cd_error: float = 0.0
     litho_epe: float = 0.0
+    manufacturing_cost: float = 0.0
     total: float = 0.0
 
     def to_dict(self) -> Dict[str, float]:
@@ -2042,5 +2043,6 @@ class CompositeLossComponents:
             'weighted_mae': self.weighted_mae,
             'cd_error': self.cd_error,
             'litho_epe': self.litho_epe,
+            'manufacturing_cost': self.manufacturing_cost,
             'total': self.total
         }

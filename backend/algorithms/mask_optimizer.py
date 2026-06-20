@@ -119,6 +119,7 @@ class LossWeights:
            + w_weighted_mse * WMSE + w_weighted_mae * WMAE
            + w_worst_case * worst_case_loss（蒙特卡洛最坏情况损失）
            + w_cd_error * |CD_error| + w_litho_epe * EPE_litho
+           + w_manufacturing_cost * ManufacturingCost (掩模制造成本惩罚)
 
     Attributes:
         mse: MSE（均方误差）权重
@@ -134,6 +135,7 @@ class LossWeights:
         worst_case: 蒙特卡洛最坏情况损失权重（需配合 use_monte_carlo=True 使用）
         cd_error: 实测CD偏差（|CD_wafer - CD_target|）权重，Fab计量指标闭环
         litho_epe: 光刻EPE（基于晶圆二值图边缘距离变换）权重，Fab可测指标
+        manufacturing_cost: 掩模制造成本惩罚权重，平衡成像质量与掩模厂成本
     """
     mse: float = 1.0
     ssim: float = 0.0
@@ -148,6 +150,7 @@ class LossWeights:
     worst_case: float = 0.0
     cd_error: float = 0.0
     litho_epe: float = 0.0
+    manufacturing_cost: float = 0.0
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, float]]) -> 'LossWeights':
@@ -158,7 +161,7 @@ class LossWeights:
             'mse': 1.0, 'ssim': 0.0, 'pvb': 0.0, 'mask_complexity': 0.0,
             'binary_penalty': 0.0, 'tv_smooth': 0.0, 'epe': 0.0, 'min_feature': 0.0,
             'weighted_mse': 0.0, 'weighted_mae': 0.0, 'worst_case': 0.0,
-            'cd_error': 0.0, 'litho_epe': 0.0,
+            'cd_error': 0.0, 'litho_epe': 0.0, 'manufacturing_cost': 0.0,
         }
         defaults.update(d)
         return cls(**defaults)
@@ -178,13 +181,14 @@ class LossWeights:
             'worst_case': self.worst_case,
             'cd_error': self.cd_error,
             'litho_epe': self.litho_epe,
+            'manufacturing_cost': self.manufacturing_cost,
         }
 
     def total_weight(self) -> float:
         return (self.mse + self.ssim + self.pvb + self.mask_complexity +
                 self.binary_penalty + self.tv_smooth + self.epe + self.min_feature +
                 self.weighted_mse + self.weighted_mae + self.worst_case +
-                self.cd_error + self.litho_epe)
+                self.cd_error + self.litho_epe + self.manufacturing_cost)
 
 
 @dataclass
@@ -469,6 +473,9 @@ class OptimizationConfig:
     use_real_model_for_final_evaluation: bool = True  # 优化结束后用真实模型验证
     surrogate_device: str = 'auto'  # 代理模型推理设备: 'auto' | 'cpu' | 'cuda' | 'mps'
 
+    # 掩模制造成本惩罚配置
+    manufacturing_penalty_config: Optional[Any] = None  # ManufacturingPenaltyConfig，控制惩罚细节
+
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> 'OptimizationConfig':
         if d is None:
@@ -492,6 +499,12 @@ class OptimizationConfig:
                     cfg.rcwa_config = RCWAConfig(**value) if isinstance(value, dict) else value
                 elif key == 'fdtd_config' and value is not None:
                     cfg.fdtd_config = FDTDConfig(**value) if isinstance(value, dict) else value
+                elif key == 'manufacturing_penalty_config' and value is not None:
+                    try:
+                        from manufacturing import ManufacturingPenaltyConfig
+                        cfg.manufacturing_penalty_config = ManufacturingPenaltyConfig.from_dict(value)
+                    except ImportError:
+                        cfg.manufacturing_penalty_config = value
                 else:
                     setattr(cfg, key, value)
         return cfg
@@ -516,6 +529,11 @@ class OptimizationConfig:
                     else:
                         d[k] = v
                 result[f.name] = d
+            elif f.name == 'manufacturing_penalty_config' and val is not None:
+                if hasattr(val, 'to_dict'):
+                    result[f.name] = val.to_dict()
+                else:
+                    result[f.name] = val
             else:
                 result[f.name] = val
         return result
@@ -687,6 +705,10 @@ class MaskOptimizer:
         self._cd_target_value_nm: Optional[float] = None  # 预提取的目标CD
         self._last_cd_error_value: float = 0.0  # 最近一次的CD误差值（用于梯度回退）
         self._last_litho_epe_value: float = 0.0  # 最近一次的Litho EPE值
+
+        # 掩模制造成本惩罚
+        self._manufacturing_penalty: Optional[Any] = None  # MaskManufacturingPenalty 实例
+        self._last_manufacturing_components: Dict[str, float] = {}  # 最近一次惩罚分项明细
 
     def _setup_bandlimit_mask(self, image_size: tuple):
         """设置频域带限约束掩模"""
@@ -2100,6 +2122,97 @@ class MaskOptimizer:
         else:
             return np.zeros_like(mask)
 
+    # ------------------------------------------------------------------
+    # 掩模制造成本惩罚辅助方法
+    # ------------------------------------------------------------------
+    def _setup_manufacturing_penalty(self):
+        """初始化掩模制造成本惩罚模块"""
+        cfg = self.config
+        lw = cfg.loss_weights
+
+        if lw.manufacturing_cost <= 0:
+            self._manufacturing_penalty = None
+            if cfg.verbose:
+                logger.info("掩模制造成本惩罚未启用 (manufacturing_cost 权重为 0)")
+            return
+
+        try:
+            from manufacturing import MaskManufacturingPenalty, ManufacturingPenaltyConfig
+
+            penalty_cfg = cfg.manufacturing_penalty_config
+            if penalty_cfg is None:
+                penalty_cfg = ManufacturingPenaltyConfig()
+            elif isinstance(penalty_cfg, dict):
+                penalty_cfg = ManufacturingPenaltyConfig.from_dict(penalty_cfg)
+
+            penalty_cfg.enabled = True
+            if penalty_cfg.total_weight <= 0:
+                penalty_cfg.total_weight = 1.0
+
+            if penalty_cfg.cost_config is None:
+                from manufacturing import ManufacturingCostConfig
+                cost_cfg = ManufacturingCostConfig()
+                cost_cfg.pixel_size_nm = cfg.pixel_size
+                penalty_cfg.cost_config = cost_cfg
+
+            self._manufacturing_penalty = MaskManufacturingPenalty(penalty_cfg)
+
+            if cfg.verbose:
+                logger.info(
+                    f"掩模制造成本惩罚已启用: 权重={lw.manufacturing_cost}, "
+                    f"分项权重(vertex={penalty_cfg.vertex_weight}, "
+                    f"shot={penalty_cfg.shot_weight}, "
+                    f"data={penalty_cfg.data_weight}, "
+                    f"write_time={penalty_cfg.write_time_weight})"
+                )
+        except ImportError as e:
+            logger.warning(f"导入 manufacturing 模块失败，禁用制造成本惩罚: {e}")
+            self._manufacturing_penalty = None
+
+    def _compute_manufacturing_cost(self, mask: np.ndarray) -> CompositeLossComponents:
+        """
+        计算掩模制造成本惩罚分量
+
+        Args:
+            mask: 掩模图案
+
+        Returns:
+            CompositeLossComponents（仅填充 manufacturing_cost 字段）
+        """
+        comp = CompositeLossComponents()
+        lw = self.config.loss_weights
+
+        if lw.manufacturing_cost <= 0 or self._manufacturing_penalty is None:
+            return comp
+
+        result = self._manufacturing_penalty(mask)
+        if isinstance(result, tuple):
+            penalty_val, components = result
+            self._last_manufacturing_components = components if isinstance(components, dict) else {}
+        else:
+            penalty_val = float(result)
+            self._last_manufacturing_components = self._manufacturing_penalty.get_last_components()
+
+        comp.manufacturing_cost = lw.manufacturing_cost * penalty_val
+        return comp
+
+    def _compute_manufacturing_cost_gradient(self, mask: np.ndarray) -> np.ndarray:
+        """
+        计算掩模制造成本惩罚的梯度
+
+        Args:
+            mask: 掩模图案
+
+        Returns:
+            梯度数组
+        """
+        lw = self.config.loss_weights
+        if lw.manufacturing_cost <= 0 or self._manufacturing_penalty is None:
+            return np.zeros_like(mask)
+
+        grad = self._manufacturing_penalty.gradient(mask)
+        return lw.manufacturing_cost * grad
+
     def _compute_image_loss_components(self, image: np.ndarray,
                                        target: np.ndarray) -> CompositeLossComponents:
         """
@@ -2426,6 +2539,9 @@ class MaskOptimizer:
                            mask_constraints.epe +
                            mask_constraints.min_feature)
 
+            mfg_comp = self._compute_manufacturing_cost(mask)
+            total_loss += mfg_comp.manufacturing_cost
+
             total_loss += self._compute_regularization_loss(mask)
 
             if cfg.robustness_loss_weight > 0 and len(per_losses) > 1:
@@ -2554,6 +2670,8 @@ class MaskOptimizer:
                 gradient += lw.mask_complexity * total_variation_gradient(mask)
 
             gradient += self._compute_mask_constraints_gradient(mask)
+
+            gradient += self._compute_manufacturing_cost_gradient(mask)
 
             gradient += self._compute_regularization_gradient(mask)
 
@@ -2763,6 +2881,9 @@ class MaskOptimizer:
                               mask_constraints.epe +
                               mask_constraints.min_feature)
 
+                mfg_comp = self._compute_manufacturing_cost(mask)
+                base_loss += mfg_comp.manufacturing_cost
+
                 base_loss += self._compute_regularization_loss(mask)
             else:
                 wafer_image = self._surrogate_compute_aerial(mask)
@@ -2960,6 +3081,8 @@ class MaskOptimizer:
 
                 gradient += self._compute_mask_constraints_gradient(mask)
 
+                gradient += self._compute_manufacturing_cost_gradient(mask)
+
                 gradient += self._compute_regularization_gradient(mask)
             else:
                 wafer_image = self._surrogate_compute_aerial(mask)
@@ -3107,6 +3230,9 @@ class MaskOptimizer:
 
         # 初始化计量闭环反馈（解析测量线，预提取目标CD值）
         self._setup_metrology_closed_loop(self._target_image)
+
+        # 初始化掩模制造成本惩罚模块
+        self._setup_manufacturing_penalty()
 
         use_step_training = self._supports_step_training() and self.config.use_callbacks
 
