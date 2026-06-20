@@ -1,0 +1,154 @@
+# =====================================================
+# Calibrated Default Configuration
+# 参考配置来源: default_config.yaml
+# =====================================================
+
+system:
+  device: cpu
+optical_system:
+  technology_node: duv_arf
+  wavelength: 193.0
+  na: 1.335492
+  sigma: 0.781389
+  pixel_size: 1.0
+  defocus: 0.0
+  magnification: 4.0
+  flare: 0.0
+  shadowing_model: none
+  reflective_mask_attenuation: 0.0
+  illumination_type: conventional
+  source_params:
+    sigma_inner: 0.0
+    sigma_outer: 0.75
+  tcc_mode: socs
+  socs_num_terms: 5
+  use_socs: true
+  zernike_coefficients: {}
+optimization:
+  optimizer_type: gradient_descent
+  max_iter: 100
+  learning_rate: 0.01
+  tol: 1.0e-06
+  early_stop_patience: 10
+  lr_scheduler: null
+  lr_decay: 0.95
+  lr_step_size: 20
+  metric: mse
+  use_composite_loss: false
+  loss_weights:
+    mse: 1.0
+    ssim: 0.0
+    pvb: 0.0
+    mask_complexity: 0.0
+    weighted_mse: 0.0
+    weighted_mae: 0.0
+  spatial_weight:
+    enable: false
+    edge_weight: 2.0
+    corner_weight: 5.0
+    line_end_weight: 4.0
+    base_weight: 1.0
+    edge_sigma: 1.0
+    corner_threshold: 0.3
+    line_end_threshold: 0.5
+    weight_erosion: true
+    smooth_sigma: 0.5
+    normalize: true
+  regularization:
+    type: null
+    strength: 0.0
+  bounds:
+  - 0.0
+  - 1.0
+  verbose: true
+  random_seed: 42
+  population_size: 50
+  crossover_rate: 0.8
+  mutation_rate: 0.1
+  n_jobs: 1
+  rl_gamma: 0.99
+  rl_epsilon: 0.1
+  rl_epsilon_decay: 0.995
+output:
+  save_dir: ./results
+  save_images: true
+  save_history: true
+  image_format: png
+  log_level: INFO
+imaging:
+  resist_threshold: 0.286457
+  apply_resist: true
+  diffusion_length: 12.712065
+  dose_to_clear: 0.718379
+  resist_contrast: 10.0
+_calibration_meta:
+  method: lmfit
+  success: true
+  message: '`ftol` termination condition is satisfied.'
+  n_data_points: 592
+  n_free_params: 6
+  degrees_of_freedom: 586
+  final_cost: 534.718632
+  chi_squared: 742.664767
+  reduced_chi_squared: 1.267346
+  varying_parameters:
+  - resist_threshold
+  - diffusion_length
+  - na_effective
+  - dose_to_clear
+  - resist_contrast
+  - sigma_effective
+  timestamp: '2026-06-20 22:36:48'
+  correlation_matrix:
+    resist_threshold:
+      resist_threshold: 1.0
+      diffusion_length: 0.8741
+      na_effective: 0.1182
+      dose_to_clear: 0.2293
+      resist_contrast: 0.2295
+      sigma_effective: 0.7495
+    diffusion_length:
+      resist_threshold: 0.8741
+      diffusion_length: 1.0
+      na_effective: 0.0704
+      dose_to_clear: -0.0095
+      resist_contrast: -0.0096
+      sigma_effective: 0.74
+    na_effective:
+      resist_threshold: 0.1182
+      diffusion_length: 0.0704
+      na_effective: 1.0
+      dose_to_clear: 0.0314
+      resist_contrast: 0.0315
+      sigma_effective: -0.1953
+    dose_to_clear:
+      resist_threshold: 0.2293
+      diffusion_length: -0.0095
+      na_effective: 0.0314
+      dose_to_clear: 1.0
+      resist_contrast: 1.0
+      sigma_effective: 0.1701
+    resist_contrast:
+      resist_threshold: 0.2295
+      diffusion_length: -0.0096
+      na_effective: 0.0315
+      dose_to_clear: 1.0
+      resist_contrast: 1.0
+      sigma_effective: 0.1702
+    sigma_effective:
+      resist_threshold: 0.7495
+      diffusion_length: 0.74
+      na_effective: -0.1953
+      dose_to_clear: 0.1701
+      resist_contrast: 0.1702
+      sigma_effective: 1.0
+_calibration_uncertainties:
+  imaging:
+    resist_threshold: 0.002885
+    diffusion_length: 0.25042
+    dose_to_clear: 6.79629
+    resist_contrast: 562.554804
+  optical_system:
+    na: 0.001717
+    sigma: 0.006493
+    wavelength: 0.0

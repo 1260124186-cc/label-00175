@@ -1,0 +1,119 @@
+# =====================================================
+# Fab 模型标定：示例配置文件
+# Calibration Configuration Example
+# =====================================================
+
+# 反演方法: nlls / lmfit / bayesian_mcmc / both
+method: lmfit
+
+# CD-SEM 数据文件路径
+dataset_path: ./calibration/sample_data/sample_cd_sem_data.csv
+
+# 输出目录
+output_dir: ./calibration_results/demo
+
+# 参考配置文件（用于生成完整的标定后配置）
+reference_config_path: ./config/default_config.yaml
+
+# 是否用量测不确定度做加权最小二乘
+use_measurement_weights: true
+
+# 前向模型复杂度: simple / standard / detailed
+forward_model_complexity: standard
+
+# 随机种子
+random_seed: 42
+
+# 图表输出
+generate_plots: true
+plot_format: png
+
+# 是否生成配置更新片段
+update_config: true
+
+# =====================================================
+# 待标定参数列表
+# 说明：
+#   - vary: true 表示参与反演；false 表示固定
+#   - lower_bound / upper_bound: 参数边界（None 表示无约束）
+#   - prior_mean / prior_std: 贝叶斯先验（仅 bayesian_mcmc 生效）
+#   - config_path: 对应 default_config.yaml 的路径
+# =====================================================
+parameters:
+  - name: resist_threshold
+    description: 光刻胶显影阈值
+    initial_value: 0.30
+    lower_bound: 0.05
+    upper_bound: 0.80
+    unit: norm.intensity
+    vary: true
+    config_path: imaging.resist_threshold
+
+  - name: diffusion_length
+    description: PEB 酸扩散 RMS 长度
+    initial_value: 10.0
+    lower_bound: 0.0
+    upper_bound: 50.0
+    unit: nm
+    vary: true
+    config_path: imaging.diffusion_length
+
+  - name: na_effective
+    description: 有效数值孔径
+    initial_value: 1.35
+    lower_bound: 1.20
+    upper_bound: 1.45
+    unit: "-"
+    vary: true
+    config_path: optical_system.na
+
+  - name: sigma_effective
+    description: 有效部分相干因子
+    initial_value: 0.75
+    lower_bound: 0.50
+    upper_bound: 0.95
+    unit: "-"
+    vary: true
+    config_path: optical_system.sigma
+
+  - name: wavelength_effective
+    description: 有效波长
+    initial_value: 193.0
+    lower_bound: 190.0
+    upper_bound: 196.0
+    unit: nm
+    vary: false          # 波长通常由激光谱线决定，固定
+    config_path: optical_system.wavelength
+
+  - name: dose_to_clear
+    description: 大开阔区刚能显影的剂量（相对）
+    initial_value: 0.5
+    lower_bound: 0.1
+    upper_bound: 1.5
+    unit: relative
+    vary: true
+
+  - name: resist_contrast
+    description: 光刻胶对比度 γ
+    initial_value: 3.0
+    lower_bound: 1.0
+    upper_bound: 8.0
+    unit: "-"
+    vary: true
+
+# =====================================================
+# NLLS / LMFIT 求解器
+# =====================================================
+nlls:
+  max_iter: 10000
+  method: trf          # trf / dogbox / lm (lm 无边界)
+  ftol: 1.0e-12
+  xtol: 1.0e-12
+
+# =====================================================
+# 贝叶斯 MCMC (可选)
+# =====================================================
+mcmc:
+  n_walkers: 24
+  n_steps: 3000
+  n_burnin: 500

@@ -1,0 +1,94 @@
+# =====================================================
+# Fab 模型标定结果：default_config.yaml 更新片段
+# Calibrated YAML Snippet for default_config.yaml
+#
+# 方法: lmfit
+# 状态: 成功
+# χ²/dof: 1.2673
+#
+# 使用方法：
+#   1. 将本文件中 optical_system / imaging 段
+#      直接合并到 default_config.yaml 对应段
+#   2. 或使用 update_default_config() 自动合并
+# =====================================================
+
+imaging:
+  resist_threshold: 0.286457
+  diffusion_length: 12.712065
+  dose_to_clear: 0.718379
+  resist_contrast: 10.0
+optical_system:
+  na: 1.335492
+  sigma: 0.781389
+  wavelength: 193.0
+_calibration_uncertainties:
+  imaging:
+    resist_threshold: 0.002885
+    diffusion_length: 0.25042
+    dose_to_clear: 6.79629
+    resist_contrast: 562.554804
+  optical_system:
+    na: 0.001717
+    sigma: 0.006493
+    wavelength: 0.0
+_calibration_meta:
+  method: lmfit
+  success: true
+  message: '`ftol` termination condition is satisfied.'
+  n_data_points: 592
+  n_free_params: 6
+  degrees_of_freedom: 586
+  final_cost: 534.718632
+  chi_squared: 742.664767
+  reduced_chi_squared: 1.267346
+  varying_parameters:
+  - resist_threshold
+  - diffusion_length
+  - na_effective
+  - dose_to_clear
+  - resist_contrast
+  - sigma_effective
+  timestamp: null
+  correlation_matrix:
+    resist_threshold:
+      resist_threshold: 1.0
+      diffusion_length: 0.8741
+      na_effective: 0.1182
+      dose_to_clear: 0.2293
+      resist_contrast: 0.2295
+      sigma_effective: 0.7495
+    diffusion_length:
+      resist_threshold: 0.8741
+      diffusion_length: 1.0
+      na_effective: 0.0704
+      dose_to_clear: -0.0095
+      resist_contrast: -0.0096
+      sigma_effective: 0.74
+    na_effective:
+      resist_threshold: 0.1182
+      diffusion_length: 0.0704
+      na_effective: 1.0
+      dose_to_clear: 0.0314
+      resist_contrast: 0.0315
+      sigma_effective: -0.1953
+    dose_to_clear:
+      resist_threshold: 0.2293
+      diffusion_length: -0.0095
+      na_effective: 0.0314
+      dose_to_clear: 1.0
+      resist_contrast: 1.0
+      sigma_effective: 0.1701
+    resist_contrast:
+      resist_threshold: 0.2295
+      diffusion_length: -0.0096
+      na_effective: 0.0315
+      dose_to_clear: 1.0
+      resist_contrast: 1.0
+      sigma_effective: 0.1702
+    sigma_effective:
+      resist_threshold: 0.7495
+      diffusion_length: 0.74
+      na_effective: -0.1953
+      dose_to_clear: 0.1701
+      resist_contrast: 0.1702
+      sigma_effective: 1.0
