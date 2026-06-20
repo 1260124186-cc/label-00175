@@ -1,7 +1,7 @@
 import logging
-from typing import Optional
+from typing import Optional, Dict, Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Depends
 from fastapi.responses import FileResponse
 
 from schemas import (
@@ -14,6 +14,7 @@ from services import (
     get_task_download_path,
     list_tasks,
 )
+from auth import get_current_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/tasks", tags=["任务管理"])
@@ -23,26 +24,31 @@ router = APIRouter(prefix="/api/tasks", tags=["任务管理"])
 async def list_all_tasks(
     task_type: Optional[str] = Query(None, description="按任务类型筛选: opc, smo, ilt, process_window, batch, simulation"),
     status: Optional[str] = Query(None, description="按状态筛选: pending, running, completed, failed"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    data = list_tasks(task_type=task_type, status=status)
+    user_id = current_user["user_id"]
+    data = list_tasks(task_type=task_type, status=status, user_id=user_id)
     tasks = [TaskStatusResponse(**t) for t in data.get("tasks", [])]
     return TaskListResponse(count=len(tasks), tasks=tasks)
 
 
 @router.get("/{task_id}", response_model=TaskStatusResponse, summary="查询单个任务状态")
-async def get_single_task(task_id: str):
-    data = get_task_status(task_id)
+async def get_single_task(task_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user["user_id"]
+    data = get_task_status(task_id, user_id=user_id)
     return TaskStatusResponse(**data)
 
 
 @router.get("/{task_id}/result", summary="获取任务详细结果（仅当任务已完成时可用）")
-async def get_single_task_result(task_id: str):
-    return get_task_result(task_id)
+async def get_single_task_result(task_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user["user_id"]
+    return get_task_result(task_id, user_id=user_id)
 
 
 @router.get("/{task_id}/download", summary="下载任务结果 JSON 文件")
-async def download_task_result(task_id: str):
-    file_path = get_task_download_path(task_id)
+async def download_task_result(task_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user["user_id"]
+    file_path = get_task_download_path(task_id, user_id=user_id)
     return FileResponse(
         path=str(file_path),
         filename=f"task_{task_id}.json",

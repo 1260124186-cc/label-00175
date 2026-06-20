@@ -20,16 +20,48 @@ BACKEND_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = BACKEND_ROOT / "config"
 DEFAULT_CONFIG_PATH = CONFIG_DIR / "default_config.yaml"
 
-API_CONFIG_DIR = Path(__file__).resolve().parent / "saved_configs"
-API_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+FALLBACK_CONFIG_DIR = Path(__file__).resolve().parent / "saved_configs"
+FALLBACK_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-TASK_RESULTS_DIR = Path(__file__).resolve().parent / "task_results"
-TASK_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+FALLBACK_TASK_RESULTS_DIR = Path(__file__).resolve().parent / "task_results"
+FALLBACK_TASK_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-GDS_UPLOAD_DIR = Path(__file__).resolve().parent / "gds_uploads"
-GDS_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+FALLBACK_GDS_UPLOAD_DIR = Path(__file__).resolve().parent / "gds_uploads"
+FALLBACK_GDS_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+AUTH_DATA_DIR = Path(__file__).resolve().parent / "auth_data"
+
+
+def _get_user_configs_dir(user_id: Optional[str]) -> Path:
+    if user_id:
+        from auth import get_user_configs_dir
+        return get_user_configs_dir(user_id)
+    return FALLBACK_CONFIG_DIR
+
+
+def _get_user_tasks_dir(user_id: Optional[str]) -> Path:
+    if user_id:
+        from auth import get_user_tasks_dir
+        return get_user_tasks_dir(user_id)
+    return FALLBACK_TASK_RESULTS_DIR
+
+
+def _get_user_gds_dir(user_id: Optional[str]) -> Path:
+    if user_id:
+        from auth import get_user_gds_dir
+        return get_user_gds_dir(user_id)
+    return FALLBACK_GDS_UPLOAD_DIR
+
+
+def _get_user_results_dir(user_id: Optional[str]) -> Path:
+    if user_id:
+        from auth import get_user_results_dir
+        return get_user_results_dir(user_id)
+    return FALLBACK_TASK_RESULTS_DIR
+
 
 RUNNING_TASKS: Dict[str, Dict[str, Any]] = {}
+_tasks_lock = threading.Lock()
 
 _ws_event_loop: Optional[asyncio.AbstractEventLoop] = None
 _ws_loop_lock = threading.Lock()
@@ -194,11 +226,12 @@ def _push_task_failed_ws(task_id: str, error: str):
     _run_async(broadcast_task_failed(task_id, error))
 
 
-def _register_task(task_type: str, payload: Dict[str, Any]) -> str:
+def _register_task(task_type: str, payload: Dict[str, Any], user_id: Optional[str] = None) -> str:
     task_id = uuid.uuid4().hex[:12]
     RUNNING_TASKS[task_id] = {
         "task_id": task_id,
         "task_type": task_type,
+        "user_id": user_id,
         "status": "pending",
         "progress": 0.0,
         "message": None,
@@ -283,10 +316,13 @@ def _set_progress(task_id: str, progress: float, message: Optional[str] = None,
 
 def _persist_task_result(task_id: str, task: Dict[str, Any]):
     try:
-        out_path = TASK_RESULTS_DIR / f"{task_id}.json"
+        user_id = task.get("user_id")
+        task_dir = _get_user_tasks_dir(user_id)
+        out_path = task_dir / f"{task_id}.json"
         serializable = {
             "task_id": task.get("task_id"),
             "task_type": task.get("task_type"),
+            "user_id": user_id,
             "status": task.get("status"),
             "progress": task.get("progress"),
             "message": task.get("message"),
@@ -372,7 +408,8 @@ def _create_test_pattern(pattern_type: str, pattern_params: Dict[str, Any]):
 
 def _load_gds_pattern(gds_file_id: str, layer: int, datatype: int = 0,
                      pixel_size: float = 1.0,
-                     target_size: Optional[Tuple[int, int]] = None) -> np.ndarray:
+                     target_size: Optional[Tuple[int, int]] = None,
+                     user_id: Optional[str] = None) -> np.ndarray:
     """
     从已上传的 GDS 文件加载指定层并栅格化为二值掩模
 
@@ -382,13 +419,15 @@ def _load_gds_pattern(gds_file_id: str, layer: int, datatype: int = 0,
         datatype: GDS 数据类型号，默认 0
         pixel_size: 每像素对应的 GDS 单位长度（GDS 单位通常为 nm）
         target_size: 目标尺寸 (H, W)，None 则由版图包围盒自动计算
+        user_id: 用户 ID，用于租户隔离
 
     Returns:
         二值掩模 (H, W) float32
     """
     from utils.data_io import load_gds_layer
 
-    gds_path = GDS_UPLOAD_DIR / gds_file_id
+    gds_dir = _get_user_gds_dir(user_id)
+    gds_path = gds_dir / gds_file_id
     if not gds_path.exists():
         raise FileNotFoundError(f"GDS 文件不存在: {gds_file_id}")
 
@@ -403,7 +442,7 @@ def _load_gds_pattern(gds_file_id: str, layer: int, datatype: int = 0,
     return np.asarray(mask, dtype=np.float32)
 
 
-def _resolve_input_pattern(payload: Dict[str, Any]) -> np.ndarray:
+def _resolve_input_pattern(payload: Dict[str, Any], user_id: Optional[str] = None) -> np.ndarray:
     """
     根据 payload 统一解析输入图案：优先使用 GDS，否则回退到测试图案
 
@@ -432,7 +471,7 @@ def _resolve_input_pattern(payload: Dict[str, Any]) -> np.ndarray:
         target_size: Optional[Tuple[int, int]] = None
         if isinstance(raw_size, (list, tuple)) and len(raw_size) >= 2:
             target_size = (int(raw_size[0]), int(raw_size[1]))
-        return _load_gds_pattern(gds_file_id, layer, datatype, pixel_size, target_size)
+        return _load_gds_pattern(gds_file_id, layer, datatype, pixel_size, target_size, user_id=user_id)
 
     pattern_type = payload.get("pattern_type") or "rectangle"
     pattern_params = payload.get("pattern_params") or {}
@@ -460,17 +499,18 @@ def load_default_config() -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"加载配置失败: {str(e)}")
 
 
-def list_saved_configs() -> Dict[str, Any]:
+def list_saved_configs(user_id: Optional[str] = None) -> Dict[str, Any]:
     try:
+        config_dir = _get_user_configs_dir(user_id)
         files = []
-        for f in API_CONFIG_DIR.glob("*.yaml"):
+        for f in config_dir.glob("*.yaml"):
             files.append({
                 "filename": f.name,
                 "path": str(f),
                 "size": f.stat().st_size,
                 "modified": f.stat().st_mtime
             })
-        for f in API_CONFIG_DIR.glob("*.yml"):
+        for f in config_dir.glob("*.yml"):
             files.append({
                 "filename": f.name,
                 "path": str(f),
@@ -483,8 +523,9 @@ def list_saved_configs() -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"列出配置文件失败: {str(e)}")
 
 
-def load_saved_config(filename: str) -> Dict[str, Any]:
-    filepath = API_CONFIG_DIR / filename
+def load_saved_config(filename: str, user_id: Optional[str] = None) -> Dict[str, Any]:
+    config_dir = _get_user_configs_dir(user_id)
+    filepath = config_dir / filename
     if not filepath.exists():
         raise HTTPException(status_code=404, detail=f"配置文件不存在: {filename}")
     try:
@@ -497,12 +538,13 @@ def load_saved_config(filename: str) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"加载配置失败: {str(e)}")
 
 
-def save_config_to_file(config: Dict[str, Any], filename: Optional[str] = None) -> str:
+def save_config_to_file(config: Dict[str, Any], filename: Optional[str] = None, user_id: Optional[str] = None) -> str:
+    config_dir = _get_user_configs_dir(user_id)
     if filename is None:
         filename = f"config_{uuid.uuid4().hex[:8]}.yaml"
     if not (filename.endswith(".yaml") or filename.endswith(".yml")):
         filename += ".yaml"
-    filepath = API_CONFIG_DIR / filename
+    filepath = config_dir / filename
     try:
         with open(filepath, "w", encoding="utf-8") as f:
             yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
@@ -512,8 +554,9 @@ def save_config_to_file(config: Dict[str, Any], filename: Optional[str] = None) 
         raise HTTPException(status_code=500, detail=f"保存配置失败: {str(e)}")
 
 
-def delete_saved_config(filename: str) -> None:
-    filepath = API_CONFIG_DIR / filename
+def delete_saved_config(filename: str, user_id: Optional[str] = None) -> None:
+    config_dir = _get_user_configs_dir(user_id)
+    filepath = config_dir / filename
     if not filepath.exists():
         raise HTTPException(status_code=404, detail=f"配置文件不存在: {filename}")
     try:
@@ -523,11 +566,12 @@ def delete_saved_config(filename: str) -> None:
         raise HTTPException(status_code=500, detail=f"删除配置失败: {str(e)}")
 
 
-def run_simulation(config: Dict[str, Any], pattern_type: str, pattern_params: Dict[str, Any]) -> str:
+def run_simulation(config: Dict[str, Any], pattern_type: str, pattern_params: Dict[str, Any], user_id: Optional[str] = None) -> str:
     task_id = uuid.uuid4().hex[:12]
     RUNNING_TASKS[task_id] = {
         "status": "starting",
         "progress": 0,
+        "user_id": user_id,
         "config": config,
         "pattern_type": pattern_type,
         "pattern_params": pattern_params,
@@ -680,9 +724,9 @@ def _execute_simulation(task_id: str):
             task["progress"] = 0
 
 
-def run_opc(payload: Dict[str, Any]) -> str:
+def run_opc(payload: Dict[str, Any], user_id: Optional[str] = None) -> str:
     import threading
-    task_id = _register_task("opc", payload)
+    task_id = _register_task("opc", payload, user_id=user_id)
     thread = threading.Thread(target=_execute_opc, args=(task_id,), daemon=True)
     thread.start()
     return task_id
@@ -743,9 +787,9 @@ def _execute_opc(task_id: str):
         _fail_task(task_id, f"{type(e).__name__}: {e}")
 
 
-def run_smo(payload: Dict[str, Any]) -> str:
+def run_smo(payload: Dict[str, Any], user_id: Optional[str] = None) -> str:
     import threading
-    task_id = _register_task("smo", payload)
+    task_id = _register_task("smo", payload, user_id=user_id)
     thread = threading.Thread(target=_execute_smo, args=(task_id,), daemon=True)
     thread.start()
     return task_id
@@ -804,9 +848,9 @@ def _execute_smo(task_id: str):
         _fail_task(task_id, f"{type(e).__name__}: {e}")
 
 
-def run_ilt(payload: Dict[str, Any]) -> str:
+def run_ilt(payload: Dict[str, Any], user_id: Optional[str] = None) -> str:
     import threading
-    task_id = _register_task("ilt", payload)
+    task_id = _register_task("ilt", payload, user_id=user_id)
     thread = threading.Thread(target=_execute_ilt, args=(task_id,), daemon=True)
     thread.start()
     return task_id
@@ -865,9 +909,9 @@ def _execute_ilt(task_id: str):
         _fail_task(task_id, f"{type(e).__name__}: {e}")
 
 
-def run_process_window(payload: Dict[str, Any]) -> str:
+def run_process_window(payload: Dict[str, Any], user_id: Optional[str] = None) -> str:
     import threading
-    task_id = _register_task("process_window", payload)
+    task_id = _register_task("process_window", payload, user_id=user_id)
     thread = threading.Thread(target=_execute_process_window, args=(task_id,), daemon=True)
     thread.start()
     return task_id
@@ -913,7 +957,8 @@ def _execute_process_window(task_id: str):
 
         _set_progress(task_id, 35, "执行工艺窗口分析（focus-dose 扫描）...")
         from analysis.process_window import quick_process_window_analysis
-        output_dir = str(TASK_RESULTS_DIR / task_id) if save_vis else None
+        user_results_dir = _get_user_results_dir(task.get("user_id"))
+        output_dir = str(user_results_dir / task_id) if save_vis else None
         if save_vis:
             os.makedirs(output_dir, exist_ok=True)
         pixel_size = float(opt_sys_dict.get("pixel_size", 1.0))
@@ -1003,9 +1048,9 @@ def _execute_process_window(task_id: str):
         _fail_task(task_id, f"{type(e).__name__}: {e}")
 
 
-def run_batch(payload: Dict[str, Any]) -> str:
+def run_batch(payload: Dict[str, Any], user_id: Optional[str] = None) -> str:
     import threading
-    task_id = _register_task("batch", payload)
+    task_id = _register_task("batch", payload, user_id=user_id)
     thread = threading.Thread(target=_execute_batch, args=(task_id,), daemon=True)
     thread.start()
     return task_id
@@ -1045,7 +1090,8 @@ def _execute_batch(task_id: str):
         if not source:
             raise ValueError("批处理必须提供 source 参数")
 
-        gds_path = GDS_UPLOAD_DIR / source
+        gds_dir = _get_user_gds_dir(task.get("user_id"))
+        gds_path = gds_dir / source
         if gds_path.exists() and gds_path.is_file():
             source = str(gds_path)
 
@@ -1157,16 +1203,69 @@ def _execute_batch(task_id: str):
         _fail_task(task_id, f"{type(e).__name__}: {e}")
 
 
-def get_task_status(task_id: str) -> Dict[str, Any]:
-    task = RUNNING_TASKS.get(task_id)
-    if not task:
-        persisted = TASK_RESULTS_DIR / f"{task_id}.json"
+def _find_persisted_task(task_id: str, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    search_dirs = []
+    if user_id:
+        search_dirs.append(_get_user_tasks_dir(user_id))
+    else:
+        search_dirs.append(FALLBACK_TASK_RESULTS_DIR)
+        if AUTH_DATA_DIR.exists():
+            for d in AUTH_DATA_DIR.iterdir():
+                tasks_sub = d / "tasks"
+                if d.is_dir() and tasks_sub.exists():
+                    search_dirs.append(tasks_sub)
+    for task_dir in search_dirs:
+        persisted = task_dir / f"{task_id}.json"
         if persisted.exists():
             try:
                 with open(persisted, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    data = json.load(f)
+                if user_id and data.get("user_id") and data.get("user_id") != user_id:
+                    continue
+                return data
             except Exception as e:
                 logger.warning(f"读取持久化任务失败 {task_id}: {e}")
+    return None
+
+
+def _load_persisted_tasks_for_user(user_id: Optional[str]) -> List[Dict[str, Any]]:
+    tasks = []
+    search_dirs = []
+    if user_id:
+        search_dirs.append(_get_user_tasks_dir(user_id))
+    else:
+        search_dirs.append(FALLBACK_TASK_RESULTS_DIR)
+        if AUTH_DATA_DIR.exists():
+            for d in AUTH_DATA_DIR.iterdir():
+                tasks_sub = d / "tasks"
+                if d.is_dir() and tasks_sub.exists():
+                    search_dirs.append(tasks_sub)
+    seen_ids = set()
+    for task_dir in search_dirs:
+        for pf in task_dir.glob("*.json"):
+            if pf.stem in seen_ids:
+                continue
+            try:
+                with open(pf, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if user_id and data.get("user_id") and data.get("user_id") != user_id:
+                    continue
+                seen_ids.add(pf.stem)
+                tasks.append(data)
+            except Exception as e:
+                logger.warning(f"读取持久化任务列表失败 {pf.name}: {e}")
+    return tasks
+
+
+def get_task_status(task_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
+    task = RUNNING_TASKS.get(task_id)
+    if task:
+        if user_id and task.get("user_id") and task.get("user_id") != user_id:
+            raise HTTPException(status_code=403, detail="无权访问此任务")
+    if not task:
+        persisted = _find_persisted_task(task_id, user_id)
+        if persisted:
+            return persisted
         raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
     return {
         "task_id": task.get("task_id", task_id),
@@ -1186,26 +1285,24 @@ def get_task_status(task_id: str) -> Dict[str, Any]:
     }
 
 
-def get_task_result(task_id: str) -> Dict[str, Any]:
+def get_task_result(task_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
     task = RUNNING_TASKS.get(task_id)
+    if task:
+        if user_id and task.get("user_id") and task.get("user_id") != user_id:
+            raise HTTPException(status_code=403, detail="无权访问此任务")
     if not task:
-        persisted = TASK_RESULTS_DIR / f"{task_id}.json"
-        if persisted.exists():
-            try:
-                with open(persisted, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    return {
-                        "task_id": task_id,
-                        "task_type": data.get("task_type"),
-                        "status": data.get("status"),
-                        "result": data.get("result_summary"),
-                        "result_summary": data.get("result_summary"),
-                        "result_detail": data.get("result_detail"),
-                        "payload": data.get("payload"),
-                        "error": data.get("error"),
-                    }
-            except Exception as e:
-                logger.warning(f"读取持久化任务结果失败 {task_id}: {e}")
+        data = _find_persisted_task(task_id, user_id)
+        if data:
+            return {
+                "task_id": task_id,
+                "task_type": data.get("task_type"),
+                "status": data.get("status"),
+                "result": data.get("result_summary"),
+                "result_summary": data.get("result_summary"),
+                "result_detail": data.get("result_detail"),
+                "payload": data.get("payload"),
+                "error": data.get("error"),
+            }
         raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
     if task.get("status") not in ("completed", "failed"):
         running_detail = task.get("result_detail")
@@ -1233,23 +1330,35 @@ def get_task_result(task_id: str) -> Dict[str, Any]:
     }
 
 
-def get_task_download_path(task_id: str) -> Path:
-    persisted = TASK_RESULTS_DIR / f"{task_id}.json"
+def get_task_download_path(task_id: str, user_id: Optional[str] = None) -> Path:
+    task = RUNNING_TASKS.get(task_id)
+    if task:
+        if user_id and task.get("user_id") and task.get("user_id") != user_id:
+            raise HTTPException(status_code=403, detail="无权访问此任务")
+    task_dir = _get_user_tasks_dir(user_id or (task.get("user_id") if task else None))
+    persisted = task_dir / f"{task_id}.json"
     if not persisted.exists():
-        task = RUNNING_TASKS.get(task_id)
         if not task:
-            raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
-        if task.get("status") not in ("completed", "failed"):
-            raise HTTPException(status_code=400, detail=f"任务尚未完成，当前状态: {task.get('status')}")
-        _persist_task_result(task_id, task)
+            found = _find_persisted_task(task_id, user_id)
+            if not found:
+                raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
+            task_uid = found.get("user_id")
+            task_dir = _get_user_tasks_dir(task_uid)
+            persisted = task_dir / f"{task_id}.json"
+        if not persisted.exists():
+            if task and task.get("status") not in ("completed", "failed"):
+                raise HTTPException(status_code=400, detail=f"任务尚未完成，当前状态: {task.get('status')}")
+            _persist_task_result(task_id, task)
     if not persisted.exists():
         raise HTTPException(status_code=404, detail=f"任务结果文件不存在")
     return persisted
 
 
-def list_tasks(task_type: Optional[str] = None, status: Optional[str] = None) -> Dict[str, Any]:
+def list_tasks(task_type: Optional[str] = None, status: Optional[str] = None, user_id: Optional[str] = None) -> Dict[str, Any]:
     tasks = []
     for tid, task in RUNNING_TASKS.items():
+        if user_id and task.get("user_id") and task.get("user_id") != user_id:
+            continue
         t_type = task.get("task_type", "unknown")
         t_status = task.get("status", "unknown")
         if task_type and t_type != task_type:
@@ -1271,46 +1380,43 @@ def list_tasks(task_type: Optional[str] = None, status: Optional[str] = None) ->
             "finished_at": task.get("finished_at"),
             "result_summary": task.get("result_summary"),
         })
-    for pf in TASK_RESULTS_DIR.glob("*.json"):
-        tid = pf.stem
+    persisted_tasks = _load_persisted_tasks_for_user(user_id)
+    for data in persisted_tasks:
+        tid = data.get("task_id")
         if tid in RUNNING_TASKS:
             continue
-        try:
-            with open(pf, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            t_type = data.get("task_type", "unknown")
-            t_status = data.get("status", "unknown")
-            if task_type and t_type != task_type:
-                continue
-            if status and t_status != status:
-                continue
-            tasks.append({
-                "task_id": tid,
-                "task_type": t_type,
-                "status": t_status,
-                "progress": data.get("progress", 0.0),
-                "message": data.get("message"),
-                "error": data.get("error"),
-                "stage": data.get("stage"),
-                "current_loss": data.get("current_loss"),
-                "iteration": data.get("iteration"),
-                "created_at": data.get("created_at"),
-                "started_at": data.get("started_at"),
-                "finished_at": data.get("finished_at"),
-                "result_summary": data.get("result_summary"),
-            })
-        except Exception as e:
-            logger.warning(f"读取持久化任务列表失败 {pf.name}: {e}")
+        t_type = data.get("task_type", "unknown")
+        t_status = data.get("status", "unknown")
+        if task_type and t_type != task_type:
+            continue
+        if status and t_status != status:
+            continue
+        tasks.append({
+            "task_id": tid,
+            "task_type": t_type,
+            "status": t_status,
+            "progress": data.get("progress", 0.0),
+            "message": data.get("message"),
+            "error": data.get("error"),
+            "stage": data.get("stage"),
+            "current_loss": data.get("current_loss"),
+            "iteration": data.get("iteration"),
+            "created_at": data.get("created_at"),
+            "started_at": data.get("started_at"),
+            "finished_at": data.get("finished_at"),
+            "result_summary": data.get("result_summary"),
+        })
     tasks.sort(key=lambda t: t.get("created_at") or 0.0, reverse=True)
     return {"count": len(tasks), "tasks": tasks}
 
 
-def upload_gds_file(file_bytes: bytes, filename: str) -> Dict[str, Any]:
+def upload_gds_file(file_bytes: bytes, filename: str, user_id: Optional[str] = None) -> Dict[str, Any]:
     safe_name = Path(filename).name
     if not safe_name.lower().endswith((".gds", ".gdsii", ".oas", ".oasis")):
         raise HTTPException(status_code=400, detail="仅支持 GDS/GDSII/OASIS 格式文件")
     file_id = f"{int(time.time() * 1000)}_{safe_name}"
-    dest = GDS_UPLOAD_DIR / file_id
+    gds_dir = _get_user_gds_dir(user_id)
+    dest = gds_dir / file_id
     with open(dest, "wb") as f:
         f.write(file_bytes)
     return {
@@ -1321,9 +1427,10 @@ def upload_gds_file(file_bytes: bytes, filename: str) -> Dict[str, Any]:
     }
 
 
-def list_gds_files() -> Dict[str, Any]:
+def list_gds_files(user_id: Optional[str] = None) -> Dict[str, Any]:
     files = []
-    for pf in GDS_UPLOAD_DIR.glob("*"):
+    gds_dir = _get_user_gds_dir(user_id)
+    for pf in gds_dir.glob("*"):
         if pf.is_file():
             st = pf.stat()
             files.append({
@@ -1336,8 +1443,9 @@ def list_gds_files() -> Dict[str, Any]:
     return {"count": len(files), "files": files}
 
 
-def get_gds_layers(file_id: str) -> Dict[str, Any]:
-    fpath = GDS_UPLOAD_DIR / file_id
+def get_gds_layers(file_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
+    gds_dir = _get_user_gds_dir(user_id)
+    fpath = gds_dir / file_id
     if not fpath.exists():
         raise HTTPException(status_code=404, detail=f"GDS 文件不存在: {file_id}")
     try:
@@ -1380,8 +1488,9 @@ def get_gds_layers(file_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"读取 GDS 层信息失败: {e}")
 
 
-def delete_gds_file(file_id: str) -> Dict[str, Any]:
-    fpath = GDS_UPLOAD_DIR / file_id
+def delete_gds_file(file_id: str, user_id: Optional[str] = None) -> Dict[str, Any]:
+    gds_dir = _get_user_gds_dir(user_id)
+    fpath = gds_dir / file_id
     if not fpath.exists():
         raise HTTPException(status_code=404, detail=f"GDS 文件不存在: {file_id}")
     try:
@@ -1391,8 +1500,9 @@ def delete_gds_file(file_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"删除 GDS 文件失败: {e}")
 
 
-def get_gds_file_path(file_id: str) -> Path:
-    fpath = GDS_UPLOAD_DIR / file_id
+def get_gds_file_path(file_id: str, user_id: Optional[str] = None) -> Path:
+    gds_dir = _get_user_gds_dir(user_id)
+    fpath = gds_dir / file_id
     if not fpath.exists():
         raise HTTPException(status_code=404, detail=f"GDS 文件不存在: {file_id}")
     return fpath

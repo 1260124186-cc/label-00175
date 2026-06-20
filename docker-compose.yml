@@ -37,10 +37,13 @@ services:
       - ./results:/app/results
       - ./backend/api/saved_configs:/app/api/saved_configs
       - ./backend/config:/app/config:ro
+      - auth_data:/app/api/auth_data
     environment:
       - PYTHONPATH=/app
       - NUMBA_CACHE_DIR=/tmp/numba_cache
       - TZ=Asia/Shanghai
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production-litho-sim-2024}
+      - JWT_EXPIRE_HOURS=${JWT_EXPIRE_HOURS:-24}
     expose:
       - "8000"
     healthcheck:
@@ -404,3 +407,4 @@ services:
 # ----------------------------------------------------------------------
 volumes:
   redis_data:
+  auth_data:

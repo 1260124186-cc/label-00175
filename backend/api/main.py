@@ -20,6 +20,7 @@ from routers.tasks import router as tasks_router
 from routers.websocket import router as websocket_router
 from routers.gds import router as gds_router
 from routers.experiments import router as experiments_router
+from routers.auth import router as auth_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,8 +30,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="RET 光刻仿真工作台 API",
-    description="计算光刻仿真框架 Web API，支持参数配置、仿真运行、OPC/SMO/ILT 工作流、工艺窗口分析、批处理优化、统一任务管理",
-    version="2.0.0",
+    description="计算光刻仿真框架 Web API，支持参数配置、仿真运行、OPC/SMO/ILT 工作流、工艺窗口分析、批处理优化、统一任务管理、JWT 用户认证与多租户隔离",
+    version="2.1.0",
 )
 
 app.add_middleware(
@@ -41,6 +42,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth_router)
 app.include_router(config_router)
 app.include_router(simulation_router)
 app.include_router(workflows_router)
@@ -60,7 +62,7 @@ async def health_check():
     return {
         "status": "ok",
         "service": "ret-litho-api",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "features": [
             "config",
             "simulation",
@@ -71,6 +73,8 @@ async def health_check():
             "batch_optimization",
             "task_management",
             "experiment_tracking",
+            "jwt_auth",
+            "multi_tenant",
         ],
     }
 

@@ -3,7 +3,7 @@ import os
 import logging
 from typing import Optional, List, Dict, Any
 
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Query, HTTPException, Depends
 from pydantic import BaseModel
 
 _API_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -29,6 +29,7 @@ from utils.experiment_tracking import (
     get_run_summary,
     filter_runs,
 )
+from auth import get_current_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/experiments", tags=["实验追踪"])
@@ -36,11 +37,20 @@ router = APIRouter(prefix="/api/experiments", tags=["实验追踪"])
 DEFAULT_TRACKING_DIR = os.path.join(_BACKEND_ROOT, "mlruns")
 
 
-def _get_tracker(experiment_name: str = "default"):
+def _get_user_tracking_dir(user_id: Optional[str]) -> str:
+    if user_id:
+        from auth import get_user_dir
+        user_dir = get_user_dir(user_id, "mlruns")
+        return str(user_dir)
+    return DEFAULT_TRACKING_DIR
+
+
+def _get_tracker(experiment_name: str = "default", user_id: Optional[str] = None):
+    tracking_dir = _get_user_tracking_dir(user_id)
     return create_tracker(
         "local",
         experiment_name=experiment_name,
-        tracking_dir=DEFAULT_TRACKING_DIR,
+        tracking_dir=tracking_dir,
     )
 
 
@@ -90,8 +100,10 @@ def _run_to_detail(run) -> ExperimentRunDetail:
 
 
 @router.get("", response_model=ExperimentListResponse, summary="获取所有实验名称列表")
-async def list_all_experiments():
-    experiments = list_experiments(DEFAULT_TRACKING_DIR)
+async def list_all_experiments(current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user["user_id"]
+    tracking_dir = _get_user_tracking_dir(user_id)
+    experiments = list_experiments(tracking_dir)
     return ExperimentListResponse(
         count=len(experiments),
         experiments=experiments,
@@ -113,8 +125,10 @@ async def list_experiment_runs(
     metric_max: Optional[float] = Query(None, description="指标最大值过滤（最终值）"),
     limit: int = Query(100, ge=1, le=1000, description="返回数量限制"),
     offset: int = Query(0, ge=0, description="偏移量"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    tracker = _get_tracker(experiment_name)
+    user_id = current_user["user_id"]
+    tracker = _get_tracker(experiment_name, user_id=user_id)
     runs = tracker.list_runs()
 
     if status:
@@ -152,14 +166,16 @@ async def list_experiment_runs(
     response_model=ExperimentRunDetail,
     summary="获取单个实验运行的详细信息",
 )
-async def get_run_detail(run_id: str, experiment_name: Optional[str] = None):
+async def get_run_detail(run_id: str, experiment_name: Optional[str] = None, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user["user_id"]
     if experiment_name:
-        tracker = _get_tracker(experiment_name)
+        tracker = _get_tracker(experiment_name, user_id=user_id)
         run = tracker.get_run(run_id)
     else:
         run = None
-        for exp_name in list_experiments(DEFAULT_TRACKING_DIR):
-            tracker = _get_tracker(exp_name)
+        tracking_dir = _get_user_tracking_dir(user_id)
+        for exp_name in list_experiments(tracking_dir):
+            tracker = _get_tracker(exp_name, user_id=user_id)
             run = tracker.get_run(run_id)
             if run:
                 break
@@ -175,18 +191,20 @@ async def get_run_detail(run_id: str, experiment_name: Optional[str] = None):
     response_model=ExperimentCompareResponse,
     summary="并排对比多次实验运行的参数与指标",
 )
-async def compare_runs(request: ExperimentCompareRequest):
+async def compare_runs(request: ExperimentCompareRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user["user_id"]
     if not request.run_ids:
         raise HTTPException(status_code=400, detail="run_ids 不能为空")
 
-    all_experiments = list_experiments(DEFAULT_TRACKING_DIR)
+    tracking_dir = _get_user_tracking_dir(user_id)
+    all_experiments = list_experiments(tracking_dir)
 
     runs = []
     experiment_name = None
     for run_id in request.run_ids:
         run = None
         for exp_name in all_experiments:
-            tracker = _get_tracker(exp_name)
+            tracker = _get_tracker(exp_name, user_id=user_id)
             run = tracker.get_run(run_id)
             if run:
                 experiment_name = exp_name
@@ -254,14 +272,17 @@ async def get_metric_curve(
     run_id: str,
     metric_name: str,
     experiment_name: Optional[str] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
+    user_id = current_user["user_id"]
     if experiment_name:
-        tracker = _get_tracker(experiment_name)
+        tracker = _get_tracker(experiment_name, user_id=user_id)
         run = tracker.get_run(run_id)
     else:
         run = None
-        for exp_name in list_experiments(DEFAULT_TRACKING_DIR):
-            tracker = _get_tracker(exp_name)
+        tracking_dir = _get_user_tracking_dir(user_id)
+        for exp_name in list_experiments(tracking_dir):
+            tracker = _get_tracker(exp_name, user_id=user_id)
             run = tracker.get_run(run_id)
             if run:
                 break

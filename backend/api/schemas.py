@@ -589,3 +589,29 @@ class MetricCurveResponse(BaseModel):
     run_id: str
     metric_name: str
     points: List[MetricHistoryPoint]
+
+
+class UserRegisterRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=32, description="用户名")
+    password: str = Field(..., min_length=6, max_length=64, description="密码")
+    display_name: Optional[str] = Field(None, max_length=64, description="显示名称")
+
+
+class UserLoginRequest(BaseModel):
+    username: str = Field(..., description="用户名")
+    password: str = Field(..., description="密码")
+
+
+class UserInfoResponse(BaseModel):
+    user_id: str
+    username: str
+    display_name: str
+    created_at: Optional[str] = None
+
+
+class TokenResponse(BaseModel):
+    success: bool = True
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int = Field(description="Token 有效期（秒）")
+    user: UserInfoResponse

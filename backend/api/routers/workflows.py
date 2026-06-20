@@ -1,6 +1,7 @@
 import logging
+from typing import Dict, Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
 from schemas import (
     TaskSubmitResponse,
@@ -17,13 +18,15 @@ from services import (
     run_process_window,
     run_batch,
 )
+from auth import get_current_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/workflows", tags=["RET工作流"])
 
 
 @router.post("/opc", response_model=TaskSubmitResponse, summary="运行OPC工作流（光学邻近校正）")
-async def submit_opc(req: OPCRunRequest):
+async def submit_opc(req: OPCRunRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user["user_id"]
     payload = {
         "optical_system": req.optical_system.model_dump(),
         "opc_config": req.opc_config.model_dump(),
@@ -35,7 +38,7 @@ async def submit_opc(req: OPCRunRequest):
         "gds_pixel_size": req.gds_pixel_size,
         "gds_target_size": req.gds_target_size,
     }
-    task_id = run_opc(payload)
+    task_id = run_opc(payload, user_id=user_id)
     return TaskSubmitResponse(
         success=True,
         message="OPC工作流任务已提交",
@@ -46,7 +49,8 @@ async def submit_opc(req: OPCRunRequest):
 
 
 @router.post("/smo", response_model=TaskSubmitResponse, summary="运行SMO工作流（光源掩模协同优化）")
-async def submit_smo(req: SMORunRequest):
+async def submit_smo(req: SMORunRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user["user_id"]
     payload = {
         "optical_system": req.optical_system.model_dump(),
         "smo_config": req.smo_config.model_dump(),
@@ -58,7 +62,7 @@ async def submit_smo(req: SMORunRequest):
         "gds_pixel_size": req.gds_pixel_size,
         "gds_target_size": req.gds_target_size,
     }
-    task_id = run_smo(payload)
+    task_id = run_smo(payload, user_id=user_id)
     return TaskSubmitResponse(
         success=True,
         message="SMO工作流任务已提交",
@@ -69,7 +73,8 @@ async def submit_smo(req: SMORunRequest):
 
 
 @router.post("/ilt", response_model=TaskSubmitResponse, summary="运行ILT工作流（反演光刻技术）")
-async def submit_ilt(req: ILTRunRequest):
+async def submit_ilt(req: ILTRunRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user["user_id"]
     payload = {
         "optical_system": req.optical_system.model_dump(),
         "ilt_config": req.ilt_config.model_dump(),
@@ -81,7 +86,7 @@ async def submit_ilt(req: ILTRunRequest):
         "gds_pixel_size": req.gds_pixel_size,
         "gds_target_size": req.gds_target_size,
     }
-    task_id = run_ilt(payload)
+    task_id = run_ilt(payload, user_id=user_id)
     return TaskSubmitResponse(
         success=True,
         message="ILT工作流任务已提交",
@@ -92,7 +97,8 @@ async def submit_ilt(req: ILTRunRequest):
 
 
 @router.post("/process-window", response_model=TaskSubmitResponse, summary="运行工艺窗口分析")
-async def submit_process_window(req: ProcessWindowRunRequest):
+async def submit_process_window(req: ProcessWindowRunRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user["user_id"]
     payload = {
         "optical_system": req.optical_system.model_dump(),
         "pattern_type": req.pattern_type,
@@ -109,7 +115,7 @@ async def submit_process_window(req: ProcessWindowRunRequest):
         "threshold": req.threshold,
         "save_visualizations": req.save_visualizations,
     }
-    task_id = run_process_window(payload)
+    task_id = run_process_window(payload, user_id=user_id)
     return TaskSubmitResponse(
         success=True,
         message="工艺窗口分析任务已提交",
@@ -120,7 +126,8 @@ async def submit_process_window(req: ProcessWindowRunRequest):
 
 
 @router.post("/batch", response_model=TaskSubmitResponse, summary="运行批处理优化")
-async def submit_batch(req: BatchOptimizationRequest):
+async def submit_batch(req: BatchOptimizationRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user["user_id"]
     payload = {
         "source": req.source,
         "layer": req.layer,
@@ -132,7 +139,7 @@ async def submit_batch(req: BatchOptimizationRequest):
         "output_dir": req.output_dir,
         "stop_on_first_failure": req.stop_on_first_failure,
     }
-    task_id = run_batch(payload)
+    task_id = run_batch(payload, user_id=user_id)
     return TaskSubmitResponse(
         success=True,
         message="批处理优化任务已提交",

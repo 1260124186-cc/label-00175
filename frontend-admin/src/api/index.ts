@@ -1,4 +1,4 @@
-import axios, { AxiosInstance, AxiosRequestConfig } from 'axios'
+import axios, { AxiosInstance, AxiosRequestConfig, AxiosResponse, InternalAxiosRequestConfig } from 'axios'
 import { ElMessage } from 'element-plus'
 import type { SimulationConfig } from '@/types/config'
 import type {
@@ -17,14 +17,84 @@ import type {
   TaskResultResponse,
 } from '@/types/workflow'
 
+const TOKEN_KEY = 'litho_auth_token'
+const USER_KEY = 'litho_auth_user'
+
 const service: AxiosInstance = axios.create({
   baseURL: '/',
   timeout: 30000,
 })
 
+function getStoredToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY)
+}
+
+function setStoredToken(token: string) {
+  localStorage.setItem(TOKEN_KEY, token)
+}
+
+function clearStoredAuth() {
+  localStorage.removeItem(TOKEN_KEY)
+  localStorage.removeItem(USER_KEY)
+}
+
+function getStoredUser(): UserInfo | null {
+  const raw = localStorage.getItem(USER_KEY)
+  if (!raw) return null
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return null
+  }
+}
+
+function setStoredUser(user: UserInfo) {
+  localStorage.setItem(USER_KEY, JSON.stringify(user))
+}
+
+export interface UserInfo {
+  user_id: string
+  username: string
+  display_name: string
+}
+
+export interface AuthState {
+  token: string | null
+  user: UserInfo | null
+  isAuthenticated: boolean
+}
+
+export function getAuthState(): AuthState {
+  const token = getStoredToken()
+  const user = getStoredUser()
+  return {
+    token,
+    user,
+    isAuthenticated: !!token && !!user,
+  }
+}
+
+service.interceptors.request.use(
+  (config: InternalAxiosRequestConfig) => {
+    const token = getStoredToken()
+    if (token && config.headers) {
+      config.headers.Authorization = `Bearer ${token}`
+    }
+    return config
+  },
+  (error) => Promise.reject(error)
+)
+
 service.interceptors.response.use(
   (response) => response.data,
   (error) => {
+    if (error?.response?.status === 401) {
+      clearStoredAuth()
+      const currentPath = window.location.pathname
+      if (!currentPath.includes('/login')) {
+        window.location.href = '/login'
+      }
+    }
     console.error('Request error:', error)
     ElMessage.error(error?.response?.data?.detail || error.message || '请求失败')
     return Promise.reject(error)
@@ -37,6 +107,36 @@ export interface ApiResponse<T = any> {
   config?: T
   data?: T
   [key: string]: any
+}
+
+export const authApi = {
+  register: (username: string, password: string, displayName?: string) =>
+    service.post<any, any>('/api/auth/register', {
+      username,
+      password,
+      display_name: displayName || null,
+    }),
+
+  login: async (username: string, password: string): Promise<AuthState> => {
+    const res = await service.post<any, any>('/api/auth/login', {
+      username,
+      password,
+    })
+    setStoredToken(res.access_token)
+    setStoredUser(res.user)
+    return {
+      token: res.access_token,
+      user: res.user,
+      isAuthenticated: true,
+    }
+  },
+
+  logout: () => {
+    clearStoredAuth()
+  },
+
+  me: () =>
+    service.get<any, any>('/api/auth/me'),
 }
 
 export const configApi = {
