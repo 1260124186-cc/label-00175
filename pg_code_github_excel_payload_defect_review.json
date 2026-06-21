@@ -1,0 +1,14 @@
+{
+  "repo_id": "label-00175",
+  "trae_session_id": ".538128058159683:defa39f780cb85cbf69c92e56c9127a1_6a36b07ab9d68543d277a16c.6a36b1bdb9d68543d277a1ce.6a36b1bd4f193b1e99776c7b:Trae CN.T(2026/6/20 23:29:01)",
+  "user_prompt": "实现掩模缺陷打印性分析模块。新建 backend/defect/，支持在掩模指定位置注入点缺陷、线缺陷或污染斑，仿真其对晶圆成像的影响，计算缺陷诱导 CD 变化与失效概率，输出缺陷敏感度排序表，供掩模检测规格制定参考。",
+  "repo_url": "https://github.com/1260124186-cc/label-00175",
+  "commit_id": "33fbfaf0d98d37a70d8d624c5fef00531a28b731",
+  "task_type": "Feature迭代",
+  "business_domain": "科学计算",
+  "change_scope": "模块内多文件",
+  "task_difficulty": "一般",
+  "task_completed": "完成了任务",
+  "satisfaction": "满意",
+  "dissatisfaction_reason": ""
+}

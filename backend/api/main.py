@@ -21,6 +21,7 @@ from routers.websocket import router as websocket_router
 from routers.gds import router as gds_router
 from routers.experiments import router as experiments_router
 from routers.auth import router as auth_router
+from advisor.api import router as advisor_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,6 +51,7 @@ app.include_router(tasks_router)
 app.include_router(websocket_router)
 app.include_router(gds_router)
 app.include_router(experiments_router)
+app.include_router(advisor_router)
 
 
 @app.get("/", summary="根路径 - 跳转到 API 文档")
@@ -75,6 +77,7 @@ async def health_check():
             "experiment_tracking",
             "jwt_auth",
             "multi_tenant",
+            "ret_advisor",
         ],
     }
 

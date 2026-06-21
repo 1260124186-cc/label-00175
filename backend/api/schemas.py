@@ -615,3 +615,51 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
     expires_in: int = Field(description="Token 有效期（秒）")
     user: UserInfoResponse
+
+
+class RETRecommendRequest(BaseModel):
+    optical_system: OpticalSystem = Field(default_factory=OpticalSystem)
+    pattern_type: str = Field("line_space", description="版图类型: line_space, contact_hole, l_shaped_corner, t_junction, sram_bitcell")
+    pattern_params: Dict[str, Any] = Field(
+        default_factory=lambda: {"size": [128, 128], "cd": 45.0, "pitch": 90.0},
+        description="版图参数：cd(关键尺寸nm), pitch(间距nm), size(网格尺寸)"
+    )
+    user_preference: Optional[str] = Field(
+        None,
+        description="用户偏好: speed(速度优先), quality(质量优先), balanced(平衡)"
+    )
+
+    @field_validator("user_preference")
+    @classmethod
+    def validate_preference(cls, v):
+        if v is None:
+            return v
+        valid = ["speed", "quality", "balanced"]
+        if v not in valid:
+            raise ValueError(f"用户偏好必须为以下之一: {valid}")
+        return v
+
+
+class RETRecommendFromFeaturesRequest(BaseModel):
+    features: Dict[str, Any] = Field(
+        ...,
+        description=(
+            "版图特征字典，必需键: min_cd_nm, corner_density, periodicity_score. "
+            "可选键: dominant_pitch_nm, duty_cycle, fill_ratio, "
+            "spectral (dict: high_freq_energy_ratio 等), "
+            "technology_node, wavelength, na, pixel_size, image_shape"
+        )
+    )
+    user_preference: Optional[str] = Field(
+        None,
+        description="用户偏好: speed(速度优先), quality(质量优先), balanced(平衡)"
+    )
+
+
+class RETRecommendResponse(BaseModel):
+    success: bool = True
+    message: str = "RET 策略推荐完成"
+    recommendation: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="推荐结果，含 primary(主推荐), alternatives(备选), features(特征), warnings(警告)"
+    )
