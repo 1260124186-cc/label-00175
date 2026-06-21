@@ -24,6 +24,12 @@ const routes: RouteRecordRaw[] = [
         name: 'Workflow',
         component: () => import('@/views/WorkflowPage.vue'),
         meta: { title: 'RET 工作流', icon: 'SetUp' }
+      },
+      {
+        path: 'mask-editor',
+        name: 'MaskEditor',
+        component: () => import('@/views/MaskCanvasPage.vue'),
+        meta: { title: '掩模编辑器', icon: 'Grid' }
       }
     ]
   }

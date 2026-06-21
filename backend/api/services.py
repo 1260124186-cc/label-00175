@@ -367,6 +367,7 @@ def _build_optical_system(opt_sys_cfg: Dict[str, Any]):
 
 def _create_test_pattern(pattern_type: str, pattern_params: Dict[str, Any]):
     from utils.data_io import create_test_pattern
+    import numpy as np
 
     raw_size = pattern_params.get("size", [64, 64])
     if not isinstance(raw_size, (list, tuple)) or len(raw_size) < 2:
@@ -377,6 +378,22 @@ def _create_test_pattern(pattern_type: str, pattern_params: Dict[str, Any]):
     except (TypeError, ValueError):
         size_h, size_w = 64, 64
     size = (size_h, size_w)
+
+    if pattern_type == "custom_mask":
+        custom_mask = pattern_params.get("custom_mask")
+        if custom_mask is not None:
+            try:
+                mask_array = np.array(custom_mask, dtype=np.float64)
+                if mask_array.ndim == 2:
+                    from scipy.ndimage import zoom
+                    if mask_array.shape != size:
+                        sy = size_h / mask_array.shape[0]
+                        sx = size_w / mask_array.shape[1]
+                        mask_array = zoom(mask_array, (sy, sx), order=1)
+                    return mask_array.astype(np.float32)
+            except (ValueError, TypeError):
+                pass
+        return np.zeros(size, dtype=np.float32)
 
     def _int_or_none(v, max_val):
         if v is None:
@@ -400,7 +417,6 @@ def _create_test_pattern(pattern_type: str, pattern_params: Dict[str, Any]):
         y_start=y_start,
         y_end=y_end,
     )
-    import numpy as np
     if target_pattern is None or not hasattr(target_pattern, "shape"):
         target_pattern = np.zeros(size, dtype=np.float32)
     return target_pattern
@@ -664,18 +680,37 @@ def _execute_simulation(task_id: str):
         # ============================================================
         # 3. 生成测试图案
         # ============================================================
-        target_pattern = create_test_pattern(
-            pattern_type,
-            size=size,
-            x_start=x_start,
-            x_end=x_end,
-            y_start=y_start,
-            y_end=y_end
-        )
-        # 兜底：任何异常都返回 0 数组
-        if target_pattern is None or not hasattr(target_pattern, "shape"):
-            import numpy as np
-            target_pattern = np.zeros(size, dtype=np.float32)
+        import numpy as np
+        if pattern_type == "custom_mask":
+            custom_mask = pattern_params.get("custom_mask")
+            if custom_mask is not None:
+                try:
+                    target_pattern = np.array(custom_mask, dtype=np.float64)
+                    if target_pattern.ndim == 2:
+                        from scipy.ndimage import zoom
+                        if target_pattern.shape != size:
+                            sy = size_h / target_pattern.shape[0]
+                            sx = size_w / target_pattern.shape[1]
+                            target_pattern = zoom(target_pattern, (sy, sx), order=1)
+                        target_pattern = target_pattern.astype(np.float32)
+                    else:
+                        target_pattern = np.zeros(size, dtype=np.float32)
+                except (ValueError, TypeError):
+                    target_pattern = np.zeros(size, dtype=np.float32)
+            else:
+                target_pattern = np.zeros(size, dtype=np.float32)
+        else:
+            target_pattern = create_test_pattern(
+                pattern_type,
+                size=size,
+                x_start=x_start,
+                x_end=x_end,
+                y_start=y_start,
+                y_end=y_end
+            )
+            # 兜底：任何异常都返回 0 数组
+            if target_pattern is None or not hasattr(target_pattern, "shape"):
+                target_pattern = np.zeros(size, dtype=np.float32)
 
         task["progress"] = 60
 

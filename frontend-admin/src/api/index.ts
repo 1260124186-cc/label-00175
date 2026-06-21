@@ -163,6 +163,17 @@ export const simulationApi = {
   run: (config: SimulationConfig, patternType: string = 'rectangle', patternParams: Record<string, any> = {}) =>
     service.post<any, ApiResponse>('/api/simulation/run', { config, pattern_type: patternType, pattern_params: patternParams }),
 
+  runWithCustomMask: (config: SimulationConfig, maskData: number[][], pupilData?: number[][] | null) =>
+    service.post<any, any>('/api/simulation/run', {
+      config,
+      pattern_type: 'custom_mask',
+      pattern_params: {
+        size: [maskData.length, maskData[0]?.length || 0],
+        custom_mask: maskData,
+        custom_pupil: pupilData || null
+      }
+    }),
+
   listTasks: () =>
     service.get<any, any>('/api/simulation/tasks'),
 
