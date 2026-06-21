@@ -1,0 +1,183 @@
+{{- if .Values.celeryWorker.enabled -}}
+{{- $fullName := include "litho-sim.fullname" . -}}
+{{- $component := "celery-worker" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullName }}-celery-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "litho-sim.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  {{- if not .Values.celeryWorker.keda.enabled }}
+  replicas: {{ .Values.celeryWorker.replicas }}
+  {{- end }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "litho-sim.componentLabels" (dict "component" $component "Release" .Release "Chart" .Chart "Values" .Values) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "litho-sim.componentLabels" (dict "component" $component "Release" .Release "Chart" .Chart "Values" .Values) | nindent 8 }}
+        {{- if .Values.celeryWorker.gpu.enabled }}
+        node-role.kubernetes.io/worker-gpu: "true"
+        {{- end }}
+      {{- with .Values.celeryWorker.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.celeryWorker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.celeryWorker.gpu.enabled }}
+      nodeSelector:
+        {{- toYaml .Values.celeryWorker.gpu.nodeSelector | nindent 8 }}
+      {{- end }}
+      {{- with .Values.celeryWorker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.celeryWorker.gpu.enabled }}
+      tolerations:
+        {{- include "litho-sim.gpu.tolerations" . | nindent 8 }}
+      {{- end }}
+      affinity:
+        {{- toYaml .Values.celeryWorker.affinity | nindent 8 }}
+        {{- if .Values.celeryWorker.gpu.enabled }}
+        {{- include "litho-sim.gpu.affinity" . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.celeryWorker.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "litho-sim.serviceAccountName" . }}
+      containers:
+        - name: celery-worker
+          image: {{ include "litho-sim.image" (dict "Values" .Values "image" .Values.celeryWorker.image) }}
+          imagePullPolicy: {{ include "litho-sim.imagePullPolicy" (dict "Values" .Values "image" .Values.celeryWorker.image) }}
+          command:
+            - sh
+            - -c
+            - |
+              celery -A pipeline.batch_runner.celery_app \
+                worker \
+                -Q ${CELERY_QUEUE:-litho_batch} \
+                --concurrency=${CELERY_CONCURRENCY:-2} \
+                --loglevel=INFO \
+                --hostname=worker@%h \
+                --pool=prefork \
+                --task-events \
+                --without-mingle \
+                --without-gossip
+          ports:
+            - name: celery
+              containerPort: 5555
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.celeryWorker.resources | nindent 12 }}
+            {{- if .Values.celeryWorker.gpu.enabled }}
+            {{- include "litho-sim.gpu.resources" . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.celeryWorker.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.celeryWorker.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.celeryWorker.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - sh
+                  - -c
+                  - "celery -A pipeline.batch_runner.celery_app control shutdown && sleep 30"
+          env:
+            - name: PYTHONPATH
+              value: "/app"
+            - name: NUMBA_CACHE_DIR
+              value: "/tmp/numba_cache"
+            - name: TZ
+              value: {{ .Values.global.timezone | quote }}
+            - name: CELERY_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $fullName }}-secrets
+                  key: celeryBrokerUrl
+            - name: CELERY_RESULT_BACKEND
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $fullName }}-secrets
+                  key: celeryResultBackend
+            - name: CELERY_QUEUE
+              value: {{ .Values.celeryWorker.queueName | quote }}
+            - name: CELERY_CONCURRENCY
+              value: {{ .Values.celeryWorker.concurrency | quote }}
+            - name: REDIS_HOST
+              value: {{ include "litho-sim.redis.host" . | quote }}
+            - name: REDIS_PORT
+              value: {{ include "litho-sim.redis.port" . | quote }}
+            {{- if .Values.celeryWorker.gpu.enabled }}
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+            - name: GPU_ENABLED
+              value: "true"
+            {{- end }}
+          volumeMounts:
+            - name: results
+              mountPath: /app/results
+              {{- if .Values.celeryWorker.persistence.subPath.results }}
+              subPath: {{ .Values.celeryWorker.persistence.subPath.results }}
+              {{- end }}
+            - name: layout-library
+              mountPath: /app/layout_library
+              readOnly: true
+              {{- if .Values.celeryWorker.persistence.subPath.layoutLibrary }}
+              subPath: {{ .Values.celeryWorker.persistence.subPath.layoutLibrary }}
+              {{- end }}
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+              {{- if .Values.celeryWorker.persistence.subPath.config }}
+              subPath: {{ .Values.celeryWorker.persistence.subPath.config }}
+              {{- end }}
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: results
+          {{- if .Values.celeryWorker.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.celeryWorker.persistence.existingClaim | default (printf "%s-%s" $fullName "worker-results") }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: layout-library
+          {{- if .Values.celeryWorker.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.celeryWorker.persistence.existingClaim | default (printf "%s-%s" $fullName "config") }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: config
+          {{- if .Values.celeryWorker.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.celeryWorker.persistence.existingClaim | default (printf "%s-%s" $fullName "config") }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+{{- end -}}

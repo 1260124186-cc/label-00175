@@ -1,0 +1,148 @@
+{{- if .Values.api.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "litho-sim.fullname" . }}-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "litho-sim.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  {{- if not .Values.api.autoscaling.enabled }}
+  replicas: {{ .Values.api.replicas }}
+  {{- end }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "litho-sim.componentLabels" (dict "component" "api" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "litho-sim.componentLabels" (dict "component" "api" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 8 }}
+      {{- with .Values.api.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.api.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.api.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.api.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.api.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "litho-sim.serviceAccountName" . }}
+      containers:
+        - name: api
+          image: {{ include "litho-sim.image" (dict "Values" .Values "image" .Values.api.image) }}
+          imagePullPolicy: {{ include "litho-sim.imagePullPolicy" (dict "Values" .Values "image" .Values.api.image) }}
+          ports:
+            - name: http-api
+              containerPort: {{ .Values.api.service.targetPort }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+          {{- with .Values.api.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.api.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.api.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: PYTHONPATH
+              value: {{ .Values.api.config.pythonPath | quote }}
+            - name: NUMBA_CACHE_DIR
+              value: {{ .Values.api.config.numbaCacheDir | quote }}
+            - name: TZ
+              value: {{ .Values.global.timezone | quote }}
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "litho-sim.fullname" . }}-secrets
+                  key: jwtSecret
+            - name: JWT_EXPIRE_HOURS
+              value: {{ .Values.global.jwtExpireHours | quote }}
+            - name: CELERY_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "litho-sim.fullname" . }}-secrets
+                  key: celeryBrokerUrl
+            - name: CELERY_RESULT_BACKEND
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "litho-sim.fullname" . }}-secrets
+                  key: celeryResultBackend
+            - name: CELERY_QUEUE
+              value: {{ .Values.celeryWorker.queueName | quote }}
+            - name: REDIS_HOST
+              value: {{ include "litho-sim.redis.host" . | quote }}
+            - name: REDIS_PORT
+              value: {{ include "litho-sim.redis.port" . | quote }}
+          volumeMounts:
+            - name: results
+              mountPath: /app/results
+              {{- if .Values.api.persistence.subPath.results }}
+              subPath: {{ .Values.api.persistence.subPath.results }}
+              {{- end }}
+            - name: saved-configs
+              mountPath: /app/api/saved_configs
+              {{- if .Values.api.persistence.subPath.savedConfigs }}
+              subPath: {{ .Values.api.persistence.subPath.savedConfigs }}
+              {{- end }}
+            - name: auth-data
+              mountPath: /app/api/auth_data
+              {{- if .Values.api.persistence.subPath.authData }}
+              subPath: {{ .Values.api.persistence.subPath.authData }}
+              {{- end }}
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+      volumes:
+        - name: results
+          {{- if .Values.api.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.api.persistence.existingClaim | default (printf "%s-%s" (include "litho-sim.fullname" .) "results") }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: saved-configs
+          {{- if .Values.api.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.api.persistence.existingClaim | default (printf "%s-%s" (include "litho-sim.fullname" .) "results") }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: auth-data
+          {{- if .Values.api.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.api.persistence.existingClaim | default (printf "%s-%s" (include "litho-sim.fullname" .) "auth") }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: config
+          {{- if .Values.api.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.api.persistence.existingClaim | default (printf "%s-%s" (include "litho-sim.fullname" .) "config") }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- end -}}

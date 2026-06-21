@@ -1,0 +1,24 @@
+{{- if .Values.redis.enabled -}}
+{{- if not .Values.redis.useExternal -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "litho-sim.fullname" . }}-redis-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "litho-sim.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+data:
+  redis.conf: |
+    appendonly {{ .Values.redis.config.appendonly }}
+    appendfsync {{ .Values.redis.config.appendfsync }}
+    maxmemory {{ .Values.redis.config.maxmemory }}
+    maxmemory-policy {{ .Values.redis.config.maxmemoryPolicy }}
+    tcp-keepalive {{ .Values.redis.config.tcpKeepalive }}
+    timeout {{ .Values.redis.config.timeout }}
+    loglevel {{ .Values.redis.config.loglevel }}
+    {{- if .Values.redis.auth.enabled }}
+    requirepass {{ .Values.redis.auth.password }}
+    {{- end }}
+{{- end -}}
+{{- end -}}

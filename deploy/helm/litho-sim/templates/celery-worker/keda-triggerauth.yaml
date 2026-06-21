@@ -1,0 +1,15 @@
+{{- if and .Values.celeryWorker.enabled .Values.celeryWorker.keda.enabled -}}
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ include "litho-sim.fullname" . }}-celery-worker-trigger-auth
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "litho-sim.labels" . | nindent 4 }}
+    app.kubernetes.io/component: celery-worker
+spec:
+  secretTargetRef:
+    - parameter: password
+      name: {{ include "litho-sim.fullname" . }}-secrets
+      key: redisPassword
+{{- end -}}

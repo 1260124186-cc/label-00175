@@ -1,0 +1,19 @@
+{{- if and .Values.celeryWorker.enabled .Values.celeryWorker.service.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "litho-sim.fullname" . }}-celery-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "litho-sim.labels" . | nindent 4 }}
+    app.kubernetes.io/component: celery-worker
+spec:
+  type: {{ .Values.celeryWorker.service.type }}
+  ports:
+    - port: {{ .Values.celeryWorker.service.port }}
+      targetPort: 5555
+      protocol: TCP
+      name: celery-worker
+  selector:
+    {{- include "litho-sim.componentLabels" (dict "component" "celery-worker" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 4 }}
+{{- end -}}

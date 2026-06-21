@@ -1,0 +1,73 @@
+{{- if and .Values.celeryWorker.enabled .Values.celeryWorker.keda.enabled -}}
+{{- $fullName := include "litho-sim.fullname" . -}}
+{{- $component := "celery-worker" -}}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ $fullName }}-celery-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "litho-sim.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ $fullName }}-celery-worker
+  pollingInterval: {{ .Values.celeryWorker.keda.pollingInterval }}
+  cooldownPeriod: {{ .Values.celeryWorker.keda.cooldownPeriod }}
+  idleReplicaCount: 0
+  minReplicaCount: {{ .Values.celeryWorker.keda.minReplicaCount }}
+  maxReplicaCount: {{ .Values.celeryWorker.keda.maxReplicaCount }}
+  {{- if or .Values.celeryWorker.keda.scaleUp .Values.celeryWorker.keda.scaleDown }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        {{- with .Values.celeryWorker.keda.scaleDown }}
+        scaleDown:
+          stabilizationWindowSeconds: {{ .stabilizationWindowSeconds }}
+          policies:
+            {{- toYaml .policies | nindent 12 }}
+        {{- end }}
+        {{- with .Values.celeryWorker.keda.scaleUp }}
+        scaleUp:
+          stabilizationWindowSeconds: {{ .stabilizationWindowSeconds }}
+          policies:
+            {{- toYaml .policies | nindent 12 }}
+        {{- end }}
+  {{- end }}
+  triggers:
+    - type: redis
+      metadata:
+        host: {{ include "litho-sim.redis.host" . | quote }}
+        port: {{ include "litho-sim.redis.port" . | quote }}
+        username: ""
+        databaseIndex: "0"
+        listName: {{ .Values.celeryWorker.queueName | quote }}
+        listLength: {{ .Values.celeryWorker.keda.queueLength | quote }}
+        activationListLength: {{ .Values.celeryWorker.keda.activationQueueLength | quote }}
+        enableTLS: "false"
+      authenticationRef:
+        name: {{ $fullName }}-celery-worker-trigger-auth
+
+    {{- if .Values.celeryWorker.gpu.enabled }}
+    - type: cpu
+      metricType: Utilization
+      metadata:
+        value: "80"
+    - type: memory
+      metricType: Utilization
+      metadata:
+        value: "85"
+    {{- end }}
+
+    {{- if .Values.monitoring.enabled }}
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-operator-prometheus.monitoring.svc.cluster.local:9090
+        metricName: celery_tasks_pending
+        query: sum(celery_queue_length{queue="{{ .Values.celeryWorker.queueName }}"})
+        threshold: {{ .Values.celeryWorker.keda.queueLength | quote }}
+        activationThreshold: {{ .Values.celeryWorker.keda.activationQueueLength | quote }}
+    {{- end }}
+{{- end -}}

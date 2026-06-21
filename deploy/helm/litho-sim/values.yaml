@@ -1,0 +1,416 @@
+global:
+  imageRegistry: "docker.io/"
+  imagePullPolicy: IfNotPresent
+  storageClass: ""
+  timezone: "Asia/Shanghai"
+  jwtSecret: "change-me-in-production-litho-sim-2024"
+  jwtExpireHours: 24
+
+nameOverride: ""
+fullnameOverride: ""
+
+commonLabels:
+  app.kubernetes.io/part-of: litho-sim
+  app.kubernetes.io/managed-by: Helm
+
+api:
+  enabled: true
+  name: api
+  replicas: 2
+  image:
+    repository: litho-sim/api
+    tag: "2.1.0"
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 8000
+    targetPort: 8000
+  resources:
+    limits:
+      cpu: "4"
+      memory: "4Gi"
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+  livenessProbe:
+    httpGet:
+      path: /api/health
+      port: 8000
+    initialDelaySeconds: 40
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 5
+  readinessProbe:
+    httpGet:
+      path: /api/health
+      port: 8000
+    initialDelaySeconds: 20
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  persistence:
+    enabled: true
+    existingClaim: ""
+    accessMode: ReadWriteMany
+    size: 50Gi
+    subPath:
+      results: results
+      savedConfigs: api/saved_configs
+      authData: api/auth_data
+  config:
+    pythonPath: "/app"
+    numbaCacheDir: "/tmp/numba_cache"
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  podSecurityContext: {}
+  securityContext: {}
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts:
+      - host: api.litho-sim.local
+        paths:
+          - path: /
+            pathType: ImplementationSpecific
+    tls: []
+
+celeryWorker:
+  enabled: true
+  name: celery-worker
+  replicas: 2
+  concurrency: 4
+  queueName: "litho_batch"
+  image:
+    repository: litho-sim/backend
+    tag: "2.1.0"
+    pullPolicy: IfNotPresent
+  service:
+    enabled: true
+    type: ClusterIP
+    port: 5555
+  resources:
+    limits:
+      cpu: "8"
+      memory: "16Gi"
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+  livenessProbe:
+    exec:
+      command:
+        - sh
+        - -c
+        - "celery -A pipeline.batch_runner.celery_app inspect ping -d worker@$(hostname) 2>/dev/null | grep -q 'pong'"
+    initialDelaySeconds: 60
+    periodSeconds: 20
+    timeoutSeconds: 10
+    failureThreshold: 3
+  readinessProbe:
+    exec:
+      command:
+        - sh
+        - -c
+        - "celery -A pipeline.batch_runner.celery_app inspect ping -d worker@$(hostname) 2>/dev/null | grep -q 'pong'"
+    initialDelaySeconds: 40
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 3
+  persistence:
+    enabled: true
+    existingClaim: ""
+    accessMode: ReadWriteMany
+    size: 100Gi
+    subPath:
+      results: results
+      layoutLibrary: layout_library
+      config: config
+  env:
+    celeryBrokerUrl: "redis://:$(REDIS_PASSWORD)@$(REDIS_HOST):$(REDIS_PORT)/0"
+    celeryResultBackend: "redis://:$(REDIS_PASSWORD)@$(REDIS_HOST):$(REDIS_PORT)/1"
+  nodeSelector: {}
+  tolerations: []
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/component: celery-worker
+            topologyKey: kubernetes.io/hostname
+  podAnnotations: {}
+  podSecurityContext: {}
+  securityContext: {}
+  gpu:
+    enabled: false
+    type: "nvidia"
+    count: 1
+    nodeSelector:
+      nvidia.com/gpu.present: "true"
+    tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+  keda:
+    enabled: true
+    minReplicaCount: 1
+    maxReplicaCount: 50
+    pollingInterval: 10
+    cooldownPeriod: 300
+    queueLength: 10
+    activationQueueLength: 1
+    redisAddressFromEnv: "CELERY_BROKER_URL"
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+
+redis:
+  enabled: true
+  useExternal: false
+  external:
+    host: ""
+    port: 6379
+    password: ""
+  name: redis
+  architecture: standalone
+  auth:
+    enabled: true
+    password: "redis-litho-sim-password"
+  image:
+    registry: docker.io
+    repository: library/redis
+    tag: "7-alpine"
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 6379
+  persistence:
+    enabled: true
+    existingClaim: ""
+    accessMode: ReadWriteOnce
+    size: 10Gi
+    storageClass: ""
+  resources:
+    limits:
+      cpu: "2"
+      memory: "1Gi"
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+  config:
+    appendonly: "yes"
+    appendfsync: "everysec"
+    maxmemory: "512mb"
+    maxmemoryPolicy: "allkeys-lru"
+    tcpKeepalive: "60"
+    timeout: "300"
+    loglevel: "notice"
+  livenessProbe:
+    exec:
+      command:
+        - sh
+        - -c
+        - "redis-cli ping | grep -q PONG"
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 5
+  readinessProbe:
+    exec:
+      command:
+        - sh
+        - -c
+        - "redis-cli ping | grep -q PONG"
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  podSecurityContext: {}
+  securityContext: {}
+
+frontend:
+  enabled: true
+  name: frontend
+  replicas: 2
+  image:
+    repository: litho-sim/frontend
+    tag: "2.1.0"
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 80
+    targetPort: 80
+  resources:
+    limits:
+      cpu: "2"
+      memory: "1Gi"
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+  livenessProbe:
+    httpGet:
+      path: /
+      port: 80
+    initialDelaySeconds: 5
+    periodSeconds: 15
+    timeoutSeconds: 3
+    failureThreshold: 5
+  readinessProbe:
+    httpGet:
+      path: /
+      port: 80
+    initialDelaySeconds: 3
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  ingress:
+    enabled: true
+    className: "nginx"
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      nginx.ingress.kubernetes.io/ssl-redirect: "false"
+      nginx.ingress.kubernetes.io/use-regex: "true"
+      nginx.ingress.kubernetes.io/rewrite-target: /$1
+      nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+      nginx.ingress.kubernetes.io/proxy-connect-timeout: "300"
+      nginx.ingress.kubernetes.io/websocket-services: "litho-sim-api"
+    hosts:
+      - host: litho-sim.local
+        paths:
+          - path: /?(.*)
+            pathType: ImplementationSpecific
+          - path: /api/?(.*)
+            pathType: ImplementationSpecific
+          - path: /ws/?(.*)
+            pathType: ImplementationSpecific
+    tls: []
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  podSecurityContext: {}
+  securityContext: {}
+
+flower:
+  enabled: true
+  name: flower
+  replicas: 1
+  image:
+    repository: litho-sim/backend
+    tag: "2.1.0"
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 5555
+  ingress:
+    enabled: true
+    className: "nginx"
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      nginx.ingress.kubernetes.io/auth-type: basic
+      nginx.ingress.kubernetes.io/auth-secret: litho-sim-flower-auth
+      nginx.ingress.kubernetes.io/auth-realm: 'Flower Monitoring'
+    hosts:
+      - host: flower.litho-sim.local
+        paths:
+          - path: /
+            pathType: ImplementationSpecific
+    tls: []
+  resources:
+    limits:
+      cpu: "1"
+      memory: "512Mi"
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+  auth:
+    username: "admin"
+    password: "admin123"
+  livenessProbe:
+    httpGet:
+      path: /
+      port: 5555
+    initialDelaySeconds: 20
+    periodSeconds: 15
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readinessProbe:
+    httpGet:
+      path: /
+      port: 5555
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  podSecurityContext: {}
+  securityContext: {}
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+rbac:
+  create: true
+  pspEnabled: false
+
+networkPolicy:
+  enabled: false
+  ingressDenyAll: false
+  egressDenyAll: false
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+monitoring:
+  enabled: false
+  prometheus:
+    enabled: false
+    serviceMonitor:
+      enabled: false
+      interval: "30s"
+      scrapeTimeout: "10s"
+
+tests:
+  enabled: false

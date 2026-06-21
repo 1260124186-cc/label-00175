@@ -1,0 +1,22 @@
+{{- if .Values.podDisruptionBudget.enabled -}}
+{{- $componentNames := list "api" "celery-worker" "frontend" "redis" "flower" -}}
+{{- range $component := $componentNames -}}
+{{- $componentEnabled := index $.Values $component "enabled" | default true -}}
+{{- if $componentEnabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "litho-sim.fullname" $ }}-{{ $component }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "litho-sim.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  minAvailable: {{ $.Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "litho-sim.componentLabels" (dict "component" $component "Release" $.Release "Chart" $.Chart "Values" $.Values) | nindent 6 }}
+{{- end }}
+{{- end }}
+{{- end }}

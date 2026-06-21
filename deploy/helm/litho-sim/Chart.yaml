@@ -1,0 +1,30 @@
+apiVersion: v2
+name: litho-sim
+description: 计算光刻仿真云原生部署套件 - 支持弹性伸缩的分布式仿真平台
+type: application
+version: 2.1.0
+appVersion: "2.1.0"
+kubeVersion: ">=1.24.0-0"
+keywords:
+  - lithography
+  - simulation
+  - semiconductor
+  - opc
+  - smo
+  - ret
+  - celery
+  - keda
+home: https://github.com/litho-sim/litho-sim
+sources:
+  - https://github.com/litho-sim/litho-sim
+maintainers:
+  - name: litho-sim-team
+    email: dev@litho-sim.io
+dependencies:
+  - name: redis
+    version: ">=18.0.0"
+    repository: https://charts.bitnami.com/bitnami
+    condition: redis.enabled
+annotations:
+  category: ScientificComputing
+  licenses: Apache-2.0

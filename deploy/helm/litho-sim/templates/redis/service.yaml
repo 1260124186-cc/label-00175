@@ -1,0 +1,21 @@
+{{- if .Values.redis.enabled -}}
+{{- if not .Values.redis.useExternal -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "litho-sim.fullname" . }}-redis
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "litho-sim.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  type: {{ .Values.redis.service.type }}
+  ports:
+    - port: {{ .Values.redis.service.port }}
+      targetPort: 6379
+      protocol: TCP
+      name: redis
+  selector:
+    {{- include "litho-sim.componentLabels" (dict "component" "redis" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 4 }}
+{{- end -}}
+{{- end -}}

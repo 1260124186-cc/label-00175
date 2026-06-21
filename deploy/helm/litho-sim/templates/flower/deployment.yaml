@@ -1,0 +1,120 @@
+{{- if .Values.flower.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "litho-sim.fullname" . }}-flower
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "litho-sim.labels" . | nindent 4 }}
+    app.kubernetes.io/component: flower
+spec:
+  replicas: {{ .Values.flower.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "litho-sim.componentLabels" (dict "component" "flower" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "litho-sim.componentLabels" (dict "component" "flower" "Release" .Release "Chart" .Chart "Values" .Values) | nindent 8 }}
+      {{- with .Values.flower.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.flower.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.flower.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.flower.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.flower.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "litho-sim.serviceAccountName" . }}
+      containers:
+        - name: flower
+          image: {{ include "litho-sim.image" (dict "Values" .Values "image" .Values.flower.image) }}
+          imagePullPolicy: {{ include "litho-sim.imagePullPolicy" (dict "Values" .Values "image" .Values.flower.image) }}
+          command:
+            - sh
+            - -c
+            - |
+              celery -A pipeline.batch_runner.celery_app flower \
+                --port=5555 \
+                --broker_api=${CELERY_BROKER_URL} \
+                --basic_auth=${FLOWER_AUTH} \
+                --persistent=True \
+                --db=/app/results/flower.db \
+                --loglevel=INFO
+          ports:
+            - name: flower
+              containerPort: 5555
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.flower.resources | nindent 12 }}
+          {{- with .Values.flower.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.flower.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.flower.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: PYTHONPATH
+              value: "/app"
+            - name: TZ
+              value: {{ .Values.global.timezone | quote }}
+            - name: CELERY_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "litho-sim.fullname" . }}-secrets
+                  key: celeryBrokerUrl
+            - name: CELERY_RESULT_BACKEND
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "litho-sim.fullname" . }}-secrets
+                  key: celeryResultBackend
+            - name: FLOWER_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "litho-sim.fullname" . }}-flower-auth
+                  key: auth
+            - name: FLOWER_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "litho-sim.fullname" . }}-flower-auth
+                  key: username
+            - name: FLOWER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "litho-sim.fullname" . }}-flower-auth
+                  key: password
+          volumeMounts:
+            - name: results
+              mountPath: /app/results
+      volumes:
+        - name: results
+          {{- if .Values.api.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.api.persistence.existingClaim | default (printf "%s-%s" (include "litho-sim.fullname" .) "results") }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- end -}}

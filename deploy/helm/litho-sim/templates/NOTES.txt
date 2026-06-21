@@ -1,0 +1,130 @@
+*********************************************************************
+**  计算光刻仿真云原生平台部署成功！ **
+*********************************************************************
+
+RELEASE NAME: {{ .Release.Name }}
+NAMESPACE: {{ .Release.Namespace }}
+CHART VERSION: {{ .Chart.Version }}
+APP VERSION: {{ .Chart.AppVersion }}
+
+*********************************************************************
+**  服务访问方式 **
+*********************************************************************
+
+1. 前端 Web 工作台
+{{- if .Values.frontend.ingress.enabled }}
+   域名: http{{ if .Values.frontend.ingress.tls }}s{{ end }}://{{ (index .Values.frontend.ingress.hosts 0).host }}
+{{- end }}
+   服务端口: kubectl port-forward svc/{{ include "litho-sim.fullname" . }}-frontend 8080:80
+   本地访问: http://localhost:8080
+
+2. REST API 文档
+   接口文档: http://localhost:8080/docs
+   健康检查: curl http://localhost:8080/api/health
+
+3. Celery Flower 监控面板
+{{- if .Values.flower.enabled }}
+{{- if .Values.flower.ingress.enabled }}
+   域名: http{{ if .Values.flower.ingress.tls }}s{{ end }}://{{ (index .Values.flower.ingress.hosts 0).host }}
+   用户名: {{ .Values.flower.auth.username }}
+   密码: {{ .Values.flower.auth.password }}
+{{- end }}
+   端口转发: kubectl port-forward svc/{{ include "litho-sim.fullname" . }}-flower 5555:5555
+{{- end }}
+
+*********************************************************************
+**  自动扩缩容配置 **
+*********************************************************************
+
+API 服务:
+  - 启用 HPA: {{ .Values.api.autoscaling.enabled }}
+  - 副本范围: {{ .Values.api.autoscaling.minReplicas }} ~ {{ .Values.api.autoscaling.maxReplicas }}
+  - 扩缩指标: CPU {{ .Values.api.autoscaling.targetCPUUtilizationPercentage }}%,
+              Memory {{ .Values.api.autoscaling.targetMemoryUtilizationPercentage }}%
+
+Celery Worker:
+  - 启用 KEDA: {{ .Values.celeryWorker.keda.enabled }}
+  - 副本范围: {{ .Values.celeryWorker.keda.minReplicaCount }} ~ {{ .Values.celeryWorker.keda.maxReplicaCount }}
+  - 队列阈值: 每 {{ .Values.celeryWorker.keda.queueLength }} 个任务扩容 1 个 Worker
+  - 轮询间隔: {{ .Values.celeryWorker.keda.pollingInterval }}s
+  - 冷却时间: {{ .Values.celeryWorker.keda.cooldownPeriod }}s
+
+GPU Worker:
+  - GPU 支持: {{ .Values.celeryWorker.gpu.enabled }}
+  - GPU 数量: {{ .Values.celeryWorker.gpu.count }}
+
+*********************************************************************
+**  Redis 连接信息 **
+*********************************************************************
+
+主服务: {{ include "litho-sim.redis.host" . }}:{{ include "litho-sim.redis.port" . }}
+Broker DB: 0
+Result DB: 1
+{{- if .Values.redis.auth.enabled }}
+密码已通过 Secret 注入
+{{- end }}
+
+*********************************************************************
+**  持久化存储 **
+*********************************************************************
+
+结果存储: PVC {{ include "litho-sim.fullname" . }}-results
+Redis 数据: PVC {{ include "litho-sim.fullname" . }}-redis
+配置文件: PVC {{ include "litho-sim.fullname" . }}-config
+
+*********************************************************************
+**  常用运维命令 **
+*********************************************************************
+
+查看所有 Pod:
+  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/part-of=litho-sim
+
+查看自动扩缩容状态:
+  kubectl get hpa -n {{ .Release.Namespace }}
+  kubectl get scaledobject -n {{ .Release.Namespace }}
+
+查看 Celery Worker 队列长度:
+  kubectl exec -it $(kubectl get pod -n {{ .Release.Namespace }} -l app.kubernetes.io/component=celery-worker -o jsonpath='{.items[0].metadata.name}') -- redis-cli -h {{ include "litho-sim.redis.host" . }} -a '{{ include "litho-sim.redis.password" . }}' llen celery
+
+扩容 Worker 手动:
+  kubectl scale deployment/{{ include "litho-sim.fullname" . }}-celery-worker --replicas=10 -n {{ .Release.Namespace }}
+
+查看日志:
+  API: kubectl logs -f -n {{ .Release.Namespace }} -l app.kubernetes.io/component=api
+  Worker: kubectl logs -f -n {{ .Release.Namespace }} -l app.kubernetes.io/component=celery-worker
+  Redis: kubectl logs -f -n {{ .Release.Namespace }} -l app.kubernetes.io/component=redis
+
+*********************************************************************
+**  升级/回滚 **
+*********************************************************************
+
+升级:
+  helm upgrade {{ .Release.Name }} deploy/helm/litho-sim -n {{ .Release.Namespace }} -f custom-values.yaml
+
+回滚:
+  helm rollback {{ .Release.Name }} -n {{ .Release.Namespace }}
+
+卸载:
+  helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}
+
+*********************************************************************
+**  注意事项 **
+*********************************************************************
+
+1. 生产环境请务必修改以下默认密码：
+   - global.jwtSecret
+   - redis.auth.password
+   - flower.auth.password
+
+2. 首次安装请等待所有 Pod 就绪后再访问：
+   watch kubectl get pods -n {{ .Release.Namespace }}
+
+3. KEDA 自动扩缩容需要先安装 KEDA Operator：
+   helm repo add kedacore https://kedacore.github.io/charts
+   helm repo update
+   helm install keda kedacore/keda --namespace keda --create-namespace
+
+4. 启用 GPU Worker 需要：
+   - 安装 NVIDIA GPU Operator
+   - 配置 nvidia.com/gpu 污点和标签的节点
+   - 设置 celeryWorker.gpu.enabled=true

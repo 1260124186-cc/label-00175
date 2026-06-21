@@ -1,0 +1,227 @@
+{{- if and .Values.celeryWorker.enabled .Values.celeryWorker.gpu.enabled -}}
+{{- $fullName := include "litho-sim.fullname" . -}}
+{{- $component := "celery-worker-gpu" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullName }}-celery-worker-gpu
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "litho-sim.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+    app.kubernetes.io/type: gpu
+spec:
+  {{- if not .Values.celeryWorker.keda.enabled }}
+  replicas: {{ .Values.celeryWorker.replicas }}
+  {{- end }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "litho-sim.componentLabels" (dict "component" $component "Release" .Release "Chart" .Chart "Values" .Values) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "litho-sim.componentLabels" (dict "component" $component "Release" .Release "Chart" .Chart "Values" .Values) | nindent 8 }}
+        app.kubernetes.io/type: gpu
+      annotations:
+        {{- with .Values.celeryWorker.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      nodeSelector:
+        {{- toYaml .Values.celeryWorker.gpu.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.celeryWorker.gpu.tolerations | nindent 8 }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              {{- range $key, $value := .Values.celeryWorker.gpu.nodeSelector }}
+              - key: {{ $key | quote }}
+                operator: In
+                values:
+                - {{ $value | quote }}
+              {{- end }}
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/component: {{ $component }}
+              topologyKey: kubernetes.io/hostname
+      {{- with .Values.celeryWorker.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "litho-sim.serviceAccountName" . }}
+      containers:
+        - name: celery-worker-gpu
+          image: {{ include "litho-sim.image" (dict "Values" .Values "image" .Values.celeryWorker.image) }}
+          imagePullPolicy: {{ include "litho-sim.imagePullPolicy" (dict "Values" .Values "image" .Values.celeryWorker.image) }}
+          command:
+            - sh
+            - -c
+            - |
+              celery -A pipeline.batch_runner.celery_app \
+                worker \
+                -Q ${CELERY_QUEUE:-litho_batch}_gpu \
+                --concurrency=${CELERY_CONCURRENCY:-1} \
+                --loglevel=INFO \
+                --hostname=worker-gpu@%h \
+                --pool=prefork \
+                --task-events \
+                --without-mingle \
+                --without-gossip
+          resources:
+            limits:
+              cpu: {{ .Values.celeryWorker.resources.limits.cpu | quote }}
+              memory: {{ .Values.celeryWorker.resources.limits.memory | quote }}
+              {{- toYaml .Values.celeryWorker.gpu.resources.limits | nindent 14 }}
+            requests:
+              cpu: {{ .Values.celeryWorker.resources.requests.cpu | quote }}
+              memory: {{ .Values.celeryWorker.resources.requests.memory | quote }}
+              {{- toYaml .Values.celeryWorker.gpu.resources.requests | default dict | nindent 14 }}
+          {{- with .Values.celeryWorker.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.celeryWorker.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.celeryWorker.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - sh
+                  - -c
+                  - "celery -A pipeline.batch_runner.celery_app control shutdown && sleep 60"
+          env:
+            - name: PYTHONPATH
+              value: "/app"
+            - name: NUMBA_CACHE_DIR
+              value: "/tmp/numba_cache"
+            - name: TZ
+              value: {{ .Values.global.timezone | quote }}
+            - name: CELERY_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $fullName }}-secrets
+                  key: celeryBrokerUrl
+            - name: CELERY_RESULT_BACKEND
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $fullName }}-secrets
+                  key: celeryResultBackend
+            - name: CELERY_QUEUE
+              value: {{ printf "%s_gpu" .Values.celeryWorker.queueName | quote }}
+            - name: CELERY_CONCURRENCY
+              value: "1"
+            - name: REDIS_HOST
+              value: {{ include "litho-sim.redis.host" . | quote }}
+            - name: REDIS_PORT
+              value: {{ include "litho-sim.redis.port" . | quote }}
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+            - name: GPU_ENABLED
+              value: "true"
+            - name: GPU_TYPE
+              value: {{ .Values.celeryWorker.gpu.type | quote }}
+            - name: NUMBA_ENABLE_CUDASIM
+              value: "0"
+          volumeMounts:
+            - name: results
+              mountPath: /app/results
+            - name: layout-library
+              mountPath: /app/layout_library
+              readOnly: true
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: results
+          {{- if .Values.celeryWorker.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.celeryWorker.persistence.existingClaim | default (printf "%s-%s" $fullName "worker-results") }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: layout-library
+          {{- if .Values.celeryWorker.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.celeryWorker.persistence.existingClaim | default (printf "%s-%s" $fullName "config") }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: config
+          {{- if .Values.celeryWorker.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.celeryWorker.persistence.existingClaim | default (printf "%s-%s" $fullName "config") }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+---
+{{- if .Values.celeryWorker.keda.enabled }}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ $fullName }}-celery-worker-gpu
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "litho-sim.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+    app.kubernetes.io/type: gpu
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ $fullName }}-celery-worker-gpu
+  pollingInterval: {{ .Values.celeryWorker.keda.pollingInterval }}
+  cooldownPeriod: 600
+  idleReplicaCount: 0
+  minReplicaCount: 0
+  maxReplicaCount: 10
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 600
+          policies:
+            - type: Percent
+              value: 50
+              periodSeconds: 120
+        scaleUp:
+          stabilizationWindowSeconds: 60
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60
+  triggers:
+    - type: redis
+      metadata:
+        host: {{ include "litho-sim.redis.host" . | quote }}
+        port: {{ include "litho-sim.redis.port" . | quote }}
+        username: ""
+        databaseIndex: "0"
+        listName: {{ printf "%s_gpu" .Values.celeryWorker.queueName | quote }}
+        listLength: "1"
+        activationListLength: "1"
+        enableTLS: "false"
+      authenticationRef:
+        name: {{ $fullName }}-celery-worker-trigger-auth
+{{- end }}
+{{- end -}}
