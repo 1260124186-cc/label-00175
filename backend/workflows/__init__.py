@@ -66,6 +66,19 @@ try:
         HybridOPCILTWorkflow,
         run_hybrid_opc_ilt_workflow,
     )
+
+    from workflows.mpc_opc import (
+        MPCConfig,
+        PredictionResult,
+        MPCOptimizationResult,
+        MPCOPCIterationResult,
+        MPCOPCWorkflowResult,
+        EPEPredictor,
+        ProcessDriftEstimator,
+        MPCOptimizer,
+        MPCOPCWorkflow,
+        run_mpc_opc_workflow,
+    )
 except ImportError:
     from .opc import (
         OPCConfig,
@@ -124,6 +137,19 @@ except ImportError:
         run_hybrid_opc_ilt_workflow,
     )
 
+    from .mpc_opc import (
+        MPCConfig,
+        PredictionResult,
+        MPCOptimizationResult,
+        MPCOPCIterationResult,
+        MPCOPCWorkflowResult,
+        EPEPredictor,
+        ProcessDriftEstimator,
+        MPCOptimizer,
+        MPCOPCWorkflow,
+        run_mpc_opc_workflow,
+    )
+
 __all__ = [
     'OPCConfig',
     'HotspotDetector',
@@ -170,4 +196,14 @@ __all__ = [
     'LocalILTOptimizer',
     'HybridOPCILTWorkflow',
     'run_hybrid_opc_ilt_workflow',
+    'MPCConfig',
+    'PredictionResult',
+    'MPCOptimizationResult',
+    'MPCOPCIterationResult',
+    'MPCOPCWorkflowResult',
+    'EPEPredictor',
+    'ProcessDriftEstimator',
+    'MPCOptimizer',
+    'MPCOPCWorkflow',
+    'run_mpc_opc_workflow',
 ]
