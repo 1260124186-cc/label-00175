@@ -1,0 +1,87 @@
+# -*- coding: utf-8 -*-
+"""
+插件配置文件模板
+
+放置在项目根目录或任意位置，通过
+    manager.load_from_file("plugins_config.yaml")
+加载。也可只传字典给 manager.load_from_dict({...})。
+
+支持的顶层键名 (两者等价):
+  - plugins:                 # 推荐写法
+  - imaging_backends: ...    # 直接在顶层写也行
+
+插件注册按优先级排序；若出现同名插件，高优先级会覆盖低优先级。
+"""
+
+plugins:
+
+  # ============================================================
+  # 成像后端
+  # ============================================================
+  imaging_backends:
+    # 自定义成像模型
+    simple_abbe:
+      enabled: true
+      class: "plugins.examples.custom_plugins:SimpleAbbeImaging"
+      config:
+        # 该插件配置项会合并到插件实例中
+        logging_verbose: true
+
+    # 一个"虚拟"的第三方 RCWA 严格电磁仿真插件
+    # 注意：这个示例 class 路径不存在，仅作语法示范
+    # rcwa_2d:
+    #   enabled: false
+    #   class: "my_rcwa_plugin.imaging:RCWA2DImagingBackend"
+    #   config:
+    #     max_diffraction_order: 12
+    #     polarization: "TE"
+
+  # ============================================================
+  # 优化器
+  # ============================================================
+  optimizers:
+    # 自定义 Heavy-Ball 动量优化器
+    heavy_ball:
+      enabled: true
+      class: "plugins.examples.custom_plugins:HeavyBallOptimizer"
+      config:
+        alpha: 0.005
+        beta: 0.92
+
+    # 另一个示例：对内置 bfgs 做参数默认覆盖（同名时 register_config 优先级）
+    # bfgs:
+    #   enabled: true
+    #   class: "plugins.builtin:BuiltinBFGSOptimizer"
+    #   config:
+    #     max_iter: 400
+    #     tol: 1e-8
+
+  # ============================================================
+  # 损失函数
+  # ============================================================
+  loss_functions:
+    # 自定义鲁棒 L1 损失
+    robust_l1:
+      enabled: true
+      class: "plugins.examples.custom_plugins:RobustL1Loss"
+      config:
+        epsilon: 0.005
+
+  # ============================================================
+  # 工作流
+  # ============================================================
+  workflows:
+    # 多分辨率工作流示例
+    multires:
+      enabled: true
+      class: "plugins.examples.custom_plugins:MultiResWorkflow"
+      config:
+        levels: 3
+        iters_per_level: 80
+
+    # 示例：使用第三方校准工作流
+    # custom_calibration:
+    #   enabled: false
+    #   class: "my_calib.workflow:CalibrationWorkflow"
+    #   config:
+    #     mode: "bayesian"
