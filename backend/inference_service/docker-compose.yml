@@ -1,0 +1,136 @@
+# ========================================================================
+# 产线推理微服务 - Docker Compose 编排
+# ========================================================================
+# 包含:
+#   1. inference-service:   推理服务 (gRPC + HTTP)
+#   2. prometheus:          指标采集 (可选
+#   3. grafana:             可视化仪表盘 (可选)
+#
+# 启动:
+#   docker-compose up -d
+#
+# 仅启动推理服务:
+#   docker-compose up -d inference-service
+# ========================================================================
+
+version: "3.9"
+
+x-inference-env: &inference-env
+  # 服务
+  LITHO_INF_SERVICE_NAME: litho-inference-service
+  LITHO_INF_ENVIRONMENT: production
+  # 引擎
+  LITHO_INF_ENGINE_TYPE: hopkins_lite   # 改为 surrogate 使用代理模型
+  LITHO_INF_MODEL_DIR: /models
+  LITHO_INF_DEVICE: auto
+  # gRPC
+  LITHO_INF_GRPC_ENABLED: "true"
+  LITHO_INF_GRPC_HOST: 0.0.0.0
+  LITHO_INF_GRPC_PORT: 50051
+  LITHO_INF_GRPC_API_KEY: ${GRPC_API_KEY:-}
+  # HTTP
+  LITHO_INF_HTTP_ENABLED: "true"
+  LITHO_INF_HTTP_HOST: 0.0.0.0
+  LITHO_INF_HTTP_PORT: 8080
+  LITHO_INF_HTTP_API_KEY: ${HTTP_API_KEY:-}
+  # 监控
+  LITHO_INF_METRICS_ENABLED: "true"
+  LITHO_INF_PROMETHEUS_PORT: 9090
+  LITHO_INF_LOG_LEVEL: INFO
+
+services:
+  # ----------------------------------------------------------------------
+  # 推理微服务
+  # ----------------------------------------------------------------------
+  inference-service:
+    build:
+      context: ../../..
+      dockerfile: backend/inference_service/Dockerfile
+    image: litho-inference-service:latest
+    container_name: litho-inference-service
+    restart: unless-stopped
+    environment:
+      <<: *inference-env
+    volumes:
+      # 代理模型挂载 (如需 surrogate 模式)
+      - ./models:/models:ro
+      # 日志目录
+      - ./logs:/app/backend/inference_service/logs:rw
+    ports:
+      - "50051:50051"   # gRPC
+      - "8080:8080"     # HTTP/REST
+      - "9090:9090"     # Prometheus metrics
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 4G
+        reservations:
+          cpus: "2.0"
+          memory: 1G
+      # GPU 支持 (代理模型模式
+      # reservations:
+      #   devices:
+      #     - driver: nvidia
+      #       count: 1
+      #       capabilities: [gpu]
+    networks:
+      - litho-net
+
+  # ----------------------------------------------------------------------
+  # Prometheus 指标采集 (可选)
+  # ----------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: litho-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9091:9090"
+    networks:
+      - litho-net
+    profiles:
+      - monitoring
+
+  # ----------------------------------------------------------------------
+  # Grafana 可视化 (可选)
+  # ----------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: litho-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin123}
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/grafana-dashboards:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    networks:
+      - litho-net
+    profiles:
+      - monitoring
+    depends_on:
+      - prometheus
+
+networks:
+  litho-net:
+    driver: bridge
+
+volumes:
+  prometheus-data:
+  grafana-data:

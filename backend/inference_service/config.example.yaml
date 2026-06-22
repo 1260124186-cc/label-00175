@@ -1,0 +1,128 @@
+# ========================================================================
+# 产线推理微服务 - 示例配置文件
+# ========================================================================
+# 复制为 config.yaml 后根据实际环境修改
+# ========================================================================
+
+service_name: litho-inference-service
+environment: production
+timezone: Asia/Shanghai
+graceful_shutdown_timeout_sec: 30
+
+# ========================================================================
+# 推理引擎配置
+# ========================================================================
+engine:
+  # 引擎类型: auto / surrogate / hopkins_lite
+  #   - auto: 自动检测模型文件，存在代理模型则用 surrogate，否则用 hopkins_lite
+  #   - surrogate: 神经网络代理模型 (ONNX/TorchScript)
+  #   - hopkins_lite: 轻量化 Hopkins 近似 (纯 NumPy)
+  engine_type: auto
+
+  # 代理模型目录: 需包含 model.onnx 或 model.pt + metadata.json
+  model_dir: ./models
+
+  # 优先使用 ONNX Runtime (vs TorchScript)
+  prefer_onnx: true
+
+  # 推理设备: auto / cpu / cuda
+  device: auto
+
+  # 预热迭代次数 (0 表示禁用)
+  warmup_iterations: 10
+
+  # 最大批大小
+  max_batch_size: 64
+
+  # Hopkins 核函数缓存目录 (可选
+  hopkins_kernel_dir: null
+  hopkins_approximation_order: 2
+
+# ========================================================================
+# gRPC 服务配置
+# ========================================================================
+grpc:
+  enabled: true
+  host: 0.0.0.0
+  port: 50051
+  max_workers: 8
+  max_message_size_mb: 64
+  enable_reflection: true
+  keepalive_time_ms: 30000
+  keepalive_timeout_ms: 10000
+  keepalive_permit_without_calls: true
+
+  # SSL/TLS 配置 (可选)
+  ssl_enabled: false
+  ssl_cert_path: null
+  ssl_key_path: null
+  ssl_ca_path: null
+
+  # API Key (简单认证
+  api_key: null
+
+# ========================================================================
+# HTTP/REST 服务配置
+# ========================================================================
+http:
+  enabled: true
+  host: 0.0.0.0
+  port: 8080
+  workers: 1
+
+  # CORS
+  enable_cors: true
+  cors_origins:
+    - "*"
+
+  # Swagger 文档
+  enable_docs: true
+  docs_url: /docs
+  redoc_url: /redoc
+
+  # 认证
+  api_key: null
+
+  # 限流
+  rate_limit_per_minute: 600
+
+  # 上传
+  max_upload_size_mb: 128
+
+  enable_gzip: true
+
+# ========================================================================
+# 监控与日志配置
+# ========================================================================
+metrics:
+  enabled: true
+
+  # Prometheus exporter 端口
+  prometheus_port: 9090
+  enable_prometheus: true
+
+  # 延迟直方图桶 (毫秒)
+  collect_latency_histogram: true
+  latency_histogram_buckets_ms:
+    - 0.1
+    - 0.5
+    - 1.0
+    - 2.0
+    - 5.0
+    - 10.0
+    - 20.0
+    - 50.0
+    - 100.0
+    - 200.0
+    - 500.0
+    - 1000.0
+
+  # 日志
+  log_level: INFO          # DEBUG / INFO / WARNING / ERROR
+  log_format: text         # text / json
+
+  # 文件日志 (可选)
+  enable_file_logging: false
+  log_file_path: ./logs/inference_service.log
+  log_rotation_max_mb: 100
+  log_rotation_backup_count: 10

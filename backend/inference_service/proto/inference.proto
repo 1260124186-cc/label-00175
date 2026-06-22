@@ -1,0 +1,245 @@
+// ========================================================================
+// Lithography Inference Service - gRPC Protocol Definition
+// ========================================================================
+// 产线推理微服务 gRPC 接口定义
+// 提供低延迟的空间像推理和 EPE 估计服务
+//
+// 编译命令:
+//   python -m grpc_tools.protoc -I./proto \
+//     --python_out=. --grpc_python_out=. \
+//     --pyi_out=. proto/inference.proto
+// ========================================================================
+
+syntax = "proto3";
+
+package litho_inference;
+
+option java_multiple_files = true;
+option java_package = "com.litho.inference";
+option java_outer_classname = "InferenceProto";
+option go_package = "litho/inference/v1";
+
+// ------------------------------------------------------------------------
+// 枚举类型
+// ------------------------------------------------------------------------
+
+enum InferenceMode {
+    MODE_AUTO = 0;
+    MODE_SURROGATE = 1;
+    MODE_HOPKINS_LITE = 2;
+}
+
+enum OutputType {
+    OUTPUT_AERIAL_IMAGE = 0;
+    OUTPUT_EPE = 1;
+    OUTPUT_BOTH = 2;
+}
+
+enum ServiceStatus {
+    STATUS_UNKNOWN = 0;
+    STATUS_HEALTHY = 1;
+    STATUS_DEGRADED = 2;
+    STATUS_UNHEALTHY = 3;
+}
+
+// ------------------------------------------------------------------------
+// 光学系统参数
+// ------------------------------------------------------------------------
+
+message OpticalParams {
+    double wavelength_nm = 1;
+    double na = 2;
+    double sigma = 3;
+    double defocus_nm = 4;
+    double pixel_size_nm = 5;
+    string illumination_type = 6;
+    optional double annular_sigma_inner = 7;
+    optional double annular_sigma_outer = 8;
+    optional double dipole_angle_deg = 9;
+}
+
+// ------------------------------------------------------------------------
+// 2D 数组表示 (行优先)
+// ------------------------------------------------------------------------
+
+message Array2D {
+    int32 height = 1;
+    int32 width = 2;
+    repeated float data = 3 [packed = true];
+}
+
+// ------------------------------------------------------------------------
+// EPE 指标
+// ------------------------------------------------------------------------
+
+message EpeMetrics {
+    double epe_mean_nm = 1;
+    double epe_max_nm = 2;
+    double epe_std_nm = 3;
+    double epe_median_nm = 4;
+    int32 num_edge_pixels_wafer = 5;
+    int32 num_edge_pixels_target = 6;
+}
+
+// ------------------------------------------------------------------------
+// 空间像推理
+// ------------------------------------------------------------------------
+
+message PredictAerialRequest {
+    repeated Array2D masks = 1;
+    InferenceMode inference_mode = 2;
+    optional OpticalParams optical_params = 3;
+    double threshold = 4;
+    bool return_input_mask = 5;
+    string request_id = 6;
+}
+
+message PredictAerialResponse {
+    repeated Array2D aerial_images = 1;
+    repeated Array2D masks = 2;
+    string inference_mode_used = 3;
+    string engine_type = 4;
+    double latency_ms_total = 5;
+    double latency_ms_per_mask_avg = 6;
+    int32 num_masks = 7;
+    string request_id = 8;
+}
+
+// ------------------------------------------------------------------------
+// EPE 估计
+// ------------------------------------------------------------------------
+
+message EstimateEpeRequest {
+    repeated Array2D masks = 1;
+    repeated Array2D targets = 2;
+    InferenceMode inference_mode = 3;
+    optional OpticalParams optical_params = 4;
+    double threshold = 5;
+    double pixel_size_nm = 6;
+    string edge_method = 7;
+    bool return_aerial_images = 8;
+    string request_id = 9;
+}
+
+message EstimateEpeResponse {
+    repeated EpeMetrics epe_results = 1;
+    repeated Array2D aerial_images = 2;
+    string inference_mode_used = 3;
+    string engine_type = 4;
+    double latency_ms_total = 5;
+    double latency_ms_per_mask_avg = 6;
+    int32 num_masks = 7;
+    string request_id = 8;
+}
+
+// ------------------------------------------------------------------------
+// 批量混合推理
+// ------------------------------------------------------------------------
+
+message BatchInferenceRequest {
+    repeated Array2D masks = 1;
+    repeated Array2D targets = 2;
+    OutputType output_type = 3;
+    InferenceMode inference_mode = 4;
+    optional OpticalParams optical_params = 5;
+    double threshold = 6;
+    double pixel_size_nm = 7;
+    int32 max_batch_size = 8;
+    string request_id = 9;
+}
+
+message BatchInferenceResponse {
+    repeated Array2D aerial_images = 1;
+    repeated EpeMetrics epe_results = 2;
+    string inference_mode_used = 3;
+    string engine_type = 4;
+    double latency_ms_total = 5;
+    double latency_ms_per_mask_avg = 6;
+    int32 num_masks = 7;
+    int32 num_batches = 8;
+    string request_id = 9;
+}
+
+// ------------------------------------------------------------------------
+// 健康检查与监控
+// ------------------------------------------------------------------------
+
+message HealthCheckRequest {
+    bool detailed = 1;
+}
+
+message HealthCheckResponse {
+    ServiceStatus status = 1;
+    string engine_status = 2;
+    bool grpc_enabled = 3;
+    bool http_enabled = 4;
+    double uptime_seconds = 5;
+    string service_name = 6;
+    string service_id = 7;
+    map<string, string> checks = 8;
+}
+
+message ServiceInfoRequest {}
+
+message ServiceInfoResponse {
+    string name = 1;
+    string version = 2;
+    string environment = 3;
+    map<string, string> engine = 4;
+    map<string, string> endpoints = 5;
+}
+
+message MetricsRequest {
+    int32 recent_window = 1;
+}
+
+message MetricsResponse {
+    int64 total_requests = 1;
+    int64 total_masks_processed = 2;
+    int64 total_errors = 3;
+    double avg_latency_ms = 4;
+    double p50_latency_ms = 5;
+    double p95_latency_ms = 6;
+    double p99_latency_ms = 7;
+    double throughput_masks_per_sec = 8;
+}
+
+message ReloadRequest {
+    map<string, string> config_overrides = 1;
+}
+
+message ReloadResponse {
+    bool success = 1;
+    string message = 2;
+    double reload_time_ms = 3;
+}
+
+// ------------------------------------------------------------------------
+// 服务定义
+// ------------------------------------------------------------------------
+
+service LithoInferenceService {
+    // 空间像推理
+    rpc PredictAerial (PredictAerialRequest) returns (PredictAerialResponse);
+
+    // 空间像流式推理 (适用于大量掩模)
+    rpc PredictAerialStream (stream PredictAerialRequest) returns (stream PredictAerialResponse);
+
+    // EPE 估计
+    rpc EstimateEpe (EstimateEpeRequest) returns (EstimateEpeResponse);
+
+    // 批量混合推理
+    rpc BatchInference (BatchInferenceRequest) returns (BatchInferenceResponse);
+
+    // 健康检查
+    rpc HealthCheck (HealthCheckRequest) returns (HealthCheckResponse);
+
+    // 服务信息
+    rpc GetServiceInfo (ServiceInfoRequest) returns (ServiceInfoResponse);
+
+    // 性能指标
+    rpc GetMetrics (MetricsRequest) returns (MetricsResponse);
+
+    // 热重载模型
+    rpc ReloadModel (ReloadRequest) returns (ReloadResponse);
+}
